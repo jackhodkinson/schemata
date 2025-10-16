@@ -101,7 +101,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	if migrateDryRun {
-		fmt.Println("\n=== DRY RUN MODE ===\n")
+		fmt.Println("\n=== DRY RUN MODE ===")
 	}
 
 	if err := applier.Apply(ctx, migrations, opts); err != nil {

@@ -88,6 +88,14 @@ func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, erro
 		return p.parseCreateExtension(node.CreateExtensionStmt)
 	case *pg_query.Node_CreateSchemaStmt:
 		return p.parseCreateSchema(node.CreateSchemaStmt)
+	case *pg_query.Node_GrantStmt:
+		// GRANT statements - we'll handle these by attaching grants to objects
+		// For now, skip as standalone objects (grants are properties of tables/views/functions)
+		return nil, nil
+	case *pg_query.Node_AlterOwnerStmt:
+		// ALTER ... OWNER TO statements
+		// For now, skip as standalone objects (owner is a property of objects)
+		return nil, nil
 	default:
 		// Not a schema object we track (e.g., INSERT, UPDATE, etc.)
 		return nil, nil
