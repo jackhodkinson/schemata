@@ -1,0 +1,47 @@
+package db
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackhodkinson/schemata/internal/config"
+)
+
+// Pool wraps a database connection pool
+type Pool struct {
+	*pgxpool.Pool
+}
+
+// Connect creates a new connection pool from a DBConnection config
+func Connect(ctx context.Context, conn *config.DBConnection) (*Pool, error) {
+	connStr, err := conn.ToConnectionString()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build connection string: %w", err)
+	}
+
+	pool, err := pgxpool.New(ctx, connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection pool: %w", err)
+	}
+
+	// Test the connection
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	return &Pool{Pool: pool}, nil
+}
+
+// Close closes the connection pool
+func (p *Pool) Close() {
+	if p.Pool != nil {
+		p.Pool.Close()
+	}
+}
+
+// EnsureConnected verifies the connection is active
+func (p *Pool) EnsureConnected(ctx context.Context) error {
+	return p.Pool.Ping(ctx)
+}

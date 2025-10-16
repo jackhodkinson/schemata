@@ -1,0 +1,766 @@
+package parser
+
+import (
+	"fmt"
+	"os"
+
+	pg_query "github.com/pganalyze/pg_query_go/v5"
+	"github.com/jackhodkinson/schemata/pkg/schema"
+)
+
+// Parser uses pg_query_go to parse SQL files into schema objects
+type Parser struct{}
+
+// NewParser creates a new SQL parser
+func NewParser() *Parser {
+	return &Parser{}
+}
+
+// ParseFile parses a SQL file and returns all database objects
+func (p *Parser) ParseFile(path string) ([]schema.DatabaseObject, error) {
+	// Read the file
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	return p.ParseSQL(string(content))
+}
+
+// ParseSQL parses SQL text and returns all database objects
+func (p *Parser) ParseSQL(sql string) ([]schema.DatabaseObject, error) {
+	// Parse the SQL using pg_query_go
+	result, err := pg_query.Parse(sql)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SQL: %w", err)
+	}
+
+	var objects []schema.DatabaseObject
+
+	// Iterate through statements
+	for _, stmt := range result.Stmts {
+		obj, err := p.extractObject(stmt.Stmt)
+		if err != nil {
+			// Log warning but continue parsing other statements
+			fmt.Printf("Warning: failed to extract object from statement: %v\n", err)
+			continue
+		}
+
+		if obj != nil {
+			objects = append(objects, obj)
+		}
+	}
+
+	return objects, nil
+}
+
+// extractObject extracts a database object from a parsed statement
+func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, error) {
+	if stmt == nil {
+		return nil, nil
+	}
+
+	// Check what type of statement this is
+	switch node := stmt.Node.(type) {
+	case *pg_query.Node_CreateStmt:
+		return p.extractTable(node.CreateStmt)
+
+	case *pg_query.Node_CreateSeqStmt:
+		return p.extractSequence(node.CreateSeqStmt)
+
+	case *pg_query.Node_ViewStmt:
+		return p.extractView(node.ViewStmt)
+
+	case *pg_query.Node_CreateFunctionStmt:
+		return p.extractFunction(node.CreateFunctionStmt)
+
+	case *pg_query.Node_IndexStmt:
+		return p.extractIndex(node.IndexStmt)
+
+	case *pg_query.Node_CreateEnumStmt:
+		return p.extractEnum(node.CreateEnumStmt)
+
+	case *pg_query.Node_CreateDomainStmt:
+		return p.extractDomain(node.CreateDomainStmt)
+
+	case *pg_query.Node_CreateExtensionStmt:
+		return p.extractExtension(node.CreateExtensionStmt)
+
+	case *pg_query.Node_CreateTrigStmt:
+		return p.extractTrigger(node.CreateTrigStmt)
+
+	case *pg_query.Node_CreatePolicyStmt:
+		return p.extractPolicy(node.CreatePolicyStmt)
+
+	default:
+		// Not a CREATE statement we track, skip it
+		return nil, nil
+	}
+}
+
+// extractTable extracts a table from a CREATE TABLE statement
+func (p *Parser) extractTable(stmt *pg_query.CreateStmt) (schema.DatabaseObject, error) {
+	if stmt.Relation == nil {
+		return nil, fmt.Errorf("create table statement missing relation")
+	}
+
+	table := schema.Table{
+		Schema: schema.SchemaName(getSchemaName(stmt.Relation)),
+		Name:   schema.TableName(stmt.Relation.Relname),
+	}
+
+	// Extract columns
+	for _, elt := range stmt.TableElts {
+		if colDef := elt.GetColumnDef(); colDef != nil {
+			col, err := p.extractColumn(colDef)
+			if err != nil {
+				return nil, fmt.Errorf("failed to extract column: %w", err)
+			}
+			table.Columns = append(table.Columns, col)
+		}
+
+		// Extract constraints
+		if constraint := elt.GetConstraint(); constraint != nil {
+			if err := p.extractTableConstraint(&table, constraint); err != nil {
+				return nil, fmt.Errorf("failed to extract constraint: %w", err)
+			}
+		}
+	}
+
+	return table, nil
+}
+
+func (p *Parser) extractColumn(colDef *pg_query.ColumnDef) (schema.Column, error) {
+	col := schema.Column{
+		Name: schema.ColumnName(colDef.Colname),
+	}
+
+	// Extract type
+	if colDef.TypeName != nil {
+		col.Type = schema.TypeName(formatTypeName(colDef.TypeName))
+	}
+
+	// Extract NOT NULL
+	for _, constraint := range colDef.Constraints {
+		if c := constraint.GetConstraint(); c != nil {
+			switch c.Contype {
+			case pg_query.ConstrType_CONSTR_NOTNULL:
+				col.NotNull = true
+			case pg_query.ConstrType_CONSTR_DEFAULT:
+				if c.RawExpr != nil {
+					expr := nodeToSQL(c.RawExpr)
+					col.Default = &expr
+				}
+			case pg_query.ConstrType_CONSTR_GENERATED:
+				if c.RawExpr != nil {
+					expr := nodeToSQL(c.RawExpr)
+					col.Generated = &schema.GeneratedSpec{
+						Expr:   expr,
+						Stored: c.GeneratedWhen == 's',
+					}
+				}
+			case pg_query.ConstrType_CONSTR_IDENTITY:
+				col.Identity = &schema.IdentitySpec{
+					Always: c.GeneratedWhen == 'a',
+				}
+			}
+		}
+	}
+
+	return col, nil
+}
+
+func (p *Parser) extractTableConstraint(table *schema.Table, constraint *pg_query.Constraint) error {
+	switch constraint.Contype {
+	case pg_query.ConstrType_CONSTR_PRIMARY:
+		pk := &schema.PrimaryKey{
+			Cols:              extractColumnNames(constraint.Keys),
+			Deferrable:        constraint.Deferrable,
+			InitiallyDeferred: constraint.Initdeferred,
+		}
+		if constraint.Conname != "" {
+			pk.Name = &constraint.Conname
+		}
+		table.PrimaryKey = pk
+
+	case pg_query.ConstrType_CONSTR_UNIQUE:
+		uq := schema.UniqueConstraint{
+			Name:              constraint.Conname,
+			Cols:              extractColumnNames(constraint.Keys),
+			Deferrable:        constraint.Deferrable,
+			InitiallyDeferred: constraint.Initdeferred,
+			NullsDistinct:     true, // Default
+		}
+		table.Uniques = append(table.Uniques, uq)
+
+	case pg_query.ConstrType_CONSTR_CHECK:
+		if constraint.RawExpr != nil {
+			check := schema.CheckConstraint{
+				Name:              constraint.Conname,
+				Expr:              nodeToSQL(constraint.RawExpr),
+				Deferrable:        constraint.Deferrable,
+				InitiallyDeferred: constraint.Initdeferred,
+			}
+			table.Checks = append(table.Checks, check)
+		}
+
+	case pg_query.ConstrType_CONSTR_FOREIGN:
+		if constraint.Pktable != nil {
+			fk := schema.ForeignKey{
+				Name: constraint.Conname,
+				Cols: extractColumnNames(constraint.FkAttrs),
+				Ref: schema.ForeignKeyRef{
+					Schema: schema.SchemaName(getSchemaName(constraint.Pktable)),
+					Table:  schema.TableName(constraint.Pktable.Relname),
+					Cols:   extractColumnNames(constraint.PkAttrs),
+				},
+				OnUpdate:          parseFkAction(constraint.FkUpdAction),
+				OnDelete:          parseFkAction(constraint.FkDelAction),
+				Match:             parseFkMatchType(constraint.FkMatchtype),
+				Deferrable:        constraint.Deferrable,
+				InitiallyDeferred: constraint.Initdeferred,
+			}
+			table.ForeignKeys = append(table.ForeignKeys, fk)
+		}
+	}
+
+	return nil
+}
+
+func (p *Parser) extractSequence(stmt *pg_query.CreateSeqStmt) (schema.DatabaseObject, error) {
+	if stmt.Sequence == nil {
+		return nil, fmt.Errorf("create sequence statement missing sequence name")
+	}
+
+	seq := schema.Sequence{
+		Schema: schema.SchemaName(getSchemaName(stmt.Sequence)),
+		Name:   stmt.Sequence.Relname,
+		Cycle:  false,
+	}
+
+	// Extract sequence options
+	for _, opt := range stmt.Options {
+		if defElem := opt.GetDefElem(); defElem != nil {
+			switch defElem.Defname {
+			case "start":
+				if val := getIntValue(defElem.Arg); val != nil {
+					seq.Start = val
+				}
+			case "increment":
+				if val := getIntValue(defElem.Arg); val != nil {
+					seq.Increment = val
+				}
+			case "minvalue":
+				if val := getIntValue(defElem.Arg); val != nil {
+					seq.MinValue = val
+				}
+			case "maxvalue":
+				if val := getIntValue(defElem.Arg); val != nil {
+					seq.MaxValue = val
+				}
+			case "cache":
+				if val := getIntValue(defElem.Arg); val != nil {
+					seq.Cache = val
+				}
+			case "cycle":
+				seq.Cycle = true
+			case "as":
+				if val := getStringValue(defElem.Arg); val != nil {
+					seq.Type = *val
+				}
+			}
+		}
+	}
+
+	return seq, nil
+}
+
+func (p *Parser) extractView(stmt *pg_query.ViewStmt) (schema.DatabaseObject, error) {
+	if stmt.View == nil {
+		return nil, fmt.Errorf("create view statement missing view name")
+	}
+
+	view := schema.View{
+		Schema: schema.SchemaName(getSchemaName(stmt.View)),
+		Name:   stmt.View.Relname,
+	}
+
+	// Check if materialized
+	if stmt.Options != nil {
+		// TODO: Determine if materialized from statement
+		view.Type = schema.RegularView
+	} else {
+		view.Type = schema.RegularView
+	}
+
+	// Extract query definition
+	if stmt.Query != nil {
+		view.Definition = schema.ViewDefinition{
+			Query: nodeToSQL(stmt.Query),
+		}
+	}
+
+	return view, nil
+}
+
+func (p *Parser) extractFunction(stmt *pg_query.CreateFunctionStmt) (schema.DatabaseObject, error) {
+	if len(stmt.Funcname) == 0 {
+		return nil, fmt.Errorf("create function statement missing function name")
+	}
+
+	fn := schema.Function{
+		Schema: schema.SchemaName("public"), // Default schema
+	}
+
+	// Extract function name (can be schema-qualified)
+	if len(stmt.Funcname) > 1 {
+		if strNode := stmt.Funcname[0].GetString_(); strNode != nil {
+			fn.Schema = schema.SchemaName(strNode.Sval)
+		}
+		if strNode := stmt.Funcname[1].GetString_(); strNode != nil {
+			fn.Name = strNode.Sval
+		}
+	} else if len(stmt.Funcname) == 1 {
+		if strNode := stmt.Funcname[0].GetString_(); strNode != nil {
+			fn.Name = strNode.Sval
+		}
+	}
+
+	// Extract parameters
+	for _, param := range stmt.Parameters {
+		if funcParam := param.GetFunctionParameter(); funcParam != nil {
+			arg := schema.FunctionArg{
+				Type: schema.TypeName(formatTypeName(funcParam.ArgType)),
+			}
+			if funcParam.Name != "" {
+				arg.Name = &funcParam.Name
+			}
+
+			// Parse mode
+			switch funcParam.Mode {
+			case pg_query.FunctionParameterMode_FUNC_PARAM_IN:
+				arg.Mode = schema.InMode
+			case pg_query.FunctionParameterMode_FUNC_PARAM_OUT:
+				arg.Mode = schema.OutMode
+			case pg_query.FunctionParameterMode_FUNC_PARAM_INOUT:
+				arg.Mode = schema.InOutMode
+			case pg_query.FunctionParameterMode_FUNC_PARAM_VARIADIC:
+				arg.Mode = schema.VariadicMode
+			default:
+				arg.Mode = schema.InMode
+			}
+
+			fn.Args = append(fn.Args, arg)
+		}
+	}
+
+	// Extract return type
+	if stmt.ReturnType != nil {
+		fn.Returns = schema.ReturnsType{
+			Type: schema.TypeName(formatTypeName(stmt.ReturnType)),
+		}
+	}
+
+	// Extract options (language, volatility, etc.)
+	for _, opt := range stmt.Options {
+		if defElem := opt.GetDefElem(); defElem != nil {
+			switch defElem.Defname {
+			case "language":
+				if val := getStringValue(defElem.Arg); val != nil {
+					fn.Language = schema.Language(*val)
+				}
+			case "volatility":
+				if val := getStringValue(defElem.Arg); val != nil {
+					switch *val {
+					case "immutable":
+						fn.Volatility = schema.Immutable
+					case "stable":
+						fn.Volatility = schema.Stable
+					default:
+						fn.Volatility = schema.Volatile
+					}
+				}
+			case "strict":
+				fn.Strict = true
+			case "security_definer":
+				fn.SecurityDefiner = true
+			case "parallel":
+				if val := getStringValue(defElem.Arg); val != nil {
+					switch *val {
+					case "safe":
+						fn.Parallel = schema.ParallelSafe
+					case "restricted":
+						fn.Parallel = schema.ParallelRestricted
+					default:
+						fn.Parallel = schema.ParallelUnsafe
+					}
+				}
+			case "as":
+				// Function body
+				if val := getStringValue(defElem.Arg); val != nil {
+					fn.Body = *val
+				}
+			}
+		}
+	}
+
+	return fn, nil
+}
+
+func (p *Parser) extractIndex(stmt *pg_query.IndexStmt) (schema.DatabaseObject, error) {
+	if stmt.Relation == nil {
+		return nil, fmt.Errorf("create index statement missing relation")
+	}
+
+	idx := schema.Index{
+		Schema: schema.SchemaName(getSchemaName(stmt.Relation)),
+		Table:  schema.TableName(stmt.Relation.Relname),
+		Name:   stmt.Idxname,
+		Unique: stmt.Unique,
+		Method: schema.BTree, // Default
+	}
+
+	if stmt.AccessMethod != "" {
+		idx.Method = schema.IndexMethod(stmt.AccessMethod)
+	}
+
+	// Extract key expressions
+	for _, elem := range stmt.IndexParams {
+		if idxElem := elem.GetIndexElem(); idxElem != nil {
+			keyExpr := schema.IndexKeyExpr{}
+
+			if idxElem.Name != "" {
+				keyExpr.Expr = schema.Expr(idxElem.Name)
+			} else if idxElem.Expr != nil {
+				keyExpr.Expr = nodeToSQL(idxElem.Expr)
+			}
+
+			// Parse ordering
+			switch idxElem.Ordering {
+			case pg_query.SortByDir_SORTBY_ASC:
+				asc := schema.Asc
+				keyExpr.Ordering = &asc
+			case pg_query.SortByDir_SORTBY_DESC:
+				desc := schema.Desc
+				keyExpr.Ordering = &desc
+			}
+
+			// Parse nulls ordering
+			switch idxElem.NullsOrdering {
+			case pg_query.SortByNulls_SORTBY_NULLS_FIRST:
+				nullsFirst := schema.NullsFirst
+				keyExpr.NullsOrdering = &nullsFirst
+			case pg_query.SortByNulls_SORTBY_NULLS_LAST:
+				nullsLast := schema.NullsLast
+				keyExpr.NullsOrdering = &nullsLast
+			}
+
+			idx.KeyExprs = append(idx.KeyExprs, keyExpr)
+		}
+	}
+
+	// Extract predicate (WHERE clause)
+	if stmt.WhereClause != nil {
+		pred := nodeToSQL(stmt.WhereClause)
+		idx.Predicate = &pred
+	}
+
+	return idx, nil
+}
+
+func (p *Parser) extractEnum(stmt *pg_query.CreateEnumStmt) (schema.DatabaseObject, error) {
+	if len(stmt.TypeName) == 0 {
+		return nil, fmt.Errorf("create enum statement missing type name")
+	}
+
+	enum := schema.EnumDef{
+		Schema: schema.SchemaName("public"), // Default
+	}
+
+	// Extract schema and name
+	if len(stmt.TypeName) > 1 {
+		if strNode := stmt.TypeName[0].GetString_(); strNode != nil {
+			enum.Schema = schema.SchemaName(strNode.Sval)
+		}
+		if strNode := stmt.TypeName[1].GetString_(); strNode != nil {
+			enum.Name = schema.TypeName(strNode.Sval)
+		}
+	} else if len(stmt.TypeName) == 1 {
+		if strNode := stmt.TypeName[0].GetString_(); strNode != nil {
+			enum.Name = schema.TypeName(strNode.Sval)
+		}
+	}
+
+	// Extract enum values
+	for _, val := range stmt.Vals {
+		if strNode := val.GetString_(); strNode != nil {
+			enum.Values = append(enum.Values, strNode.Sval)
+		}
+	}
+
+	return enum, nil
+}
+
+func (p *Parser) extractDomain(stmt *pg_query.CreateDomainStmt) (schema.DatabaseObject, error) {
+	if len(stmt.Domainname) == 0 {
+		return nil, fmt.Errorf("create domain statement missing domain name")
+	}
+
+	domain := schema.DomainDef{
+		Schema:  schema.SchemaName("public"), // Default
+		NotNull: false,
+	}
+
+	// Extract schema and name
+	if len(stmt.Domainname) > 1 {
+		if strNode := stmt.Domainname[0].GetString_(); strNode != nil {
+			domain.Schema = schema.SchemaName(strNode.Sval)
+		}
+		if strNode := stmt.Domainname[1].GetString_(); strNode != nil {
+			domain.Name = schema.TypeName(strNode.Sval)
+		}
+	} else if len(stmt.Domainname) == 1 {
+		if strNode := stmt.Domainname[0].GetString_(); strNode != nil {
+			domain.Name = schema.TypeName(strNode.Sval)
+		}
+	}
+
+	// Extract base type
+	if stmt.TypeName != nil {
+		domain.BaseType = schema.TypeName(formatTypeName(stmt.TypeName))
+	}
+
+	// Extract constraints
+	for _, constraint := range stmt.Constraints {
+		if c := constraint.GetConstraint(); c != nil {
+			switch c.Contype {
+			case pg_query.ConstrType_CONSTR_NOTNULL:
+				domain.NotNull = true
+			case pg_query.ConstrType_CONSTR_DEFAULT:
+				if c.RawExpr != nil {
+					expr := nodeToSQL(c.RawExpr)
+					domain.Default = &expr
+				}
+			case pg_query.ConstrType_CONSTR_CHECK:
+				if c.RawExpr != nil {
+					expr := nodeToSQL(c.RawExpr)
+					domain.Check = &expr
+				}
+			}
+		}
+	}
+
+	return domain, nil
+}
+
+func (p *Parser) extractExtension(stmt *pg_query.CreateExtensionStmt) (schema.DatabaseObject, error) {
+	ext := schema.Extension{
+		Schema: schema.SchemaName("public"), // Default, will be set based on extension
+		Name:   stmt.Extname,
+	}
+
+	return ext, nil
+}
+
+func (p *Parser) extractTrigger(stmt *pg_query.CreateTrigStmt) (schema.DatabaseObject, error) {
+	if stmt.Relation == nil {
+		return nil, fmt.Errorf("create trigger statement missing relation")
+	}
+
+	trig := schema.Trigger{
+		Schema: schema.SchemaName(getSchemaName(stmt.Relation)),
+		Table:  schema.TableName(stmt.Relation.Relname),
+		Name:   stmt.Trigname,
+	}
+
+	// Parse timing
+	if stmt.Timing&0x02 != 0 {
+		trig.Timing = schema.Before
+	} else if stmt.Timing&0x04 != 0 {
+		trig.Timing = schema.After
+	} else if stmt.Timing&0x40 != 0 {
+		trig.Timing = schema.InsteadOf
+	}
+
+	// Parse events
+	if stmt.Events&0x04 != 0 {
+		trig.Events = append(trig.Events, schema.Insert)
+	}
+	if stmt.Events&0x08 != 0 {
+		trig.Events = append(trig.Events, schema.Delete)
+	}
+	if stmt.Events&0x10 != 0 {
+		trig.Events = append(trig.Events, schema.Update)
+	}
+	if stmt.Events&0x20 != 0 {
+		trig.Events = append(trig.Events, schema.Truncate)
+	}
+
+	// Parse function name
+	if len(stmt.Funcname) > 0 {
+		funcSchema := "public"
+		funcName := ""
+		if len(stmt.Funcname) > 1 {
+			if strNode := stmt.Funcname[0].GetString_(); strNode != nil {
+				funcSchema = strNode.Sval
+			}
+			if strNode := stmt.Funcname[1].GetString_(); strNode != nil {
+				funcName = strNode.Sval
+			}
+		} else if len(stmt.Funcname) == 1 {
+			if strNode := stmt.Funcname[0].GetString_(); strNode != nil {
+				funcName = strNode.Sval
+			}
+		}
+
+		trig.Function = schema.QualifiedName{
+			Schema: schema.SchemaName(funcSchema),
+			Name:   funcName,
+		}
+	}
+
+	trig.ForEachRow = stmt.Row
+
+	return trig, nil
+}
+
+func (p *Parser) extractPolicy(stmt *pg_query.CreatePolicyStmt) (schema.DatabaseObject, error) {
+	if stmt.Table == nil {
+		return nil, fmt.Errorf("create policy statement missing table")
+	}
+
+	pol := schema.Policy{
+		Schema:     schema.SchemaName(getSchemaName(stmt.Table)),
+		Table:      schema.TableName(stmt.Table.Relname),
+		Name:       stmt.PolicyName,
+		Permissive: true, // Default
+	}
+
+	// Parse command type
+	if stmt.CmdName != "" {
+		switch stmt.CmdName {
+		case "select":
+			pol.For = schema.ForSelect
+		case "insert":
+			pol.For = schema.ForInsert
+		case "update":
+			pol.For = schema.ForUpdate
+		case "delete":
+			pol.For = schema.ForDelete
+		default:
+			pol.For = schema.ForAll
+		}
+	}
+
+	// Parse USING clause
+	if stmt.Qual != nil {
+		expr := nodeToSQL(stmt.Qual)
+		pol.Using = &expr
+	}
+
+	// Parse WITH CHECK clause
+	if stmt.WithCheck != nil {
+		expr := nodeToSQL(stmt.WithCheck)
+		pol.WithCheck = &expr
+	}
+
+	// Parse roles
+	for _, role := range stmt.Roles {
+		if roleNode := role.GetRoleSpec(); roleNode != nil {
+			if roleNode.Rolename != "" {
+				pol.To = append(pol.To, roleNode.Rolename)
+			}
+		}
+	}
+
+	return pol, nil
+}
+
+// Helper functions
+
+func getSchemaName(rel *pg_query.RangeVar) string {
+	if rel.Schemaname != "" {
+		return rel.Schemaname
+	}
+	return "public"
+}
+
+func formatTypeName(typeName *pg_query.TypeName) string {
+	if len(typeName.Names) == 0 {
+		return "unknown"
+	}
+
+	parts := []string{}
+	for _, name := range typeName.Names {
+		if strNode := name.GetString_(); strNode != nil {
+			parts = append(parts, strNode.Sval)
+		}
+	}
+
+	return fmt.Sprintf("%s", parts[len(parts)-1]) // Use last part as type name
+}
+
+func extractColumnNames(nodes []*pg_query.Node) []schema.ColumnName {
+	var names []schema.ColumnName
+	for _, node := range nodes {
+		if strNode := node.GetString_(); strNode != nil {
+			names = append(names, schema.ColumnName(strNode.Sval))
+		}
+	}
+	return names
+}
+
+func parseFkAction(action byte) schema.ReferentialAction {
+	switch action {
+	case 'a':
+		return schema.NoAction
+	case 'r':
+		return schema.Restrict
+	case 'c':
+		return schema.Cascade
+	case 'n':
+		return schema.SetNull
+	case 'd':
+		return schema.SetDefault
+	default:
+		return schema.NoAction
+	}
+}
+
+func parseFkMatchType(matchType byte) schema.MatchType {
+	switch matchType {
+	case 'f':
+		return schema.MatchFull
+	case 'p':
+		return schema.MatchPartial
+	default:
+		return schema.MatchSimple
+	}
+}
+
+func getIntValue(node *pg_query.Node) *int64 {
+	if intNode := node.GetInteger(); intNode != nil {
+		val := int64(intNode.Ival)
+		return &val
+	}
+	return nil
+}
+
+func getStringValue(node *pg_query.Node) *string {
+	if strNode := node.GetString_(); strNode != nil {
+		return &strNode.Sval
+	}
+	return nil
+}
+
+// nodeToSQL converts a parse tree node back to SQL
+// This is a simplified version - pg_query provides a Deparse function for this
+func nodeToSQL(node *pg_query.Node) schema.Expr {
+	// Use pg_query's built-in deparsing
+	sql, err := pg_query.Deparse(node)
+	if err != nil {
+		// Fallback: return a placeholder
+		return schema.Expr(fmt.Sprintf("<expr>"))
+	}
+	return schema.Expr(sql)
+}

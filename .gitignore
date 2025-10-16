@@ -1,0 +1,31 @@
+# Binaries
+/schemata
+/cmd/schemata/schemata
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+testdata/tmp/
+*.db
+
+# Build artifacts
+/dist/
+/build/
+
+# OS files
+.DS_Store

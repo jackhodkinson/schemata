@@ -1,0 +1,59 @@
+services:
+  # Test database for dev environment
+  postgres-dev:
+    image: postgres:16-alpine
+    container_name: schemata-dev
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: schemata_dev
+    ports:
+      - "25433:5432"
+    volumes:
+      - dev-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Test database for target environment
+  postgres-target:
+    image: postgres:16-alpine
+    container_name: schemata-target
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: schemata_target
+    ports:
+      - "25434:5432"
+    volumes:
+      - target-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Test database for staging (multi-target tests)
+  postgres-staging:
+    image: postgres:16-alpine
+    container_name: schemata-staging
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: schemata_staging
+    ports:
+      - "25435:5432"
+    volumes:
+      - staging-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  dev-data:
+  target-data:
+  staging-data:
