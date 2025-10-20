@@ -1,0 +1,4 @@
+dev: postgresql://postgres:postgres@localhost:25433/schemata_dev?sslmode=disable
+target: postgresql://postgres:postgres@localhost:25434/schemata_target?sslmode=disable
+schema: testdata/schemas/initial_schema.sql
+migrations: testdata/migrations

@@ -88,6 +88,10 @@ func (d *Differ) Diff(desired, actual schema.SchemaObjectMap) (*Diff, error) {
 
 // compareObjects performs deep comparison of two objects to identify specific changes
 func (d *Differ) compareObjects(desired, actual schema.DatabaseObject) ([]string, error) {
+	// Normalize both objects before comparing to ensure consistent comparison
+	desired = normalize(desired)
+	actual = normalize(actual)
+
 	// Type-specific comparison using comparators
 	switch desiredObj := desired.(type) {
 	case schema.Table:

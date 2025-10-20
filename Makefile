@@ -7,6 +7,21 @@ export CGO_CFLAGS := -DHAVE_STRCHRNUL=1
 build:
 	go build -o bin/schemata ./cmd/schemata
 
+# Install to /usr/local/bin (requires sudo on some systems)
+install: build
+	@echo "Installing schemata to /usr/local/bin..."
+	@mkdir -p /usr/local/bin
+	@cp bin/schemata /usr/local/bin/schemata
+	@chmod +x /usr/local/bin/schemata
+	@echo "✓ schemata installed successfully!"
+	@echo "Run 'schemata --help' to get started"
+
+# Uninstall from /usr/local/bin
+uninstall:
+	@echo "Removing schemata from /usr/local/bin..."
+	@rm -f /usr/local/bin/schemata
+	@echo "✓ schemata uninstalled"
+
 # Run all tests
 test:
 	go test -v ./...
@@ -26,6 +41,11 @@ test-integration:
 	go test -v ./test/integration/...
 	@echo "Stopping Docker databases..."
 	@docker compose down
+
+# Run end-to-end test (requires Docker databases to be running)
+test-e2e:
+	@echo "Running end-to-end test..."
+	@./test/integration/end_to_end_binary_test.sh
 
 # Start Docker test databases
 docker-up:

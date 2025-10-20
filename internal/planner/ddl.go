@@ -20,15 +20,22 @@ func NewDDLGenerator() *DDLGenerator {
 func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObjectMap) (string, error) {
 	var statements []string
 
-	// Generate CREATE statements
-	for _, key := range diff.ToCreate {
-		if obj, exists := objectMap[key]; exists {
-			stmt, err := g.generateCreate(obj.Payload)
-			if err != nil {
-				return "", fmt.Errorf("failed to generate CREATE for %v: %w", key, err)
-			}
-			statements = append(statements, stmt)
+	// Generate DROP statements first (in reverse dependency order)
+	if len(diff.ToDrop) > 0 {
+		dropStatements, err := g.generateDropStatements(diff.ToDrop, objectMap)
+		if err != nil {
+			return "", fmt.Errorf("failed to generate DROP statements: %w", err)
 		}
+		statements = append(statements, dropStatements...)
+	}
+
+	// Generate CREATE statements (in dependency order)
+	if len(diff.ToCreate) > 0 {
+		createStatements, err := g.generateCreateStatements(diff.ToCreate, objectMap)
+		if err != nil {
+			return "", fmt.Errorf("failed to generate CREATE statements: %w", err)
+		}
+		statements = append(statements, createStatements...)
 	}
 
 	// Generate ALTER statements
@@ -40,16 +47,90 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 		statements = append(statements, stmts...)
 	}
 
-	// Generate DROP statements
-	for _, key := range diff.ToDrop {
+	return strings.Join(statements, "\n\n"), nil
+}
+
+// generateCreateStatements generates CREATE statements in dependency order
+func (g *DDLGenerator) generateCreateStatements(keys []schema.ObjectKey, objectMap schema.SchemaObjectMap) ([]string, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	// Build a graph for only the objects being created
+	graph := BuildGraph(objectMap)
+
+	// Filter graph to only include objects being created
+	filteredGraph := FilterGraphForKeys(graph, keys)
+
+	// Topologically sort to respect dependencies
+	sortedKeys, err := filteredGraph.TopologicalSort()
+	if err != nil {
+		// Circular dependency detected - provide helpful error
+		cycle, _ := filteredGraph.DetectCycle()
+		if cycle != nil {
+			return nil, fmt.Errorf("circular dependency detected: %s\nCannot determine creation order. Consider creating tables first without foreign keys, then adding foreign keys with ALTER TABLE", formatCycle(cycle))
+		}
+		return nil, err
+	}
+
+	// Generate CREATE statements in sorted order
+	var statements []string
+	for _, key := range sortedKeys {
+		if obj, exists := objectMap[key]; exists {
+			stmt, err := g.generateCreate(obj.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate CREATE for %v: %w", key, err)
+			}
+			statements = append(statements, stmt)
+		}
+	}
+
+	return statements, nil
+}
+
+// generateDropStatements generates DROP statements in reverse dependency order
+func (g *DDLGenerator) generateDropStatements(keys []schema.ObjectKey, objectMap schema.SchemaObjectMap) ([]string, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	// Build graph
+	graph := BuildGraph(objectMap)
+
+	// Filter to only objects being dropped
+	filteredGraph := FilterGraphForKeys(graph, keys)
+
+	// Reverse topological sort (drop dependents before dependencies)
+	sortedKeys, err := filteredGraph.ReverseTopologicalSort()
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate DROP statements in reverse dependency order
+	var statements []string
+	for _, key := range sortedKeys {
 		stmt, err := g.generateDrop(key)
 		if err != nil {
-			return "", fmt.Errorf("failed to generate DROP for %v: %w", key, err)
+			return nil, fmt.Errorf("failed to generate DROP for %v: %w", key, err)
 		}
 		statements = append(statements, stmt)
 	}
 
-	return strings.Join(statements, "\n\n"), nil
+	return statements, nil
+}
+
+// formatCycle formats a dependency cycle for error messages
+func formatCycle(cycle []schema.ObjectKey) string {
+	if len(cycle) == 0 {
+		return ""
+	}
+
+	parts := make([]string, len(cycle))
+	for i, key := range cycle {
+		parts[i] = fmt.Sprintf("%s.%s", key.Schema, key.Name)
+	}
+
+	return strings.Join(parts, " → ")
 }
 
 // GenerateCreateStatement generates a CREATE statement for an object
@@ -209,13 +290,24 @@ func (g *DDLGenerator) generateCreateFunction(fn schema.Function) string {
 		returnsClause = fmt.Sprintf("RETURNS SETOF %s", ret.Type)
 	}
 
-	return fmt.Sprintf(`CREATE FUNCTION %s.%s(%s)
+	// Build the function definition
+	// Note: VOLATILITY and other options must come AFTER the function body
+	stmt := fmt.Sprintf(`CREATE FUNCTION %s.%s(%s)
 %s
 LANGUAGE %s
-VOLATILITY %s
 AS $$
 %s
-$$;`, fn.Schema, fn.Name, strings.Join(args, ", "), returnsClause, fn.Language, fn.Volatility, fn.Body)
+$$`, fn.Schema, fn.Name, strings.Join(args, ", "), returnsClause, fn.Language, fn.Body)
+
+	// Add function options after the body (if not defaults)
+	// Default for plpgsql is VOLATILE, so we can omit it in most cases
+	// But for completeness, we'll include it if specified
+	if fn.Volatility != schema.Volatile {
+		stmt += fmt.Sprintf("\nVOLATILITY %s", fn.Volatility)
+	}
+
+	stmt += ";"
+	return stmt
 }
 
 func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
@@ -324,7 +416,12 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 
 	switch obj := alter.NewObject.(type) {
 	case schema.Table:
-		return g.generateAlterTable(obj, alter), nil
+		// Pass both old and new table objects for proper constraint handling
+		var oldTable *schema.Table
+		if oldObj, ok := alter.OldObject.(schema.Table); ok {
+			oldTable = &oldObj
+		}
+		return g.generateAlterTable(obj, oldTable, alter), nil
 	case schema.View:
 		// Views: DROP and CREATE
 		dropStmt, _ := g.generateDrop(alter.Key)
@@ -341,20 +438,275 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 	}
 }
 
-func (g *DDLGenerator) generateAlterTable(tbl schema.Table, alter differ.AlterOperation) []string {
+func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Table, alter differ.AlterOperation) []string {
 	var statements []string
 
-	// For now, generate simple ALTER statements based on change descriptions
+	// Build column and constraint maps for quick lookup (new table)
+	colMap := make(map[schema.ColumnName]schema.Column)
+	for _, col := range tbl.Columns {
+		colMap[col.Name] = col
+	}
+
+	// Build old constraint maps for dropping
+	var oldPKName string
+	oldUniqueMap := make(map[string]schema.UniqueConstraint)
+	oldCheckMap := make(map[string]schema.CheckConstraint)
+	oldFKMap := make(map[string]schema.ForeignKey)
+
+	if oldTable != nil {
+		if oldTable.PrimaryKey != nil && oldTable.PrimaryKey.Name != nil {
+			oldPKName = *oldTable.PrimaryKey.Name
+		}
+		for _, uq := range oldTable.Uniques {
+			oldUniqueMap[uq.Name] = uq
+		}
+		for _, ck := range oldTable.Checks {
+			oldCheckMap[ck.Name] = ck
+		}
+		for _, fk := range oldTable.ForeignKeys {
+			oldFKMap[fk.Name] = fk
+		}
+	}
+
+	// Process each change and generate appropriate DDL
 	for _, change := range alter.Changes {
-		// This is simplified - would need more sophisticated parsing of changes
-		if strings.Contains(change, "add column") {
-			// Extract column name (simplified)
-			statements = append(statements, fmt.Sprintf("-- TODO: %s", change))
-		} else if strings.Contains(change, "drop column") {
-			statements = append(statements, fmt.Sprintf("-- TODO: %s", change))
+		if strings.HasPrefix(change, "add column ") {
+			colName := schema.ColumnName(strings.TrimPrefix(change, "add column "))
+			if col, exists := colMap[colName]; exists {
+				colDef := fmt.Sprintf("%s %s", col.Name, col.Type)
+				if col.NotNull {
+					colDef += " NOT NULL"
+				}
+				if col.Default != nil {
+					colDef += fmt.Sprintf(" DEFAULT %s", *col.Default)
+				}
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN %s;", tbl.Schema, tbl.Name, colDef))
+			}
+		} else if strings.HasPrefix(change, "drop column ") {
+			colName := strings.TrimPrefix(change, "drop column ")
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP COLUMN %s;", tbl.Schema, tbl.Name, colName))
+		} else if strings.HasPrefix(change, "alter column ") {
+			// Parse "alter column <name>: <details>"
+			parts := strings.SplitN(strings.TrimPrefix(change, "alter column "), ": ", 2)
+			if len(parts) == 2 {
+				colName := parts[0]
+				changeDetail := parts[1]
+				statements = append(statements, g.generateColumnAlter(tbl, colName, changeDetail)...)
+			}
+		} else if strings.HasPrefix(change, "add primary key") {
+			if tbl.PrimaryKey != nil {
+				pkCols := make([]string, len(tbl.PrimaryKey.Cols))
+				for i, col := range tbl.PrimaryKey.Cols {
+					pkCols[i] = string(col)
+				}
+				pkName := "pkey"
+				if tbl.PrimaryKey.Name != nil {
+					pkName = *tbl.PrimaryKey.Name
+				}
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s);",
+					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", ")))
+			}
+		} else if strings.HasPrefix(change, "drop primary key") {
+			if oldPKName != "" {
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+					tbl.Schema, tbl.Name, oldPKName))
+			} else {
+				statements = append(statements, fmt.Sprintf("-- TODO: %s (old constraint name not available)", change))
+			}
+		} else if strings.HasPrefix(change, "primary key columns changed") || strings.Contains(change, "primary key") && strings.Contains(change, "changed") {
+			// Drop old primary key and add new one
+			if oldPKName != "" {
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+					tbl.Schema, tbl.Name, oldPKName))
+			}
+			if tbl.PrimaryKey != nil {
+				pkCols := make([]string, len(tbl.PrimaryKey.Cols))
+				for i, col := range tbl.PrimaryKey.Cols {
+					pkCols[i] = string(col)
+				}
+				pkName := "pkey"
+				if tbl.PrimaryKey.Name != nil {
+					pkName = *tbl.PrimaryKey.Name
+				}
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s);",
+					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", ")))
+			}
+		} else if strings.HasPrefix(change, "add unique constraint ") {
+			constraintName := strings.TrimPrefix(change, "add unique constraint ")
+			for _, uq := range tbl.Uniques {
+				if uq.Name == constraintName {
+					uqCols := make([]string, len(uq.Cols))
+					for i, col := range uq.Cols {
+						uqCols[i] = string(col)
+					}
+					statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s);",
+						tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", ")))
+					break
+				}
+			}
+		} else if strings.HasPrefix(change, "drop unique constraint ") {
+			constraintName := strings.TrimPrefix(change, "drop unique constraint ")
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+				tbl.Schema, tbl.Name, constraintName))
+		} else if strings.HasPrefix(change, "add check constraint ") {
+			constraintName := strings.TrimPrefix(change, "add check constraint ")
+			for _, ck := range tbl.Checks {
+				if ck.Name == constraintName {
+					statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s);",
+						tbl.Schema, tbl.Name, ck.Name, ck.Expr))
+					break
+				}
+			}
+		} else if strings.HasPrefix(change, "drop check constraint ") {
+			constraintName := strings.TrimPrefix(change, "drop check constraint ")
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+				tbl.Schema, tbl.Name, constraintName))
+		} else if strings.HasPrefix(change, "add foreign key ") {
+			constraintName := strings.TrimPrefix(change, "add foreign key ")
+			for _, fk := range tbl.ForeignKeys {
+				if fk.Name == constraintName {
+					fkCols := make([]string, len(fk.Cols))
+					for i, col := range fk.Cols {
+						fkCols[i] = string(col)
+					}
+					refCols := make([]string, len(fk.Ref.Cols))
+					for i, col := range fk.Ref.Cols {
+						refCols[i] = string(col)
+					}
+					fkDef := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
+						tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+					if fk.OnDelete != schema.NoAction {
+						fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
+					}
+					if fk.OnUpdate != schema.NoAction {
+						fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
+					}
+					statements = append(statements, fkDef+";")
+					break
+				}
+			}
+		} else if strings.HasPrefix(change, "drop foreign key ") {
+			constraintName := strings.TrimPrefix(change, "drop foreign key ")
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+				tbl.Schema, tbl.Name, constraintName))
+		} else if strings.Contains(change, "unique constraint") && strings.Contains(change, "changed") {
+			// Modified unique constraint: drop and recreate
+			// Parse "unique constraint <name> <property> changed"
+			parts := strings.Fields(change)
+			if len(parts) >= 3 {
+				constraintName := parts[2]
+				// Drop old
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+					tbl.Schema, tbl.Name, constraintName))
+				// Add new
+				for _, uq := range tbl.Uniques {
+					if uq.Name == constraintName {
+						uqCols := make([]string, len(uq.Cols))
+						for i, col := range uq.Cols {
+							uqCols[i] = string(col)
+						}
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s);",
+							tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", ")))
+						break
+					}
+				}
+			}
+		} else if strings.Contains(change, "check constraint") && strings.Contains(change, "changed") {
+			// Modified check constraint: drop and recreate
+			parts := strings.Fields(change)
+			if len(parts) >= 3 {
+				constraintName := parts[2]
+				// Drop old
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+					tbl.Schema, tbl.Name, constraintName))
+				// Add new
+				for _, ck := range tbl.Checks {
+					if ck.Name == constraintName {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s);",
+							tbl.Schema, tbl.Name, ck.Name, ck.Expr))
+						break
+					}
+				}
+			}
+		} else if strings.Contains(change, "foreign key") && strings.Contains(change, "changed") {
+			// Modified foreign key: drop and recreate
+			parts := strings.Fields(change)
+			if len(parts) >= 3 {
+				constraintName := parts[2]
+				// Drop old
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+					tbl.Schema, tbl.Name, constraintName))
+				// Add new
+				for _, fk := range tbl.ForeignKeys {
+					if fk.Name == constraintName {
+						fkCols := make([]string, len(fk.Cols))
+						for i, col := range fk.Cols {
+							fkCols[i] = string(col)
+						}
+						refCols := make([]string, len(fk.Ref.Cols))
+						for i, col := range fk.Ref.Cols {
+							refCols[i] = string(col)
+						}
+						fkDef := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
+							tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+						if fk.OnDelete != schema.NoAction {
+							fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
+						}
+						if fk.OnUpdate != schema.NoAction {
+							fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
+						}
+						statements = append(statements, fkDef+";")
+						break
+					}
+				}
+			}
 		} else {
+			// Fallback for other changes
 			statements = append(statements, fmt.Sprintf("-- TODO: %s", change))
 		}
+	}
+
+	return statements
+}
+
+func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, colName, changeDetail string) []string {
+	var statements []string
+	tableName := fmt.Sprintf("%s.%s", tbl.Schema, tbl.Name)
+
+	if strings.Contains(changeDetail, "type changed") {
+		// Parse "type changed from <old> to <new>"
+		if strings.Contains(changeDetail, " to ") {
+			parts := strings.Split(changeDetail, " to ")
+			if len(parts) == 2 {
+				newType := strings.TrimSpace(parts[1])
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;",
+					tableName, colName, newType))
+			}
+		}
+	} else if changeDetail == "set not null" {
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;",
+			tableName, colName))
+	} else if changeDetail == "drop not null" {
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;",
+			tableName, colName))
+	} else if changeDetail == "default changed" {
+		// Find the column to get the new default value
+		for _, col := range tbl.Columns {
+			if col.Name == schema.ColumnName(colName) {
+				if col.Default != nil {
+					statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;",
+						tableName, colName, *col.Default))
+				} else {
+					statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;",
+						tableName, colName))
+				}
+				break
+			}
+		}
+	} else {
+		// For other column changes, generate a TODO
+		statements = append(statements, fmt.Sprintf("-- TODO: ALTER TABLE %s ALTER COLUMN %s: %s",
+			tableName, colName, changeDetail))
 	}
 
 	return statements

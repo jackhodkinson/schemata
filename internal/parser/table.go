@@ -32,7 +32,7 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 
 		switch node := elt.Node.(type) {
 		case *pg_query.Node_ColumnDef:
-			col, isPK, err := p.parseColumnDef(node.ColumnDef)
+			col, isPK, isUnique, colFK, err := p.parseColumnDef(node.ColumnDef)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse column: %w", err)
 			}
@@ -47,6 +47,26 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 				}
 			}
 
+			// Handle inline UNIQUE constraint
+			if isUnique {
+				// Generate constraint name: table_column_key
+				constraintName := fmt.Sprintf("%s_%s_key", table.Name, col.Name)
+				table.Uniques = append(table.Uniques, schema.UniqueConstraint{
+					Name:          constraintName,
+					Cols:          []schema.ColumnName{col.Name},
+					NullsDistinct: true, // Default
+				})
+			}
+
+			// Handle inline REFERENCES constraint (column-level FK)
+			if colFK != nil {
+				// Generate constraint name if not provided
+				if colFK.Name == "" {
+					colFK.Name = fmt.Sprintf("%s_%s_fkey", table.Name, col.Name)
+				}
+				table.ForeignKeys = append(table.ForeignKeys, *colFK)
+			}
+
 		case *pg_query.Node_Constraint:
 			err := p.parseTableConstraint(node.Constraint, &table)
 			if err != nil {
@@ -59,10 +79,12 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 }
 
 // parseColumnDef parses a column definition
-// Returns the column and a bool indicating if this column has an inline PRIMARY KEY
-func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, error) {
+// Returns the column, a bool indicating if this column has an inline PRIMARY KEY,
+// a bool indicating if this column has UNIQUE constraint,
+// and an optional ForeignKey if the column has an inline REFERENCES clause
+func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, bool, *schema.ForeignKey, error) {
 	if col == nil {
-		return schema.Column{}, false, fmt.Errorf("nil column definition")
+		return schema.Column{}, false, false, nil, fmt.Errorf("nil column definition")
 	}
 
 	column := schema.Column{
@@ -77,19 +99,29 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, e
 
 	// Parse column constraints
 	isPrimaryKey := false
+	isUnique := false
+	var columnFK *schema.ForeignKey
+
 	for _, constraint := range col.Constraints {
 		if constraint == nil {
 			continue
 		}
 
 		if c, ok := constraint.Node.(*pg_query.Node_Constraint); ok {
-			if p.parseColumnConstraint(c.Constraint, &column) {
+			isPK, isUQ, fk := p.parseColumnConstraint(c.Constraint, &column)
+			if isPK {
 				isPrimaryKey = true
+			}
+			if isUQ {
+				isUnique = true
+			}
+			if fk != nil {
+				columnFK = fk
 			}
 		}
 	}
 
-	return column, isPrimaryKey, nil
+	return column, isPrimaryKey, isUnique, columnFK, nil
 }
 
 // parseTypeName converts a TypeName node to our TypeName
@@ -143,17 +175,24 @@ func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) string {
 }
 
 // parseColumnConstraint parses column-level constraints
-// Returns true if this is a PRIMARY KEY constraint (needs table-level handling)
-func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) bool {
+// Returns (isPrimaryKey, isUnique, foreignKey)
+// - isPrimaryKey: true if this is a PRIMARY KEY constraint (needs table-level handling)
+// - isUnique: true if this is a UNIQUE constraint (needs table-level handling)
+// - foreignKey: non-nil if this is a REFERENCES constraint (needs to be added to table.ForeignKeys)
+func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) (bool, bool, *schema.ForeignKey) {
 	if constraint == nil {
-		return false
+		return false, false, nil
 	}
 
 	switch constraint.Contype {
 	case pg_query.ConstrType_CONSTR_PRIMARY:
 		// PRIMARY KEY on column - caller needs to handle this at table level
 		column.NotNull = true // Primary keys are implicitly NOT NULL
-		return true
+		return true, false, nil
+
+	case pg_query.ConstrType_CONSTR_UNIQUE:
+		// UNIQUE constraint on column - caller needs to handle this at table level
+		return false, true, nil
 
 	case pg_query.ConstrType_CONSTR_NOTNULL:
 		column.NotNull = true
@@ -182,9 +221,46 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 				Stored: true, // Default to STORED
 			}
 		}
+
+	case pg_query.ConstrType_CONSTR_FOREIGN:
+		// Column-level REFERENCES constraint
+		// The column name is implicit (it's the column being defined)
+		refCols := p.extractColumnNames(constraint.PkAttrs)
+
+		// Extract referenced table
+		refSchema := schema.SchemaName("public")
+		refTable := ""
+		if constraint.Pktable != nil {
+			refSchema, refTable = p.extractQualifiedName(constraint.Pktable)
+		}
+
+		// Generate a constraint name if not provided
+		constraintName := constraint.Conname
+		if constraintName == "" {
+			// Auto-generate name: <table>_<column>_fkey
+			// Note: We don't have table name here, so we'll let the caller set it
+			constraintName = ""
+		}
+
+		fk := &schema.ForeignKey{
+			Name: constraintName,
+			Cols: []schema.ColumnName{column.Name}, // Column is implicit!
+			Ref: schema.ForeignKeyRef{
+				Schema: refSchema,
+				Table:  schema.TableName(refTable),
+				Cols:   refCols,
+			}			,
+			OnUpdate:          p.parseFkActionString(constraint.FkUpdAction),
+			OnDelete:          p.parseFkActionString(constraint.FkDelAction),
+			Match:             p.parseFkMatchTypeString(constraint.FkMatchtype),
+			Deferrable:        constraint.Deferrable,
+			InitiallyDeferred: constraint.Initdeferred,
+		}
+
+		return false, false, fk
 	}
 
-	return false
+	return false, false, nil
 }
 
 // parseTableConstraint parses table-level constraints
@@ -232,7 +308,8 @@ func (p *Parser) parseTableConstraint(constraint *pg_query.Constraint, table *sc
 
 	case pg_query.ConstrType_CONSTR_FOREIGN:
 		// Foreign key
-		cols := p.extractColumnNames(constraint.Keys)
+		// Note: For FK constraints, pg_query uses FkAttrs for source columns, not Keys
+		cols := p.extractColumnNames(constraint.FkAttrs)
 		refCols := p.extractColumnNames(constraint.PkAttrs)
 
 		// Extract referenced table

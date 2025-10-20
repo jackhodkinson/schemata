@@ -10,8 +10,9 @@ import (
 func compareTables(desired, actual schema.Table) []string {
 	var changes []string
 
-	// Compare owner
-	if !stringPtrEqual(desired.Owner, actual.Owner) {
+	// Compare owner - but only if desired owner is specified
+	// If desired owner is nil, we don't care about the actual owner
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
 		changes = append(changes, "owner changed")
 	}
 
@@ -375,7 +376,8 @@ func compareViews(desired, actual schema.View) []string {
 		changes = append(changes, "check option changed")
 	}
 
-	if !stringPtrEqual(desired.Owner, actual.Owner) {
+	// Compare owner - but only if desired owner is specified
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
 		changes = append(changes, "owner changed")
 	}
 

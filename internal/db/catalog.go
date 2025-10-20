@@ -47,21 +47,76 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 	objects = append(objects, domains...)
 
 	// Extract sequences
-	sequences, err := c.extractSequences(ctx, schemaFilter)
+	sequenceObjs, err := c.extractSequences(ctx, schemaFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract sequences: %w", err)
 	}
-	objects = append(objects, sequences...)
 
 	// Extract tables (with columns and constraints)
-	tables, err := c.extractTables(ctx, schemaFilter)
+	tableObjs, err := c.extractTables(ctx, schemaFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract tables: %w", err)
 	}
-	objects = append(objects, tables...)
+
+	// Normalize tables to convert expanded SERIAL types back to SERIAL
+	// Build sequence slice for normalization
+	var sequences []schema.Sequence
+	for _, obj := range sequenceObjs {
+		if seq, ok := obj.(schema.Sequence); ok {
+			sequences = append(sequences, seq)
+		}
+	}
+
+	// Normalize each table and filter out sequences owned by SERIAL columns
+	var serialSequences = make(map[schema.ObjectKey]bool)
+	for i, obj := range tableObjs {
+		if tbl, ok := obj.(schema.Table); ok {
+			normalizedTable := NormalizeTable(tbl, sequences)
+			tableObjs[i] = normalizedTable
+
+			// Mark sequences that are owned by SERIAL columns so we can filter them out
+			for _, col := range normalizedTable.Columns {
+				// If column type is serial/bigserial/smallserial, it has an owned sequence
+				typeLower := strings.ToLower(string(col.Type))
+				if typeLower == "serial" || typeLower == "bigserial" || typeLower == "smallserial" {
+					// Find the sequence owned by this column
+					for _, seq := range sequences {
+						if seq.OwnedBy != nil &&
+							seq.OwnedBy.Schema == normalizedTable.Schema &&
+							seq.OwnedBy.Table == normalizedTable.Name &&
+							seq.OwnedBy.Column == col.Name {
+							key := schema.ObjectKey{
+								Kind:   schema.SequenceKind,
+								Schema: seq.Schema,
+								Name:   string(seq.Name),
+							}
+							serialSequences[key] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Add tables to objects
+	objects = append(objects, tableObjs...)
+
+	// Add only non-SERIAL sequences to objects (filter out auto-generated sequences)
+	for _, obj := range sequenceObjs {
+		if seq, ok := obj.(schema.Sequence); ok {
+			key := schema.ObjectKey{
+				Kind:   schema.SequenceKind,
+				Schema: seq.Schema,
+				Name:   string(seq.Name),
+			}
+			if !serialSequences[key] {
+				objects = append(objects, seq)
+			}
+		}
+	}
 
 	// Extract indexes (excluding implicit indexes for PK/UNIQUE)
-	indexes, err := c.extractIndexes(ctx, schemaFilter, tables)
+	indexes, err := c.extractIndexes(ctx, schemaFilter, tableObjs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract indexes: %w", err)
 	}
@@ -250,14 +305,17 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 			s.seqmax as max_value,
 			s.seqcache as cache_size,
 			s.seqcycle as cycle,
-			d.refobjid::regclass::text as owned_by_table,
+			tn.nspname as owned_by_schema,
+			tc.relname as owned_by_table,
 			a.attname as owned_by_column
 		FROM pg_sequence s
 		JOIN pg_class c ON s.seqrelid = c.oid
 		JOIN pg_namespace n ON c.relnamespace = n.oid
 		LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype = 'a'
 		LEFT JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
-		WHERE %s
+		LEFT JOIN pg_class tc ON tc.oid = d.refobjid
+		LEFT JOIN pg_namespace tn ON tc.relnamespace = tn.oid
+		WHERE n.%s
 		ORDER BY n.nspname, c.relname
 	`, schemaFilter)
 
@@ -270,22 +328,19 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 	var objects []schema.DatabaseObject
 	for rows.Next() {
 		var seq schema.Sequence
-		var ownedByTable, ownedByColumn *string
+		var ownedBySchema, ownedByTable, ownedByColumn *string
 
 		if err := rows.Scan(&seq.Schema, &seq.Name, &seq.Type, &seq.Start, &seq.Increment,
-			&seq.MinValue, &seq.MaxValue, &seq.Cache, &seq.Cycle, &ownedByTable, &ownedByColumn); err != nil {
+			&seq.MinValue, &seq.MaxValue, &seq.Cache, &seq.Cycle,
+			&ownedBySchema, &ownedByTable, &ownedByColumn); err != nil {
 			return nil, err
 		}
 
-		if ownedByTable != nil && ownedByColumn != nil {
-			// Parse schema.table from owned_by_table
-			parts := strings.Split(*ownedByTable, ".")
-			if len(parts) == 2 {
-				seq.OwnedBy = &schema.SequenceOwner{
-					Schema: schema.SchemaName(parts[0]),
-					Table:  schema.TableName(parts[1]),
-					Column: schema.ColumnName(*ownedByColumn),
-				}
+		if ownedBySchema != nil && ownedByTable != nil && ownedByColumn != nil {
+			seq.OwnedBy = &schema.SequenceOwner{
+				Schema: schema.SchemaName(*ownedBySchema),
+				Table:  schema.TableName(*ownedByTable),
+				Column: schema.ColumnName(*ownedByColumn),
 			}
 		}
 
@@ -442,7 +497,8 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 		SELECT
 			con.conname as constraint_name,
 			con.contype::text as constraint_type,
-			array_agg(a.attname ORDER BY u.pos) as columns,
+			array_agg(a.attname ORDER BY u.pos) FILTER (WHERE a.attname IS NOT NULL) as columns,
+			array_agg(af.attname ORDER BY uf.pos) FILTER (WHERE af.attname IS NOT NULL) as ref_columns,
 			con.condeferrable as deferrable,
 			con.condeferred as deferred,
 			pg_get_constraintdef(con.oid, true) as definition,
@@ -456,6 +512,8 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 		JOIN pg_namespace n ON c.relnamespace = n.oid
 		LEFT JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, pos) ON true
 		LEFT JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = u.attnum
+		LEFT JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS uf(attnum, pos) ON true
+		LEFT JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = uf.attnum
 		LEFT JOIN pg_class fc ON con.confrelid = fc.oid
 		LEFT JOIN pg_namespace fn ON fc.relnamespace = fn.oid
 		WHERE n.nspname = $1 AND c.relname = $2
@@ -477,11 +535,12 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 	for rows.Next() {
 		var name, contype, definition string
 		var columns []string
+		var refColumns []string
 		var deferrable, deferred bool
 		var foreignSchema, foreignTable *string
 		var updateAction, deleteAction, matchType *string
 
-		if err := rows.Scan(&name, &contype, &columns, &deferrable, &deferred, &definition,
+		if err := rows.Scan(&name, &contype, &columns, &refColumns, &deferrable, &deferred, &definition,
 			&foreignSchema, &foreignTable, &updateAction, &deleteAction, &matchType); err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -530,9 +589,11 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 				cols[i] = schema.ColumnName(c)
 			}
 
-			// Parse referenced columns from definition
-			// TODO: This is a simplified version, might need more robust parsing
-			refCols := []schema.ColumnName{} // Placeholder
+			// Convert referenced columns from array
+			refCols := make([]schema.ColumnName, len(refColumns))
+			for i, c := range refColumns {
+				refCols[i] = schema.ColumnName(c)
+			}
 
 			fks = append(fks, schema.ForeignKey{
 				Name: name,
@@ -602,6 +663,7 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 		}
 	}
 
+	// First, get index metadata
 	query := fmt.Sprintf(`
 		SELECT
 			n.nspname as schema,
@@ -609,7 +671,7 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 			i.relname as index_name,
 			ix.indisunique as is_unique,
 			am.amname as method,
-			pg_get_indexdef(ix.indexrelid) as definition,
+			ix.indexrelid::int8 as index_oid,
 			obj_description(i.oid, 'pg_class') as comment
 		FROM pg_index ix
 		JOIN pg_class c ON ix.indrelid = c.oid
@@ -631,11 +693,11 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 	var objects []schema.DatabaseObject
 	for rows.Next() {
 		var idx schema.Index
-		var definition string
+		var indexOID int64
 		var comment *string
 		var method string
 
-		if err := rows.Scan(&idx.Schema, &idx.Table, &idx.Name, &idx.Unique, &method, &definition, &comment); err != nil {
+		if err := rows.Scan(&idx.Schema, &idx.Table, &idx.Name, &idx.Unique, &method, &indexOID, &comment); err != nil {
 			return nil, err
 		}
 
@@ -648,12 +710,38 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 		idx.Method = schema.IndexMethod(method)
 		idx.Comment = comment
 
-		// TODO: Parse definition to extract key expressions, predicate, include columns
-		// For now, just create a simple key expr
-		idx.KeyExprs = []schema.IndexKeyExpr{
-			{Expr: schema.Expr(definition)},
+		// Extract key expressions by querying pg_get_indexdef for each column
+		// This gets the actual expression text for each index column
+		keyExprsQuery := `
+			SELECT
+				pg_get_indexdef($1, k, true) as expr
+			FROM generate_series(1, (
+				SELECT array_length(indkey, 1)
+				FROM pg_index
+				WHERE indexrelid = $1
+			)) k
+		`
+		keyRows, err := c.pool.Query(ctx, keyExprsQuery, indexOID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract key expressions for index %s: %w", idx.Name, err)
 		}
 
+		var keyExprs []schema.IndexKeyExpr
+		for keyRows.Next() {
+			var expr string
+			if err := keyRows.Scan(&expr); err != nil {
+				keyRows.Close()
+				return nil, err
+			}
+			keyExprs = append(keyExprs, schema.IndexKeyExpr{Expr: schema.Expr(expr)})
+		}
+		keyRows.Close()
+
+		if err := keyRows.Err(); err != nil {
+			return nil, err
+		}
+
+		idx.KeyExprs = keyExprs
 		objects = append(objects, idx)
 	}
 
@@ -718,10 +806,10 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			pg_get_function_identity_arguments(p.oid) as args,
 			pg_get_function_result(p.oid) as returns,
 			l.lanname as language,
-			p.provolatile as volatility,
+			p.provolatile::text as volatility,
 			p.proisstrict as is_strict,
 			p.prosecdef as security_definer,
-			p.proparallel as parallel,
+			p.proparallel::text as parallel,
 			pg_get_functiondef(p.oid) as source,
 			obj_description(p.oid, 'pg_proc') as comment
 		FROM pg_proc p
@@ -810,20 +898,32 @@ func (c *Catalog) extractTriggers(ctx context.Context, schemaFilter string) ([]s
 		var trig schema.Trigger
 		var timingEvents int16
 		var functionName string
+		var comment *string
 
-		if err := rows.Scan(&trig.Schema, &trig.Table, &trig.Name, &timingEvents, &functionName); err != nil {
+		if err := rows.Scan(&trig.Schema, &trig.Table, &trig.Name, &timingEvents, &functionName, &comment); err != nil {
 			return nil, err
 		}
 
 		// Parse timing and events from tgtype bitfield
-		// Timing: 2=BEFORE, 4=AFTER, 64=INSTEAD OF
-		// Events: 4=INSERT, 8=DELETE, 16=UPDATE, 32=TRUNCATE
+		// Bit 0 (1): Row-level trigger (FOR EACH ROW)
+		// Bit 1 (2): BEFORE
+		// Bit 2 (4): INSERT (conflicts with AFTER - need to check timing first)
+		// Bit 3 (8): DELETE
+		// Bit 4 (16): UPDATE
+		// Bit 5 (32): TRUNCATE
+		// Bit 6 (64): INSTEAD OF
+
+		// Parse FOR EACH ROW (bit 0)
+		trig.ForEachRow = (timingEvents & 1) != 0
+
+		// Parse timing
 		if timingEvents&2 != 0 {
 			trig.Timing = schema.Before
-		} else if timingEvents&4 != 0 {
-			trig.Timing = schema.After
 		} else if timingEvents&64 != 0 {
 			trig.Timing = schema.InsteadOf
+		} else {
+			// If neither BEFORE nor INSTEAD OF, it's AFTER
+			trig.Timing = schema.After
 		}
 
 		// Parse events
@@ -869,7 +969,7 @@ func (c *Catalog) extractPolicies(ctx context.Context, schemaFilter string) ([]s
 			c.relname as table_name,
 			pol.polname as policy_name,
 			pol.polpermissive as is_permissive,
-			pol.polcmd as command,
+			pol.polcmd::text as command,
 			pol.polroles,
 			pg_get_expr(pol.polqual, pol.polrelid) as using_expr,
 			pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check_expr

@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
@@ -68,16 +70,26 @@ func normalize(obj schema.DatabaseObject) schema.DatabaseObject {
 }
 
 func normalizeTable(tbl schema.Table) schema.Table {
+	// Normalize column types
+	normalizedCols := make([]schema.Column, len(tbl.Columns))
+	copy(normalizedCols, tbl.Columns)
+	for i := range normalizedCols {
+		normalizedCols[i].Type = normalizeTypeName(normalizedCols[i].Type)
+		// Normalize default expressions
+		if normalizedCols[i].Default != nil {
+			normalized := normalizeExpr(*normalizedCols[i].Default)
+			normalizedCols[i].Default = &normalized
+		}
+	}
+
 	// Sort columns by name for consistent hashing
 	// Note: While column order affects physical layout in Postgres, for schema diffing
 	// purposes we treat tables with the same columns in different order as equivalent.
 	// Physical column reordering requires table rebuild, which is beyond basic schema management.
-	sortedCols := make([]schema.Column, len(tbl.Columns))
-	copy(sortedCols, tbl.Columns)
-	sort.Slice(sortedCols, func(i, j int) bool {
-		return sortedCols[i].Name < sortedCols[j].Name
+	sort.Slice(normalizedCols, func(i, j int) bool {
+		return normalizedCols[i].Name < normalizedCols[j].Name
 	})
-	tbl.Columns = sortedCols
+	tbl.Columns = normalizedCols
 
 	// Sort constraints by name for consistent hashing
 	sort.Slice(tbl.Uniques, func(i, j int) bool {
@@ -102,6 +114,20 @@ func normalizeTable(tbl schema.Table) schema.Table {
 }
 
 func normalizeIndex(idx schema.Index) schema.Index {
+	// Normalize key expressions
+	normalizedExprs := make([]schema.IndexKeyExpr, len(idx.KeyExprs))
+	for i, keyExpr := range idx.KeyExprs {
+		normalizedExprs[i] = keyExpr
+		normalizedExprs[i].Expr = normalizeExpr(keyExpr.Expr)
+	}
+	idx.KeyExprs = normalizedExprs
+
+	// Normalize predicate if present
+	if idx.Predicate != nil {
+		normalized := normalizeExpr(*idx.Predicate)
+		idx.Predicate = &normalized
+	}
+
 	// Sort include columns
 	sortedInclude := make([]schema.ColumnName, len(idx.Include))
 	copy(sortedInclude, idx.Include)
@@ -121,6 +147,18 @@ func normalizeView(view schema.View) schema.View {
 }
 
 func normalizeFunction(fn schema.Function) schema.Function {
+	// Normalize function body
+	// 1. Trim leading/trailing whitespace
+	// 2. Normalize internal whitespace (multiple spaces/newlines to single space)
+	// 3. Convert to lowercase for case-insensitive comparison
+	body := strings.TrimSpace(fn.Body)
+
+	// Normalize whitespace: replace multiple whitespace chars with single space
+	body = regexp.MustCompile(`\s+`).ReplaceAllString(body, " ")
+
+	// Convert to lowercase for case-insensitive keyword comparison
+	fn.Body = strings.ToLower(body)
+
 	// Sort search path
 	sortedPath := make([]schema.SchemaName, len(fn.SearchPath))
 	copy(sortedPath, fn.SearchPath)
@@ -182,4 +220,86 @@ func normalizePolicy(pol schema.Policy) schema.Policy {
 		pol.To = sorted
 	}
 	return pol
+}
+
+// normalizeTypeName normalizes type names to their canonical form
+func normalizeTypeName(typeName schema.TypeName) schema.TypeName {
+	typeStr := strings.TrimSpace(string(typeName))
+
+	// Handle common aliases - normalize TO the SQL standard names
+	switch strings.ToLower(typeStr) {
+	case "int", "int4":
+		return "integer"
+	case "int8":
+		return "bigint"
+	case "int2":
+		return "smallint"
+	case "bool":
+		return "boolean"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "time":
+		return "time without time zone"
+	case "character varying":
+		// Extract length if present
+		re := regexp.MustCompile(`character varying\((\d+)\)`)
+		if matches := re.FindStringSubmatch(typeStr); len(matches) > 0 {
+			return schema.TypeName("varchar(" + matches[1] + ")")
+		}
+		return "varchar"
+	case "character":
+		// Extract length if present
+		re := regexp.MustCompile(`character\((\d+)\)`)
+		if matches := re.FindStringSubmatch(typeStr); len(matches) > 0 {
+			return schema.TypeName("char(" + matches[1] + ")")
+		}
+		return "char"
+	}
+
+	// Handle parameterized types by converting them to lowercase
+	// but preserving the structure
+	if strings.Contains(typeStr, "(") {
+		// Extract base type and parameters
+		parts := strings.SplitN(typeStr, "(", 2)
+		if len(parts) == 2 {
+			baseType := strings.ToLower(strings.TrimSpace(parts[0]))
+			params := parts[1]
+
+			// Apply normalization to base type
+			switch baseType {
+			case "character varying":
+				return schema.TypeName("varchar(" + params)
+			case "character":
+				return schema.TypeName("char(" + params)
+			}
+		}
+	}
+
+	return typeName
+}
+
+// normalizeExpr normalizes SQL expressions to a canonical form
+func normalizeExpr(expr schema.Expr) schema.Expr {
+	exprStr := strings.TrimSpace(string(expr))
+
+	// Normalize to lowercase for function names and keywords
+	exprLower := strings.ToLower(exprStr)
+
+	// Common expression normalizations
+	// CURRENT_TIMESTAMP, current_timestamp, CURRENT_TIMESTAMP(), etc.
+	if exprLower == "current_timestamp" || exprLower == "current_timestamp()" {
+		return "current_timestamp"
+	}
+
+	// now() is equivalent to CURRENT_TIMESTAMP
+	if exprLower == "now()" {
+		return "current_timestamp"
+	}
+
+	// Default: return lowercase version
+	return schema.Expr(exprLower)
 }

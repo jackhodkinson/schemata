@@ -236,9 +236,12 @@ func (p *Parser) parseFunctionOption(opt *pg_query.DefElem, fn *schema.Function)
 	case "security":
 		fn.SecurityDefiner = true
 	case "as":
-		// Function body
+		// Function body - can be a single string or a list of strings
 		if body := p.extractStringValue(opt.Arg); body != "" {
 			fn.Body = body
+		} else if bodyParts := p.extractListValues(opt.Arg); len(bodyParts) > 0 {
+			// PL/pgSQL functions often have body as a list of strings
+			fn.Body = strings.Join(bodyParts, "\n")
 		}
 	}
 }
@@ -404,4 +407,21 @@ func (p *Parser) extractStringValue(node *pg_query.Node) string {
 		return strNode.String_.Sval
 	}
 	return ""
+}
+
+// Helper: extract list of string values from a node (for function bodies, etc.)
+func (p *Parser) extractListValues(node *pg_query.Node) []string {
+	if node == nil {
+		return nil
+	}
+	if listNode, ok := node.Node.(*pg_query.Node_List); ok {
+		var values []string
+		for _, item := range listNode.List.Items {
+			if str := p.extractStringValue(item); str != "" {
+				values = append(values, str)
+			}
+		}
+		return values
+	}
+	return nil
 }
