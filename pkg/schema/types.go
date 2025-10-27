@@ -218,6 +218,9 @@ type CheckConstraint struct {
 	NoInherit         bool
 	Deferrable        bool
 	InitiallyDeferred bool
+	// ColumnName is set for column-level CHECK constraints to track the associated column
+	// Used for generating auto-names following PostgreSQL's pattern: {table}_{column}_check
+	ColumnName        *ColumnName
 }
 
 // ForeignKey represents a foreign key constraint

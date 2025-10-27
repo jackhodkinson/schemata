@@ -9,7 +9,6 @@ import (
 	"github.com/jackhodkinson/schemata/internal/db"
 	"github.com/jackhodkinson/schemata/internal/differ"
 	"github.com/jackhodkinson/schemata/internal/parser"
-	"github.com/jackhodkinson/schemata/pkg/schema"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,7 +28,7 @@ func TestEndToEnd_SchemataMigrate(t *testing.T) {
 	ctx := context.Background()
 
 	// Connect to test database
-	dbConn := &config.DBConnection{ConnectionString: dbURL}
+	dbConn := &config.DBConnection{URL: &dbURL}
 	pool, err := db.Connect(ctx, dbConn)
 	require.NoError(t, err, "Failed to connect to test database")
 	defer pool.Close()
@@ -40,7 +39,7 @@ func TestEndToEnd_SchemataMigrate(t *testing.T) {
 	require.NoError(t, err, "Failed to apply schema")
 
 	// Parse schema.sql file (what the user wrote)
-	schemaFile := "../../testdata/schema.sql"
+	schemaFile := "../../../test-schemata/schema.sql"
 	p := parser.NewParser()
 	desiredSchema, err := p.ParseFile(schemaFile)
 	require.NoError(t, err, "Failed to parse schema.sql")
@@ -48,12 +47,13 @@ func TestEndToEnd_SchemataMigrate(t *testing.T) {
 	t.Logf("Parsed %d objects from schema.sql", len(desiredSchema))
 
 	// Extract actual schema from database (what's actually in the DB)
+	// Exclude system schemas and schemata schema (used for migration tracking)
 	catalog := db.NewCatalog(pool)
-	actualObjects, err := catalog.ExtractAllObjects(ctx, nil, nil)
+	actualObjects, err := catalog.ExtractAllObjects(ctx, nil, []string{"pg_catalog", "information_schema", "pg_toast", "schemata"})
 	require.NoError(t, err, "Failed to extract catalog from database")
 
 	// Build object map from catalog
-	actualSchema, err := buildObjectMap(actualObjects)
+	actualSchema, err := buildObjectMapFromObjects(actualObjects)
 	require.NoError(t, err, "Failed to build object map from catalog")
 
 	t.Logf("Extracted %d objects from database", len(actualSchema))
@@ -120,7 +120,7 @@ func cleanAndApplySchema(ctx context.Context, pool *db.Pool) error {
 	}
 
 	// Read schema.sql
-	schemaSQL, err := os.ReadFile("../../testdata/schema.sql")
+	schemaSQL, err := os.ReadFile("../../../test-schemata/schema.sql")
 	if err != nil {
 		return err
 	}
@@ -130,22 +130,3 @@ func cleanAndApplySchema(ctx context.Context, pool *db.Pool) error {
 	return err
 }
 
-// buildObjectMap converts a slice of objects to a SchemaObjectMap with hashes
-func buildObjectMap(objects []schema.DatabaseObject) (schema.SchemaObjectMap, error) {
-	objectMap := make(schema.SchemaObjectMap)
-
-	for _, obj := range objects {
-		key := schema.GetObjectKey(obj)
-		hash, err := differ.NormalizeAndHash(obj)
-		if err != nil {
-			return nil, err
-		}
-
-		objectMap[key] = schema.HashedObject{
-			Hash:    hash,
-			Payload: obj,
-		}
-	}
-
-	return objectMap, nil
-}

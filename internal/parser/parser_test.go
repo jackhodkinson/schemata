@@ -50,6 +50,50 @@ func TestParseSimpleTable(t *testing.T) {
 	}
 }
 
+func TestParseTableWithCollationAndComments(t *testing.T) {
+	sql := `
+		CREATE TABLE users (
+			email TEXT COLLATE "en-US-x-icu"
+		);
+
+		COMMENT ON TABLE users IS 'Users table';
+		COMMENT ON COLUMN users.email IS 'Primary contact email';
+	`
+
+	parser := NewParser()
+	objectMap, err := parser.ParseSQL(sql)
+	require.NoError(t, err)
+
+	require.Len(t, objectMap, 1, "Should have parsed 1 table")
+
+	var table schema.Table
+	for _, obj := range objectMap {
+		if tbl, ok := obj.Payload.(schema.Table); ok {
+			table = tbl
+			break
+		}
+	}
+
+	require.Equal(t, schema.TableName("users"), table.Name)
+	require.Len(t, table.Columns, 1)
+
+	assert.NotNil(t, table.Comment)
+	if table.Comment != nil {
+		assert.Equal(t, "Users table", *table.Comment)
+	}
+
+	col := table.Columns[0]
+	assert.NotNil(t, col.Collation)
+	if col.Collation != nil {
+		assert.Equal(t, "en-US-x-icu", *col.Collation)
+	}
+
+	assert.NotNil(t, col.Comment)
+	if col.Comment != nil {
+		assert.Equal(t, "Primary contact email", *col.Comment)
+	}
+}
+
 // TestParseTableWithConstraints tests parsing a table with various constraints
 func TestParseTableWithConstraints(t *testing.T) {
 	sql := `

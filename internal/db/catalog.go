@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // Catalog provides methods to query PostgreSQL catalog tables
@@ -457,17 +458,21 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
 			return nil, err
 		}
 
-		if defaultExpr != nil {
-			expr := schema.Expr(*defaultExpr)
-			col.Default = &expr
-		}
-
 		if generated != nil && len(*generated) > 0 {
 			// 's' = STORED, 'v' = VIRTUAL
-			col.Generated = &schema.GeneratedSpec{
-				Expr:   schema.Expr(*defaultExpr),
-				Stored: (*generated)[0] == 's',
+			var expr schema.Expr
+			if defaultExpr != nil {
+				expr = schema.Expr(*defaultExpr)
 			}
+			col.Generated = &schema.GeneratedSpec{
+				Expr:   expr,
+				Stored: (*generated)[0] == 's' || (*generated)[0] == 'S',
+			}
+			// Generated columns do not have traditional defaults
+			col.Default = nil
+		} else if defaultExpr != nil {
+			expr := schema.Expr(*defaultExpr)
+			col.Default = &expr
 		}
 
 		if identity != nil && len(*identity) > 0 {
@@ -672,6 +677,8 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 			ix.indisunique as is_unique,
 			am.amname as method,
 			ix.indexrelid::int8 as index_oid,
+			ix.indoption as options,
+			pg_get_expr(ix.indpred, ix.indrelid, true) as predicate,
 			obj_description(i.oid, 'pg_class') as comment
 		FROM pg_index ix
 		JOIN pg_class c ON ix.indrelid = c.oid
@@ -694,11 +701,22 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 	for rows.Next() {
 		var idx schema.Index
 		var indexOID int64
-		var comment *string
+		var comment, predicate *string
 		var method string
+		var optionsStr string
 
-		if err := rows.Scan(&idx.Schema, &idx.Table, &idx.Name, &idx.Unique, &method, &indexOID, &comment); err != nil {
+		if err := rows.Scan(&idx.Schema, &idx.Table, &idx.Name, &idx.Unique, &method, &indexOID, &optionsStr, &predicate, &comment); err != nil {
 			return nil, err
+		}
+
+		// Parse options from int2vector format (space-separated integers)
+		var options []int16
+		if optionsStr != "" {
+			for _, s := range strings.Fields(optionsStr) {
+				var opt int16
+				fmt.Sscanf(s, "%d", &opt)
+				options = append(options, opt)
+			}
 		}
 
 		// Skip implicit indexes
@@ -709,6 +727,12 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 		// Parse method
 		idx.Method = schema.IndexMethod(method)
 		idx.Comment = comment
+
+		// Parse predicate
+		if predicate != nil {
+			pred := schema.Expr(*predicate)
+			idx.Predicate = &pred
+		}
 
 		// Extract key expressions by querying pg_get_indexdef for each column
 		// This gets the actual expression text for each index column
@@ -727,13 +751,34 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 		}
 
 		var keyExprs []schema.IndexKeyExpr
+		keyIndex := 0
 		for keyRows.Next() {
 			var expr string
 			if err := keyRows.Scan(&expr); err != nil {
 				keyRows.Close()
 				return nil, err
 			}
-			keyExprs = append(keyExprs, schema.IndexKeyExpr{Expr: schema.Expr(expr)})
+
+			keyExpr := schema.IndexKeyExpr{Expr: schema.Expr(expr)}
+
+			// Parse ordering from indoption array
+			// indoption is a bitmask: bit 0 = DESC, bit 1 = NULLS FIRST
+			if keyIndex < len(options) {
+				option := options[keyIndex]
+				// Bit 0 (value 1): DESC instead of ASC
+				if option&1 != 0 {
+					ordering := schema.Desc
+					keyExpr.Ordering = &ordering
+				}
+				// Bit 1 (value 2): NULLS FIRST instead of NULLS LAST (for DESC) or NULLS FIRST instead of default
+				if option&2 != 0 {
+					nullsOrdering := schema.NullsFirst
+					keyExpr.NullsOrdering = &nullsOrdering
+				}
+			}
+
+			keyExprs = append(keyExprs, keyExpr)
+			keyIndex++
 		}
 		keyRows.Close()
 
@@ -798,6 +843,83 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 	return objects, rows.Err()
 }
 
+// extractFunctionBody extracts the function body from pg_get_functiondef() output
+// Uses pg_query to parse the CREATE FUNCTION statement and extract the body from the AST
+func extractFunctionBody(fullDef string) string {
+	// Parse the CREATE FUNCTION statement using pg_query
+	result, err := pg_query.Parse(fullDef)
+	if err != nil {
+		// If parsing fails, return empty string
+		// This shouldn't happen with valid pg_get_functiondef() output
+		return ""
+	}
+
+	// Extract the CreateFunctionStmt from the parsed result
+	if len(result.Stmts) == 0 {
+		return ""
+	}
+
+	stmt := result.Stmts[0].Stmt
+	createFuncNode, ok := stmt.Node.(*pg_query.Node_CreateFunctionStmt)
+	if !ok {
+		return ""
+	}
+
+	createFunc := createFuncNode.CreateFunctionStmt
+
+	// Look through the function options for the "as" option (function body)
+	for _, option := range createFunc.Options {
+		if option == nil {
+			continue
+		}
+		defElem, ok := option.Node.(*pg_query.Node_DefElem)
+		if !ok {
+			continue
+		}
+
+		if strings.ToLower(defElem.DefElem.Defname) == "as" {
+			// Function body can be a single string or a list of strings
+			// This matches the parser logic in internal/parser/objects.go:238-246
+			if body := extractStringValue(defElem.DefElem.Arg); body != "" {
+				return strings.TrimSpace(body)
+			} else if bodyParts := extractListValues(defElem.DefElem.Arg); len(bodyParts) > 0 {
+				// PL/pgSQL functions often have body as a list of strings
+				return strings.TrimSpace(strings.Join(bodyParts, "\n"))
+			}
+		}
+	}
+
+	return ""
+}
+
+// extractStringValue extracts a string from a pg_query Node (helper for AST traversal)
+func extractStringValue(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+	if strNode, ok := node.Node.(*pg_query.Node_String_); ok {
+		return strNode.String_.Sval
+	}
+	return ""
+}
+
+// extractListValues extracts a list of strings from a pg_query Node (helper for AST traversal)
+func extractListValues(node *pg_query.Node) []string {
+	if node == nil {
+		return nil
+	}
+	if listNode, ok := node.Node.(*pg_query.Node_List); ok {
+		var values []string
+		for _, item := range listNode.List.Items {
+			if str := extractStringValue(item); str != "" {
+				values = append(values, str)
+			}
+		}
+		return values
+	}
+	return nil
+}
+
 func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
 	query := fmt.Sprintf(`
 		SELECT
@@ -827,7 +949,10 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 
 	var objects []schema.DatabaseObject
 	for rows.Next() {
-		var fn schema.Function
+		fn := schema.Function{
+			Args:       []schema.FunctionArg{},
+			SearchPath: []schema.SchemaName{},
+		}
 		var args, returns, language, volatility, parallel, source string
 		var isStrict, securityDefiner bool
 		var comment *string
@@ -839,7 +964,11 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 		fn.Language = schema.Language(language)
 		fn.Strict = isStrict
 		fn.SecurityDefiner = securityDefiner
-		fn.Body = source
+
+		// Extract function body from pg_get_functiondef output
+		// pg_get_functiondef returns: CREATE OR REPLACE FUNCTION ... AS $tag$ body $tag$
+		// We need to extract just the body part
+		fn.Body = extractFunctionBody(source)
 		fn.Comment = comment
 
 		// Parse volatility

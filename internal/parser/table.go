@@ -2,9 +2,10 @@ package parser
 
 import (
 	"fmt"
+	"strings"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // parseCreateTable parses a CREATE TABLE statement
@@ -32,7 +33,7 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 
 		switch node := elt.Node.(type) {
 		case *pg_query.Node_ColumnDef:
-			col, isPK, isUnique, colFK, err := p.parseColumnDef(node.ColumnDef)
+			col, isPK, isUnique, colFK, colCheck, err := p.parseColumnDef(node.ColumnDef)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse column: %w", err)
 			}
@@ -67,6 +68,13 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 				table.ForeignKeys = append(table.ForeignKeys, *colFK)
 			}
 
+			// Handle inline CHECK constraint (column-level)
+			if colCheck != nil {
+				// Mark this as a column-level constraint for auto-naming
+				colCheck.ColumnName = &col.Name
+				table.Checks = append(table.Checks, *colCheck)
+			}
+
 		case *pg_query.Node_Constraint:
 			err := p.parseTableConstraint(node.Constraint, &table)
 			if err != nil {
@@ -75,16 +83,85 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 		}
 	}
 
+	// Auto-generate names for unnamed constraints to match PostgreSQL's auto-naming
+	p.generateConstraintNames(&table)
+
 	return table, nil
+}
+
+// generateConstraintNames auto-generates names for unnamed constraints
+// to match PostgreSQL's automatic naming pattern
+func (p *Parser) generateConstraintNames(table *schema.Table) {
+	// Build set of existing constraint names to avoid conflicts
+	usedNames := make(map[string]bool)
+
+	// Collect all existing names
+	if table.PrimaryKey != nil && table.PrimaryKey.Name != nil {
+		usedNames[*table.PrimaryKey.Name] = true
+	}
+	for _, uq := range table.Uniques {
+		usedNames[uq.Name] = true
+	}
+	for _, ck := range table.Checks {
+		if ck.Name != "" {
+			usedNames[ck.Name] = true
+		}
+	}
+	for _, fk := range table.ForeignKeys {
+		usedNames[fk.Name] = true
+	}
+
+	// Auto-generate names for unnamed CHECK constraints
+	// Column-level checks: {table}_{column}_check
+	// Table-level checks: {table}_check, {table}_check1, {table}_check2, etc.
+	tableLevelCheckIndex := 0
+
+	for i, ck := range table.Checks {
+		if ck.Name == "" {
+			var candidateName string
+
+			if ck.ColumnName != nil {
+				// Column-level CHECK: use {table}_{column}_check pattern
+				candidateName = fmt.Sprintf("%s_%s_check", table.Name, *ck.ColumnName)
+			} else {
+				// Table-level CHECK: use {table}_check pattern with optional index
+				if tableLevelCheckIndex == 0 {
+					candidateName = fmt.Sprintf("%s_check", table.Name)
+				} else {
+					candidateName = fmt.Sprintf("%s_check%d", table.Name, tableLevelCheckIndex)
+				}
+				tableLevelCheckIndex++
+			}
+
+			// Handle name conflicts (rare, but possible if user explicitly named a constraint)
+			originalCandidate := candidateName
+			conflictIndex := 1
+			for usedNames[candidateName] {
+				if ck.ColumnName != nil {
+					// For column-level, append a number: {table}_{column}_check1, check2, etc.
+					candidateName = fmt.Sprintf("%s%d", originalCandidate, conflictIndex)
+				} else {
+					// For table-level, increment the index
+					candidateName = fmt.Sprintf("%s_check%d", table.Name, tableLevelCheckIndex)
+					tableLevelCheckIndex++
+				}
+				conflictIndex++
+			}
+
+			table.Checks[i].Name = candidateName
+			usedNames[candidateName] = true
+		}
+	}
 }
 
 // parseColumnDef parses a column definition
 // Returns the column, a bool indicating if this column has an inline PRIMARY KEY,
 // a bool indicating if this column has UNIQUE constraint,
-// and an optional ForeignKey if the column has an inline REFERENCES clause
-func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, bool, *schema.ForeignKey, error) {
+// an optional ForeignKey if the column has an inline REFERENCES clause,
+// and an optional CheckConstraint if the column has an inline CHECK clause
+func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, bool, *schema.ForeignKey, *schema.CheckConstraint, error) {
 	if col == nil {
-		return schema.Column{}, false, false, nil, fmt.Errorf("nil column definition")
+		return schema.Column{}, false, false, nil, nil, fmt.Errorf("nil column definition")
 	}
 
 	column := schema.Column{
@@ -97,10 +174,17 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 		column.Type = p.parseTypeName(col.TypeName)
 	}
 
+	if col.CollClause != nil {
+		if collation := parseCollationClause(col.CollClause); collation != nil {
+			column.Collation = collation
+		}
+	}
+
 	// Parse column constraints
 	isPrimaryKey := false
 	isUnique := false
 	var columnFK *schema.ForeignKey
+	var columnCheck *schema.CheckConstraint
 
 	for _, constraint := range col.Constraints {
 		if constraint == nil {
@@ -108,7 +192,7 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 		}
 
 		if c, ok := constraint.Node.(*pg_query.Node_Constraint); ok {
-			isPK, isUQ, fk := p.parseColumnConstraint(c.Constraint, &column)
+			isPK, isUQ, fk, ck := p.parseColumnConstraint(c.Constraint, &column)
 			if isPK {
 				isPrimaryKey = true
 			}
@@ -118,10 +202,13 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 			if fk != nil {
 				columnFK = fk
 			}
+			if ck != nil {
+				columnCheck = ck
+			}
 		}
 	}
 
-	return column, isPrimaryKey, isUnique, columnFK, nil
+	return column, isPrimaryKey, isUnique, columnFK, columnCheck, nil
 }
 
 // parseTypeName converts a TypeName node to our TypeName
@@ -175,27 +262,42 @@ func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) string {
 }
 
 // parseColumnConstraint parses column-level constraints
-// Returns (isPrimaryKey, isUnique, foreignKey)
+// Returns (isPrimaryKey, isUnique, foreignKey, checkConstraint)
 // - isPrimaryKey: true if this is a PRIMARY KEY constraint (needs table-level handling)
 // - isUnique: true if this is a UNIQUE constraint (needs table-level handling)
 // - foreignKey: non-nil if this is a REFERENCES constraint (needs to be added to table.ForeignKeys)
-func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) (bool, bool, *schema.ForeignKey) {
+// - checkConstraint: non-nil if this is a CHECK constraint (needs to be added to table.Checks)
+func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) (bool, bool, *schema.ForeignKey, *schema.CheckConstraint) {
 	if constraint == nil {
-		return false, false, nil
+		return false, false, nil, nil
 	}
 
 	switch constraint.Contype {
 	case pg_query.ConstrType_CONSTR_PRIMARY:
 		// PRIMARY KEY on column - caller needs to handle this at table level
 		column.NotNull = true // Primary keys are implicitly NOT NULL
-		return true, false, nil
+		return true, false, nil, nil
 
 	case pg_query.ConstrType_CONSTR_UNIQUE:
 		// UNIQUE constraint on column - caller needs to handle this at table level
-		return false, true, nil
+		return false, true, nil, nil
 
 	case pg_query.ConstrType_CONSTR_NOTNULL:
 		column.NotNull = true
+
+	case pg_query.ConstrType_CONSTR_CHECK:
+		// Column-level CHECK constraint
+		if constraint.RawExpr != nil {
+			exprStr := p.deparseExpr(constraint.RawExpr)
+			check := &schema.CheckConstraint{
+				Name:              constraint.Conname,
+				Expr:              schema.Expr(exprStr),
+				NoInherit:         constraint.IsNoInherit,
+				Deferrable:        constraint.Deferrable,
+				InitiallyDeferred: constraint.Initdeferred,
+			}
+			return false, false, nil, check
+		}
 
 	case pg_query.ConstrType_CONSTR_DEFAULT:
 		if constraint.RawExpr != nil {
@@ -216,10 +318,16 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 		// GENERATED column
 		if constraint.RawExpr != nil {
 			exprStr := p.deparseExpr(constraint.RawExpr)
+			stored := true
+			if constraint.GeneratedWhen != "" {
+				stored = !(constraint.GeneratedWhen == "v" || constraint.GeneratedWhen == "V")
+			}
 			column.Generated = &schema.GeneratedSpec{
 				Expr:   schema.Expr(exprStr),
-				Stored: true, // Default to STORED
+				Stored: stored,
 			}
+			// Generated columns cannot also have defaults
+			column.Default = nil
 		}
 
 	case pg_query.ConstrType_CONSTR_FOREIGN:
@@ -249,7 +357,7 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 				Schema: refSchema,
 				Table:  schema.TableName(refTable),
 				Cols:   refCols,
-			}			,
+			},
 			OnUpdate:          p.parseFkActionString(constraint.FkUpdAction),
 			OnDelete:          p.parseFkActionString(constraint.FkDelAction),
 			Match:             p.parseFkMatchTypeString(constraint.FkMatchtype),
@@ -257,10 +365,10 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 			InitiallyDeferred: constraint.Initdeferred,
 		}
 
-		return false, false, fk
+		return false, false, fk, nil
 	}
 
-	return false, false, nil
+	return false, false, nil, nil
 }
 
 // parseTableConstraint parses table-level constraints
@@ -382,4 +490,31 @@ func (p *Parser) parseFkMatchTypeString(matchType string) schema.MatchType {
 	default:
 		return schema.MatchSimple
 	}
+}
+
+func parseCollationClause(clause *pg_query.CollateClause) *string {
+	if clause == nil {
+		return nil
+	}
+
+	names := extractNamesFromNodes(clause.Collname)
+	if len(names) == 0 {
+		return nil
+	}
+
+	value := strings.Join(names, ".")
+	return &value
+}
+
+func extractNamesFromNodes(nodes []*pg_query.Node) []string {
+	var names []string
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if strNode, ok := node.Node.(*pg_query.Node_String_); ok {
+			names = append(names, strNode.String_.Sval)
+		}
+	}
+	return names
 }

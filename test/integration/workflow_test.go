@@ -528,12 +528,66 @@ func TestALTEROperations(t *testing.T) {
 	}
 }
 
+// TestIndexOrdering tests that index column ordering (DESC, NULLS FIRST, etc.) is preserved in generated DDL
+func TestIndexOrdering(t *testing.T) {
+	// Create test schema file with an index that has DESC ordering
+	tmpDir := t.TempDir()
+	schemaFile := filepath.Join(tmpDir, "schema.sql")
+	err := os.WriteFile(schemaFile, []byte(`
+		CREATE TABLE posts (
+			id SERIAL PRIMARY KEY,
+			title TEXT NOT NULL,
+			published_at TIMESTAMP,
+			is_published BOOLEAN DEFAULT false
+		);
+
+		-- Index with DESC ordering
+		CREATE INDEX idx_posts_published_at ON posts(published_at DESC) WHERE is_published = true;
+	`), 0644)
+	require.NoError(t, err)
+
+	// Parse the schema
+	p := parser.NewParser()
+	desiredSchema, err := p.ParseFile(schemaFile)
+	require.NoError(t, err, "should parse schema.sql")
+
+	// Find the index object
+	var indexObj schema.Index
+	found := false
+	for key, obj := range desiredSchema {
+		if key.Kind == schema.IndexKind && key.Name == "idx_posts_published_at" {
+			indexObj = obj.Payload.(schema.Index)
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "should find idx_posts_published_at index")
+
+	// Verify the index was parsed with DESC ordering
+	require.Len(t, indexObj.KeyExprs, 1, "index should have 1 key expression")
+	require.NotNil(t, indexObj.KeyExprs[0].Ordering, "key expression should have ordering")
+	assert.Equal(t, schema.Desc, *indexObj.KeyExprs[0].Ordering, "key expression should have DESC ordering")
+
+	// Generate DDL for the index
+	ddlGen := planner.NewDDLGenerator()
+	ddl, err := ddlGen.GenerateCreateStatement(indexObj)
+	require.NoError(t, err, "should generate DDL for index")
+
+	t.Logf("Generated DDL:\n%s", ddl)
+
+	// The generated DDL should include "DESC" to preserve the ordering
+	assert.Contains(t, ddl, "published_at DESC", "generated DDL should include DESC ordering")
+	assert.Contains(t, ddl, "WHERE is_published = true", "generated DDL should include WHERE clause")
+}
+
 // Helper functions
 
 func cleanup(t *testing.T, ctx context.Context, devPool, targetPool *db.Pool) {
 	t.Helper()
 
 	if devPool != nil {
+		// Drop all functions first (CASCADE will handle triggers)
+		_, _ = devPool.Exec(ctx, "DROP FUNCTION IF EXISTS update_updated_at_column CASCADE")
 		_, _ = devPool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
 		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS users CASCADE")
 		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS posts CASCADE")
@@ -544,6 +598,8 @@ func cleanup(t *testing.T, ctx context.Context, devPool, targetPool *db.Pool) {
 	}
 
 	if targetPool != nil {
+		// Drop all functions first (CASCADE will handle triggers)
+		_, _ = targetPool.Exec(ctx, "DROP FUNCTION IF EXISTS update_updated_at_column CASCADE")
 		_, _ = targetPool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
 		_, _ = targetPool.Exec(ctx, "DROP TABLE IF EXISTS users CASCADE")
 		_, _ = targetPool.Exec(ctx, "DROP TABLE IF EXISTS posts CASCADE")

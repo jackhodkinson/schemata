@@ -67,6 +67,54 @@ func TestGenerateCreateTableWithConstraints(t *testing.T) {
 	assert.Contains(t, stmt, "CONSTRAINT email_valid CHECK")
 }
 
+func TestGenerateCreateTableWithCollationAndComment(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	collation := "en-US-x-icu"
+	comment := "Email address"
+	table := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{
+				Name:      "email",
+				Type:      "TEXT",
+				Collation: &collation,
+				Comment:   &comment,
+			},
+		},
+	}
+
+	stmt, err := gen.GenerateCreateStatement(table)
+	require.NoError(t, err)
+
+	assert.Contains(t, stmt, "COLLATE \"en-US-x-icu\"")
+	assert.Contains(t, stmt, "COMMENT ON COLUMN public.users.email IS 'Email address';")
+}
+
+func TestGenerateCreateTableWithGeneratedColumn(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	genExpr := schema.Expr("COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')")
+	table := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER", NotNull: true},
+			{
+				Name:      "full_name",
+				Type:      "TEXT",
+				Generated: &schema.GeneratedSpec{Expr: genExpr, Stored: true},
+			},
+		},
+	}
+
+	stmt, err := gen.GenerateCreateStatement(table)
+	require.NoError(t, err)
+
+	assert.Contains(t, stmt, "GENERATED ALWAYS AS (COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')) STORED")
+}
+
 func TestGenerateCreateTableWithForeignKey(t *testing.T) {
 	gen := NewDDLGenerator()
 
@@ -443,4 +491,175 @@ func TestGenerateDDLOrdering(t *testing.T) {
 
 	// CREATE should come before DROP
 	assert.Greater(t, dropIdx, createIdx, "DROP should come after CREATE")
+}
+
+func TestGenerateAlterTableAddGeneratedColumn(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	genExpr := schema.Expr("COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')")
+
+	oldTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER"},
+		},
+	}
+
+	newTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER"},
+			{
+				Name:      "full_name",
+				Type:      "TEXT",
+				Generated: &schema.GeneratedSpec{Expr: genExpr, Stored: true},
+			},
+		},
+	}
+
+	alter := differ.AlterOperation{
+		Key:       schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"},
+		Changes:   []string{"add column full_name"},
+		OldObject: oldTable,
+		NewObject: newTable,
+	}
+
+	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.Len(t, statements, 1)
+	assert.Equal(t,
+		"ALTER TABLE public.users ADD COLUMN full_name TEXT GENERATED ALWAYS AS (COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')) STORED;",
+		statements[0])
+}
+
+func TestGenerateAlterTableModifyGeneratedColumn(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	oldExpr := schema.Expr("COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')")
+	newExpr := schema.Expr("UPPER(COALESCE(first_name, '') || ' ' || COALESCE(last_name, ''))")
+
+	oldTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER"},
+			{
+				Name:      "full_name",
+				Type:      "TEXT",
+				Generated: &schema.GeneratedSpec{Expr: oldExpr, Stored: true},
+			},
+		},
+	}
+
+	newTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER"},
+			{
+				Name:      "full_name",
+				Type:      "TEXT",
+				Generated: &schema.GeneratedSpec{Expr: newExpr, Stored: true},
+			},
+		},
+	}
+
+	alter := differ.AlterOperation{
+		Key:       schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"},
+		Changes:   []string{"alter column full_name: generated spec changed"},
+		OldObject: oldTable,
+		NewObject: newTable,
+	}
+
+	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.Len(t, statements, 2)
+	assert.Equal(t, "ALTER TABLE public.users ALTER COLUMN full_name DROP EXPRESSION;", statements[0])
+	assert.Equal(t,
+		"ALTER TABLE public.users ALTER COLUMN full_name ADD GENERATED ALWAYS AS (UPPER(COALESCE(first_name, '') || ' ' || COALESCE(last_name, ''))) STORED;",
+		statements[1])
+}
+
+func TestGenerateAlterTableHandlesCollationAndCommentChanges(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	oldComment := "Old email comment"
+	oldTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{
+				Name:    "email",
+				Type:    "TEXT",
+				Comment: &oldComment,
+			},
+		},
+	}
+
+	collation := "en-US-x-icu"
+	newComment := "New email comment"
+	newTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{
+				Name:      "email",
+				Type:      "TEXT",
+				Collation: &collation,
+				Comment:   &newComment,
+			},
+		},
+	}
+
+	alter := differ.AlterOperation{
+		Key:       schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"},
+		Changes:   []string{"alter column email: collation changed", "alter column email: comment changed"},
+		OldObject: oldTable,
+		NewObject: newTable,
+	}
+
+	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+
+	require.Contains(t, statements, "ALTER TABLE public.users ALTER COLUMN email TYPE TEXT COLLATE \"en-US-x-icu\";")
+	require.Contains(t, statements, "COMMENT ON COLUMN public.users.email IS 'New email comment';")
+}
+
+func TestGenerateAlterTableAddColumnWithCollationAndComment(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	oldTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER"},
+		},
+	}
+
+	collation := "en-US-x-icu"
+	comment := "Display name"
+	newTable := schema.Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER"},
+			{
+				Name:      "display_name",
+				Type:      "TEXT",
+				Collation: &collation,
+				Comment:   &comment,
+			},
+		},
+	}
+
+	alter := differ.AlterOperation{
+		Key:       schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"},
+		Changes:   []string{"add column display_name"},
+		OldObject: oldTable,
+		NewObject: newTable,
+	}
+
+	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+
+	require.Contains(t, statements, "ALTER TABLE public.users ADD COLUMN display_name TEXT COLLATE \"en-US-x-icu\";")
+	require.Contains(t, statements, "COMMENT ON COLUMN public.users.display_name IS 'Display name';")
 }

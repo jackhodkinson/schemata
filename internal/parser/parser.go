@@ -5,9 +5,9 @@ import (
 	"os"
 	"strings"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/jackhodkinson/schemata/internal/differ"
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // Parser parses SQL files using pg_query_go and extracts schema objects
@@ -39,9 +39,17 @@ func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
 
 	// Extract objects from parsed statements
 	objects := []schema.DatabaseObject{}
+	var comments []commentInstruction
 
 	for _, rawStmt := range result.Stmts {
 		if rawStmt.Stmt == nil {
+			continue
+		}
+
+		if commentStmt := rawStmt.Stmt.GetCommentStmt(); commentStmt != nil {
+			if instr := p.parseCommentInstruction(commentStmt); instr != nil {
+				comments = append(comments, *instr)
+			}
 			continue
 		}
 
@@ -54,6 +62,10 @@ func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
 		if obj != nil {
 			objects = append(objects, obj)
 		}
+	}
+
+	if len(comments) > 0 {
+		objects = p.applyCommentInstructions(objects, comments)
 	}
 
 	// Build object map with hashing
@@ -216,7 +228,7 @@ func (p *Parser) getFunctionSignature(fn schema.Function) string {
 	for i, arg := range fn.Args {
 		argTypes[i] = string(arg.Type)
 	}
-	return strings.Join(argTypes, ",")
+	return fmt.Sprintf("(%s)", fmt.Sprint(argTypes))
 }
 
 // Helper to extract qualified name from RangeVar
@@ -264,4 +276,128 @@ func (p *Parser) deparseExpr(node *pg_query.Node) string {
 	result = strings.TrimSuffix(result, ";")
 
 	return result
+}
+
+type commentInstruction struct {
+	schema  schema.SchemaName
+	table   schema.TableName
+	column  *schema.ColumnName
+	comment *string
+}
+
+func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) *commentInstruction {
+	if stmt == nil {
+		return nil
+	}
+
+	var commentPtr *string
+	if stmt.Comment != "" {
+		comment := stmt.Comment
+		commentPtr = &comment
+	}
+
+	switch stmt.Objtype {
+	case pg_query.ObjectType_OBJECT_TABLE, pg_query.ObjectType_OBJECT_MATVIEW:
+		names := extractStringList(stmt.Object)
+		if len(names) == 0 {
+			return nil
+		}
+		schemaName := schema.SchemaName("public")
+		tableName := names[len(names)-1]
+		if len(names) > 1 {
+			schemaName = schema.SchemaName(names[len(names)-2])
+		}
+		return &commentInstruction{
+			schema:  schemaName,
+			table:   schema.TableName(tableName),
+			comment: commentPtr,
+		}
+	case pg_query.ObjectType_OBJECT_COLUMN:
+		names := extractStringList(stmt.Object)
+		if len(names) < 2 {
+			return nil
+		}
+		schemaName := schema.SchemaName("public")
+		tableName := names[len(names)-2]
+		columnName := schema.ColumnName(names[len(names)-1])
+		if len(names) > 2 {
+			schemaName = schema.SchemaName(names[len(names)-3])
+		}
+		return &commentInstruction{
+			schema:  schemaName,
+			table:   schema.TableName(tableName),
+			column:  &columnName,
+			comment: commentPtr,
+		}
+	default:
+		return nil
+	}
+}
+
+func (p *Parser) applyCommentInstructions(objects []schema.DatabaseObject, comments []commentInstruction) []schema.DatabaseObject {
+	if len(comments) == 0 {
+		return objects
+	}
+
+	type tableKey struct {
+		schema schema.SchemaName
+		name   schema.TableName
+	}
+
+	index := make(map[tableKey]int)
+	for i, obj := range objects {
+		if tbl, ok := obj.(schema.Table); ok {
+			index[tableKey{schema: tbl.Schema, name: tbl.Name}] = i
+		}
+	}
+
+	for _, instr := range comments {
+		key := tableKey{schema: instr.schema, name: instr.table}
+		idx, ok := index[key]
+		if !ok {
+			continue
+		}
+		tbl, ok := objects[idx].(schema.Table)
+		if !ok {
+			continue
+		}
+
+		if instr.column == nil {
+			tbl.Comment = instr.comment
+		} else {
+			for i := range tbl.Columns {
+				if tbl.Columns[i].Name == *instr.column {
+					tbl.Columns[i].Comment = instr.comment
+					break
+				}
+			}
+		}
+
+		objects[idx] = tbl
+	}
+
+	return objects
+}
+
+func extractStringList(node *pg_query.Node) []string {
+	if node == nil {
+		return nil
+	}
+	listNode, ok := node.Node.(*pg_query.Node_List)
+	if !ok || listNode.List == nil {
+		return nil
+	}
+
+	var values []string
+	for _, item := range listNode.List.Items {
+		if strNode, ok := item.Node.(*pg_query.Node_String_); ok {
+			values = append(values, strNode.String_.Sval)
+		}
+	}
+	return values
+}
+
+func quoteIdentifier(name string) string {
+	escaped := strings.ReplaceAll(name, `"`, `""`)
+	return fmt.Sprintf(`"%s"`, escaped)
 }

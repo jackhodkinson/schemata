@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // Parser uses pg_query_go to parse SQL files into schema objects
@@ -154,14 +154,19 @@ func (p *Parser) extractColumn(colDef *pg_query.ColumnDef) (schema.Column, error
 			case pg_query.ConstrType_CONSTR_GENERATED:
 				if c.RawExpr != nil {
 					expr := nodeToSQL(c.RawExpr)
+					stored := true
+					if c.GeneratedWhen != "" {
+						stored = !(c.GeneratedWhen == "v" || c.GeneratedWhen == "V")
+					}
 					col.Generated = &schema.GeneratedSpec{
 						Expr:   expr,
-						Stored: c.GeneratedWhen == 's',
+						Stored: stored,
 					}
+					col.Default = nil
 				}
 			case pg_query.ConstrType_CONSTR_IDENTITY:
 				col.Identity = &schema.IdentitySpec{
-					Always: c.GeneratedWhen == 'a',
+					Always: c.GeneratedWhen == "a",
 				}
 			}
 		}

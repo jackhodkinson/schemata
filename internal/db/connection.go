@@ -4,9 +4,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackhodkinson/schemata/internal/config"
 )
+
+// Executor is an interface that both Pool and Tx implement
+// This allows functions to work with either a connection pool or a transaction
+type Executor interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // Pool wraps a database connection pool
 type Pool struct {

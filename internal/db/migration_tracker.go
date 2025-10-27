@@ -84,10 +84,11 @@ func (mt *MigrationTracker) IsApplied(ctx context.Context, version string) (bool
 }
 
 // MarkApplied marks a migration version as applied
-func (mt *MigrationTracker) MarkApplied(ctx context.Context, version string) error {
+// The executor parameter allows this to run within a transaction
+func (mt *MigrationTracker) MarkApplied(ctx context.Context, executor Executor, version string) error {
 	query := fmt.Sprintf("INSERT INTO %s.%s (version_num) VALUES ($1)", schemaName, tableName)
 
-	_, err := mt.pool.Exec(ctx, query, version)
+	_, err := executor.Exec(ctx, query, version)
 	if err != nil {
 		return fmt.Errorf("failed to mark version as applied: %w", err)
 	}

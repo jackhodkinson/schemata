@@ -71,6 +71,10 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 				Schema: schema.SchemaName(fk.Ref.Schema),
 				Name:   string(fk.Ref.Table),
 			}
+			// Skip self-referential foreign keys (they don't create ordering dependencies)
+			if refTableKey.Kind == key.Kind && refTableKey.Schema == key.Schema && refTableKey.Name == key.Name {
+				continue
+			}
 			// Only add dependency if the referenced table is in our object map
 			if _, exists := objectMap[refTableKey]; exists {
 				graph.AddDependency(key, refTableKey)
@@ -301,38 +305,43 @@ func compareKeys(a, b schema.ObjectKey) bool {
 	return a.TableName < b.TableName
 }
 
-// FilterGraphForKeys creates a subgraph containing only the specified keys and their dependencies
+// FilterGraphForKeys creates a subgraph containing only the specified keys
+// Dependencies are preserved for ordering, but only keys in the input list are included
 func FilterGraphForKeys(graph *DependencyGraph, keys []schema.ObjectKey) *DependencyGraph {
-	// Find all dependencies recursively
-	needed := make(map[schema.ObjectKey]bool)
-	var findDeps func(schema.ObjectKey)
-	findDeps = func(key schema.ObjectKey) {
-		if needed[key] {
-			return
-		}
-		needed[key] = true
-		for _, dep := range graph.nodes[key] {
-			findDeps(dep)
-		}
-	}
+	// Track all keys that must be present (requested keys and their dependencies)
+	keysSet := make(map[schema.ObjectKey]bool)
 
+	// Explore dependencies for each requested key
 	for _, key := range keys {
-		findDeps(key)
+		collectDependencies(graph, key, keysSet)
 	}
 
-	// Build new graph with only needed nodes
+	// Build new graph containing the closure
 	newGraph := NewDependencyGraph()
-	for key := range needed {
+	for key := range keysSet {
 		newGraph.AddNode(key)
 	}
 
-	for key := range needed {
+	// Replay dependencies between retained nodes
+	for key := range keysSet {
 		for _, dep := range graph.nodes[key] {
-			if needed[dep] {
+			if keysSet[dep] {
 				newGraph.AddDependency(key, dep)
 			}
 		}
 	}
 
 	return newGraph
+}
+
+// collectDependencies performs a DFS collecting a key and all of its dependencies.
+func collectDependencies(graph *DependencyGraph, key schema.ObjectKey, visited map[schema.ObjectKey]bool) {
+	if visited[key] {
+		return
+	}
+	visited[key] = true
+
+	for _, dep := range graph.nodes[key] {
+		collectDependencies(graph, dep, visited)
+	}
 }

@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	pg_query "github.com/pganalyze/pg_query_go/v5"
+
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
 
@@ -79,6 +81,9 @@ func normalizeTable(tbl schema.Table) schema.Table {
 		if normalizedCols[i].Default != nil {
 			normalized := normalizeExpr(*normalizedCols[i].Default)
 			normalizedCols[i].Default = &normalized
+		}
+		if normalizedCols[i].Generated != nil {
+			normalizedCols[i].Generated.Expr = normalizeExpr(normalizedCols[i].Generated.Expr)
 		}
 	}
 
@@ -286,6 +291,20 @@ func normalizeTypeName(typeName schema.TypeName) schema.TypeName {
 func normalizeExpr(expr schema.Expr) schema.Expr {
 	exprStr := strings.TrimSpace(string(expr))
 
+	if canonical, err := canonicalizeExpr(exprStr); err == nil && canonical != "" {
+		exprStr = canonical
+	}
+
+	// Strip PostgreSQL type casts (::typename) for normalization
+	// This handles cases where catalog returns 'value'::typename but parser returns 'value'
+	// Common for ENUM defaults: 'user'::user_role vs 'user'
+	// We use a regex to match :: followed by a type name
+	typeCastRegex := regexp.MustCompile(`::[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)*(?:\[\])*`)
+	exprStr = typeCastRegex.ReplaceAllString(exprStr, "")
+
+	// Remove redundant wrapping parentheses
+	exprStr = stripOuterParentheses(exprStr)
+
 	// Normalize to lowercase for function names and keywords
 	exprLower := strings.ToLower(exprStr)
 
@@ -302,4 +321,73 @@ func normalizeExpr(expr schema.Expr) schema.Expr {
 
 	// Default: return lowercase version
 	return schema.Expr(exprLower)
+}
+
+func canonicalizeExpr(expr string) (string, error) {
+	if expr == "" {
+		return "", nil
+	}
+	query := fmt.Sprintf("SELECT %s", expr)
+	parsed, err := pg_query.Parse(query)
+	if err != nil {
+		return "", err
+	}
+	deparsed, err := pg_query.Deparse(parsed)
+	if err != nil {
+		return "", err
+	}
+	deparsed = strings.TrimSpace(deparsed)
+	deparsed = strings.TrimPrefix(deparsed, "SELECT ")
+	deparsed = strings.TrimSuffix(deparsed, ";")
+	return strings.TrimSpace(deparsed), nil
+}
+
+func stripOuterParentheses(expr string) string {
+	for {
+		expr = strings.TrimSpace(expr)
+		if len(expr) < 2 || expr[0] != '(' || expr[len(expr)-1] != ')' {
+			return expr
+		}
+
+		depth := 0
+		inLiteral := false
+		valid := true
+
+		for i := 0; i < len(expr); i++ {
+			ch := expr[i]
+			if inLiteral {
+				if ch == '\'' {
+					if i+1 < len(expr) && expr[i+1] == '\'' {
+						i++
+					} else {
+						inLiteral = false
+					}
+				}
+				continue
+			}
+
+			switch ch {
+			case '\'':
+				inLiteral = true
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 && i != len(expr)-1 {
+					valid = false
+					break
+				}
+				if depth < 0 {
+					valid = false
+					break
+				}
+			}
+		}
+
+		if !valid || depth != 0 {
+			return expr
+		}
+
+		expr = expr[1 : len(expr)-1]
+	}
 }

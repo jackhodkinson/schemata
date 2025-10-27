@@ -67,7 +67,7 @@ func TestMigrationTracking(t *testing.T) {
 	assert.Empty(t, versions)
 
 	// Mark a version as applied
-	err = tracker.MarkApplied(ctx, "20231015120530")
+	err = tracker.MarkApplied(ctx, pool, "20231015120530")
 	require.NoError(t, err)
 
 	// Should now have one version
@@ -94,7 +94,7 @@ func TestMigrationTracking(t *testing.T) {
 	assert.Equal(t, []string{"20231015130000", "20231016090000"}, pending)
 
 	// Mark another version
-	err = tracker.MarkApplied(ctx, "20231015130000")
+	err = tracker.MarkApplied(ctx, pool, "20231015130000")
 	require.NoError(t, err)
 
 	// Get latest version

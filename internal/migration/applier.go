@@ -108,8 +108,8 @@ func (a *Applier) applyMigration(ctx context.Context, migration Migration, opts 
 		return fmt.Errorf("failed to execute migration SQL: %w", err)
 	}
 
-	// Record migration version
-	if err := a.tracker.MarkApplied(ctx, migration.Version); err != nil {
+	// Record migration version within the same transaction
+	if err := a.tracker.MarkApplied(ctx, tx, migration.Version); err != nil {
 		return fmt.Errorf("failed to mark migration as applied: %w", err)
 	}
 
