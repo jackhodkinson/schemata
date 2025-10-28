@@ -26,20 +26,20 @@ type ObjectKey struct {
 type ObjectKind string
 
 const (
-	SchemaKind    ObjectKind = "schema"
-	ExtensionKind ObjectKind = "extension"
-	TypeKind      ObjectKind = "type"
-	SequenceKind  ObjectKind = "sequence"
-	TableKind     ObjectKind = "table"
-	ColumnKind    ObjectKind = "column"
-	IndexKind     ObjectKind = "index"
+	SchemaKind     ObjectKind = "schema"
+	ExtensionKind  ObjectKind = "extension"
+	TypeKind       ObjectKind = "type"
+	SequenceKind   ObjectKind = "sequence"
+	TableKind      ObjectKind = "table"
+	ColumnKind     ObjectKind = "column"
+	IndexKind      ObjectKind = "index"
 	ConstraintKind ObjectKind = "constraint"
-	ViewKind      ObjectKind = "view"
-	FunctionKind  ObjectKind = "function"
-	TriggerKind   ObjectKind = "trigger"
-	PolicyKind    ObjectKind = "policy"
-	GrantKind     ObjectKind = "grant"
-	OwnerKind     ObjectKind = "owner"
+	ViewKind       ObjectKind = "view"
+	FunctionKind   ObjectKind = "function"
+	TriggerKind    ObjectKind = "trigger"
+	PolicyKind     ObjectKind = "policy"
+	GrantKind      ObjectKind = "grant"
+	OwnerKind      ObjectKind = "owner"
 )
 
 // HashedObject wraps an object with its hash for efficient comparison
@@ -190,8 +190,9 @@ type IdentitySpec struct {
 }
 
 type SequenceOption struct {
-	Type  string // "START", "INCREMENT", "MINVALUE", "MAXVALUE", "CACHE", "CYCLE"
-	Value int64
+	Type     string // Normalized option keyword, e.g. "START WITH", "INCREMENT BY", "NO MINVALUE"
+	Value    int64  // Numeric option value when HasValue is true
+	HasValue bool   // Whether this option carries an explicit numeric value
 }
 
 // PrimaryKey represents a primary key constraint
@@ -220,7 +221,7 @@ type CheckConstraint struct {
 	InitiallyDeferred bool
 	// ColumnName is set for column-level CHECK constraints to track the associated column
 	// Used for generating auto-names following PostgreSQL's pattern: {table}_{column}_check
-	ColumnName        *ColumnName
+	ColumnName *ColumnName
 }
 
 // ForeignKey represents a foreign key constraint
@@ -308,11 +309,11 @@ const (
 )
 
 type IndexKeyExpr struct {
-	Expr           Expr
-	Collation      *string
-	OpClass        *string
-	Ordering       *IndexOrdering
-	NullsOrdering  *NullsOrdering
+	Expr          Expr
+	Collation     *string
+	OpClass       *string
+	Ordering      *IndexOrdering
+	NullsOrdering *NullsOrdering
 }
 
 type IndexOrdering string
@@ -463,15 +464,15 @@ const (
 
 // Trigger represents a database trigger
 type Trigger struct {
-	Schema      SchemaName
-	Table       TableName
-	Name        string
-	Timing      TriggerTiming
-	Events      []TriggerEvent
-	ForEachRow  bool
-	When        *Expr
-	Function    QualifiedName
-	Enabled     TriggerEnabled
+	Schema     SchemaName
+	Table      TableName
+	Name       string
+	Timing     TriggerTiming
+	Events     []TriggerEvent
+	ForEachRow bool
+	When       *Expr
+	Function   QualifiedName
+	Enabled    TriggerEnabled
 }
 
 func (Trigger) isDatabaseObject()         {}

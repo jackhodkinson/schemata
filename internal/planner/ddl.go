@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jackhodkinson/schemata/internal/differ"
@@ -181,7 +182,9 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 			colParts = append(colParts, fmt.Sprintf("COLLATE %s", formatQualifiedIdentifier(*col.Collation)))
 		}
 
-		if col.Generated != nil {
+		if col.Identity != nil {
+			colParts = append(colParts, formatIdentityClause(*col.Identity))
+		} else if col.Generated != nil {
 			colParts = append(colParts, formatGeneratedClause(*col.Generated))
 		} else if col.Default != nil {
 			colParts = append(colParts, fmt.Sprintf("DEFAULT %s", *col.Default))
@@ -204,7 +207,12 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 		for i, col := range tbl.PrimaryKey.Cols {
 			pkCols[i] = string(col)
 		}
-		colDefs = append(colDefs, fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkCols, ", ")))
+		pkClause := fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkCols, ", "))
+		if tbl.PrimaryKey.Name != nil && *tbl.PrimaryKey.Name != "" {
+			pkClause = fmt.Sprintf("  CONSTRAINT %s PRIMARY KEY (%s)", *tbl.PrimaryKey.Name, strings.Join(pkCols, ", "))
+		}
+		pkClause += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
+		colDefs = append(colDefs, pkClause)
 	}
 
 	// Unique constraints
@@ -213,15 +221,30 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 		for i, col := range uq.Cols {
 			uqCols[i] = string(col)
 		}
-		colDefs = append(colDefs, fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", uq.Name, strings.Join(uqCols, ", ")))
+		uqClause := fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", uq.Name, strings.Join(uqCols, ", "))
+		if !uq.NullsDistinct {
+			uqClause += " NULLS NOT DISTINCT"
+		}
+		uqClause += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
+		colDefs = append(colDefs, uqClause)
 	}
 
 	// Check constraints
 	for _, check := range tbl.Checks {
 		if check.Name != "" {
-			colDefs = append(colDefs, fmt.Sprintf("  CONSTRAINT %s CHECK (%s)", check.Name, check.Expr))
+			checkClause := fmt.Sprintf("  CONSTRAINT %s CHECK (%s)", check.Name, check.Expr)
+			if check.NoInherit {
+				checkClause += " NO INHERIT"
+			}
+			checkClause += formatConstraintTiming(check.Deferrable, check.InitiallyDeferred)
+			colDefs = append(colDefs, checkClause)
 		} else {
-			colDefs = append(colDefs, fmt.Sprintf("  CHECK (%s)", check.Expr))
+			checkClause := fmt.Sprintf("  CHECK (%s)", check.Expr)
+			if check.NoInherit {
+				checkClause += " NO INHERIT"
+			}
+			checkClause += formatConstraintTiming(check.Deferrable, check.InitiallyDeferred)
+			colDefs = append(colDefs, checkClause)
 		}
 	}
 
@@ -237,22 +260,43 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 		}
 		fkDef := fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
 			fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+		switch fk.Match {
+		case schema.MatchFull:
+			fkDef += " MATCH FULL"
+		case schema.MatchPartial:
+			fkDef += " MATCH PARTIAL"
+		}
 		if fk.OnDelete != schema.NoAction {
 			fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
 		}
 		if fk.OnUpdate != schema.NoAction {
 			fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
 		}
+		fkDef += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
 		colDefs = append(colDefs, fkDef)
 	}
 
 	parts = append(parts, strings.Join(colDefs, ",\n"))
-	parts = append(parts, ");")
+	closeLine := ")"
+	if len(tbl.RelOptions) > 0 {
+		options := append([]string(nil), tbl.RelOptions...)
+		sort.Strings(options)
+		closeLine += fmt.Sprintf(" WITH (%s)", strings.Join(options, ", "))
+	}
+	closeLine += ";"
+	parts = append(parts, closeLine)
 
 	stmt := strings.Join(parts, "\n")
 
+	var commentStatements []string
+	if tbl.Comment != nil {
+		commentStatements = append(commentStatements, formatTableCommentStatement(tbl.Schema, tbl.Name, tbl.Comment))
+	}
 	if len(columnComments) > 0 {
-		stmt += "\n\n" + strings.Join(columnComments, "\n")
+		commentStatements = append(commentStatements, columnComments...)
+	}
+	if len(commentStatements) > 0 {
+		stmt += "\n\n" + strings.Join(commentStatements, "\n")
 	}
 
 	return stmt
@@ -267,19 +311,23 @@ func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
 	// Build key expressions with ordering
 	keyExprs := make([]string, len(idx.KeyExprs))
 	for i, key := range idx.KeyExprs {
-		expr := string(key.Expr)
+		var parts []string
+		parts = append(parts, string(key.Expr))
 
-		// Add ordering if specified (ASC is default, so we only add DESC)
+		if key.Collation != nil {
+			parts = append(parts, fmt.Sprintf("COLLATE %s", formatQualifiedIdentifier(*key.Collation)))
+		}
+		if key.OpClass != nil {
+			parts = append(parts, *key.OpClass)
+		}
 		if key.Ordering != nil && *key.Ordering == schema.Desc {
-			expr += " DESC"
+			parts = append(parts, "DESC")
 		}
-
-		// Add NULLS ordering if specified
 		if key.NullsOrdering != nil {
-			expr += " " + string(*key.NullsOrdering)
+			parts = append(parts, string(*key.NullsOrdering))
 		}
 
-		keyExprs[i] = expr
+		keyExprs[i] = strings.Join(parts, " ")
 	}
 
 	stmt := fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s)",
@@ -287,10 +335,26 @@ func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
 
 	// Add WHERE clause for partial index
 	if idx.Predicate != nil {
-		stmt += fmt.Sprintf(" WHERE %s", *idx.Predicate)
+		predicate := strings.TrimSpace(string(*idx.Predicate))
+		if shouldWrapPredicate(predicate) && !(strings.HasPrefix(predicate, "(") && strings.HasSuffix(predicate, ")")) {
+			predicate = fmt.Sprintf("(%s)", predicate)
+		}
+		stmt += fmt.Sprintf(" WHERE %s", predicate)
+	}
+
+	if len(idx.Include) > 0 {
+		includeCols := make([]string, len(idx.Include))
+		for i, col := range idx.Include {
+			includeCols[i] = string(col)
+		}
+		stmt += fmt.Sprintf(" INCLUDE (%s)", strings.Join(includeCols, ", "))
 	}
 
 	stmt += ";"
+
+	if idx.Comment != nil {
+		stmt += "\n\n" + formatIndexCommentStatement(idx.Schema, idx.Name, idx.Comment)
+	}
 
 	return stmt
 }
@@ -518,7 +582,9 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 					colParts = append(colParts, fmt.Sprintf("COLLATE %s", formatQualifiedIdentifier(*col.Collation)))
 				}
 
-				if col.Generated != nil {
+				if col.Identity != nil {
+					colParts = append(colParts, formatIdentityClause(*col.Identity))
+				} else if col.Generated != nil {
 					colParts = append(colParts, formatGeneratedClause(*col.Generated))
 				} else if col.Default != nil {
 					colParts = append(colParts, fmt.Sprintf("DEFAULT %s", *col.Default))
@@ -555,8 +621,10 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				if tbl.PrimaryKey.Name != nil {
 					pkName = *tbl.PrimaryKey.Name
 				}
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s);",
-					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", ")))
+				pkStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s)",
+					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", "))
+				pkStmt += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
+				statements = append(statements, pkStmt+";")
 			}
 		} else if strings.HasPrefix(change, "drop primary key") {
 			if oldPKName != "" {
@@ -580,8 +648,10 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				if tbl.PrimaryKey.Name != nil {
 					pkName = *tbl.PrimaryKey.Name
 				}
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s);",
-					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", ")))
+				pkStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s)",
+					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", "))
+				pkStmt += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
+				statements = append(statements, pkStmt+";")
 			}
 		} else if strings.HasPrefix(change, "add unique constraint ") {
 			constraintName := strings.TrimPrefix(change, "add unique constraint ")
@@ -591,8 +661,13 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 					for i, col := range uq.Cols {
 						uqCols[i] = string(col)
 					}
-					statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s);",
-						tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", ")))
+					uqStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s)",
+						tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", "))
+					if !uq.NullsDistinct {
+						uqStmt += " NULLS NOT DISTINCT"
+					}
+					uqStmt += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
+					statements = append(statements, uqStmt+";")
 					break
 				}
 			}
@@ -604,13 +679,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			constraintName := strings.TrimPrefix(change, "add check constraint ")
 			for _, ck := range tbl.Checks {
 				if ck.Name == constraintName {
+					checkStmt := ""
 					if ck.Name != "" {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s);",
-							tbl.Schema, tbl.Name, ck.Name, ck.Expr))
+						checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s)",
+							tbl.Schema, tbl.Name, ck.Name, ck.Expr)
 					} else {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s);",
-							tbl.Schema, tbl.Name, ck.Expr))
+						checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s)",
+							tbl.Schema, tbl.Name, ck.Expr)
 					}
+					if ck.NoInherit {
+						checkStmt += " NO INHERIT"
+					}
+					checkStmt += formatConstraintTiming(ck.Deferrable, ck.InitiallyDeferred)
+					statements = append(statements, checkStmt+";")
 					break
 				}
 			}
@@ -632,12 +713,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 					}
 					fkDef := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
 						tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+					switch fk.Match {
+					case schema.MatchFull:
+						fkDef += " MATCH FULL"
+					case schema.MatchPartial:
+						fkDef += " MATCH PARTIAL"
+					}
 					if fk.OnDelete != schema.NoAction {
 						fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
 					}
 					if fk.OnUpdate != schema.NoAction {
 						fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
 					}
+					fkDef += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
 					statements = append(statements, fkDef+";")
 					break
 				}
@@ -662,8 +750,13 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 						for i, col := range uq.Cols {
 							uqCols[i] = string(col)
 						}
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s);",
-							tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", ")))
+						uqStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s)",
+							tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", "))
+						if !uq.NullsDistinct {
+							uqStmt += " NULLS NOT DISTINCT"
+						}
+						uqStmt += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
+						statements = append(statements, uqStmt+";")
 						break
 					}
 				}
@@ -679,13 +772,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				// Add new
 				for _, ck := range tbl.Checks {
 					if ck.Name == constraintName {
+						checkStmt := ""
 						if ck.Name != "" {
-							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s);",
-								tbl.Schema, tbl.Name, ck.Name, ck.Expr))
+							checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s)",
+								tbl.Schema, tbl.Name, ck.Name, ck.Expr)
 						} else {
-							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s);",
-								tbl.Schema, tbl.Name, ck.Expr))
+							checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s)",
+								tbl.Schema, tbl.Name, ck.Expr)
 						}
+						if ck.NoInherit {
+							checkStmt += " NO INHERIT"
+						}
+						checkStmt += formatConstraintTiming(ck.Deferrable, ck.InitiallyDeferred)
+						statements = append(statements, checkStmt+";")
 						break
 					}
 				}
@@ -711,12 +810,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 						}
 						fkDef := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
 							tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+						switch fk.Match {
+						case schema.MatchFull:
+							fkDef += " MATCH FULL"
+						case schema.MatchPartial:
+							fkDef += " MATCH PARTIAL"
+						}
 						if fk.OnDelete != schema.NoAction {
 							fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
 						}
 						if fk.OnUpdate != schema.NoAction {
 							fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
 						}
+						fkDef += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
 						statements = append(statements, fkDef+";")
 						break
 					}
@@ -820,12 +926,110 @@ func formatGeneratedClause(spec schema.GeneratedSpec) string {
 	return fmt.Sprintf("GENERATED ALWAYS AS (%s) %s", spec.Expr, mode)
 }
 
+func formatIdentityClause(spec schema.IdentitySpec) string {
+	mode := "BY DEFAULT"
+	if spec.Always {
+		mode = "ALWAYS"
+	}
+
+	clause := fmt.Sprintf("GENERATED %s AS IDENTITY", mode)
+
+	if options := formatSequenceOptions(spec.SequenceOptions); options != "" {
+		clause += fmt.Sprintf(" (%s)", options)
+	}
+
+	return clause
+}
+
+func formatSequenceOptions(options []schema.SequenceOption) string {
+	if len(options) == 0 {
+		return ""
+	}
+
+	ordered := append([]schema.SequenceOption(nil), options...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Type == ordered[j].Type {
+			if ordered[i].HasValue == ordered[j].HasValue {
+				return ordered[i].Value < ordered[j].Value
+			}
+			return !ordered[i].HasValue && ordered[j].HasValue
+		}
+		return sequenceOptionOrder(ordered[i].Type) < sequenceOptionOrder(ordered[j].Type)
+	})
+
+	parts := make([]string, 0, len(ordered))
+	for _, opt := range ordered {
+		if opt.HasValue {
+			parts = append(parts, fmt.Sprintf("%s %d", opt.Type, opt.Value))
+		} else {
+			parts = append(parts, opt.Type)
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func sequenceOptionOrder(optionType string) int {
+	switch optionType {
+	case "START WITH":
+		return 0
+	case "INCREMENT BY":
+		return 1
+	case "MINVALUE", "NO MINVALUE":
+		return 2
+	case "MAXVALUE", "NO MAXVALUE":
+		return 3
+	case "CACHE":
+		return 4
+	case "CYCLE", "NO CYCLE":
+		return 5
+	default:
+		return 100
+	}
+}
+
+func shouldWrapPredicate(predicate string) bool {
+	upper := strings.ToUpper(predicate)
+	return strings.Contains(upper, " IS ") ||
+		strings.Contains(upper, " AND ") ||
+		strings.Contains(upper, " OR ") ||
+		strings.Contains(upper, " BETWEEN ") ||
+		strings.Contains(upper, " LIKE ") ||
+		strings.Contains(upper, " IN (")
+}
+
+func formatConstraintTiming(deferrable, initiallyDeferred bool) string {
+	if !deferrable {
+		return ""
+	}
+	if initiallyDeferred {
+		return " DEFERRABLE INITIALLY DEFERRED"
+	}
+	return " DEFERRABLE INITIALLY IMMEDIATE"
+}
+
+func formatTableCommentStatement(schemaName schema.SchemaName, tableName schema.TableName, comment *string) string {
+	qualified := fmt.Sprintf("%s.%s", schemaName, tableName)
+	if comment == nil {
+		return fmt.Sprintf("COMMENT ON TABLE %s IS NULL;", qualified)
+	}
+	return fmt.Sprintf("COMMENT ON TABLE %s IS %s;", qualified, quoteLiteral(*comment))
+}
+
 func formatColumnCommentStatement(schemaName schema.SchemaName, tableName schema.TableName, columnName schema.ColumnName, comment *string) string {
 	qualified := fmt.Sprintf("%s.%s.%s", schemaName, tableName, columnName)
 	if comment == nil {
 		return fmt.Sprintf("COMMENT ON COLUMN %s IS NULL;", qualified)
 	}
 	return fmt.Sprintf("COMMENT ON COLUMN %s IS %s;", qualified, quoteLiteral(*comment))
+}
+
+func formatIndexCommentStatement(schemaName schema.SchemaName, indexName string, comment *string) string {
+	qualified := fmt.Sprintf("%s.%s", schemaName, indexName)
+	if comment == nil {
+		return fmt.Sprintf("COMMENT ON INDEX %s IS NULL;", qualified)
+	}
+	return fmt.Sprintf("COMMENT ON INDEX %s IS %s;", qualified, quoteLiteral(*comment))
 }
 
 func quoteLiteral(value string) string {

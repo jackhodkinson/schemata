@@ -2,6 +2,7 @@ package differ
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
@@ -719,7 +720,61 @@ func identitySpecEqual(a, b *schema.IdentitySpec) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.Always == b.Always
+	if a.Always != b.Always {
+		return false
+	}
+	return sequenceOptionsEqual(a.SequenceOptions, b.SequenceOptions)
+}
+
+func sequenceOptionsEqual(a, b []schema.SequenceOption) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+
+	if len(a) != len(b) {
+		return false
+	}
+
+	aCopy := append([]schema.SequenceOption(nil), a...)
+	bCopy := append([]schema.SequenceOption(nil), b...)
+
+	sort.Slice(aCopy, func(i, j int) bool {
+		if aCopy[i].Type == aCopy[j].Type {
+			if aCopy[i].HasValue == aCopy[j].HasValue {
+				return aCopy[i].Value < aCopy[j].Value
+			}
+			return !aCopy[i].HasValue && aCopy[j].HasValue
+		}
+		return aCopy[i].Type < aCopy[j].Type
+	})
+
+	sort.Slice(bCopy, func(i, j int) bool {
+		if bCopy[i].Type == bCopy[j].Type {
+			if bCopy[i].HasValue == bCopy[j].HasValue {
+				return bCopy[i].Value < bCopy[j].Value
+			}
+			return !bCopy[i].HasValue && bCopy[j].HasValue
+		}
+		return bCopy[i].Type < bCopy[j].Type
+	})
+
+	for i := range aCopy {
+		if aCopy[i].Type != bCopy[i].Type {
+			return false
+		}
+		if aCopy[i].HasValue != bCopy[i].HasValue {
+			return false
+		}
+		if aCopy[i].HasValue && aCopy[i].Value != bCopy[i].Value {
+			return false
+		}
+	}
+
+	return true
 }
 
 func foreignKeyRefEqual(a, b schema.ForeignKeyRef) bool {

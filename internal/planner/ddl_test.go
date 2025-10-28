@@ -215,7 +215,7 @@ func TestGenerateCreatePartialIndex(t *testing.T) {
 	stmt, err := gen.GenerateCreateStatement(index)
 	require.NoError(t, err)
 
-	assert.Contains(t, stmt, "WHERE deleted_at IS NULL")
+	assert.Contains(t, stmt, "WHERE (deleted_at IS NULL)")
 }
 
 func TestGenerateCreateView(t *testing.T) {

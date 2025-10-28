@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // parseCreateView parses a CREATE VIEW statement
@@ -407,6 +407,18 @@ func (p *Parser) extractStringValue(node *pg_query.Node) string {
 		return strNode.String_.Sval
 	}
 	return ""
+}
+
+// Helper: extract boolean value from a node
+func (p *Parser) extractBoolValue(node *pg_query.Node) *bool {
+	if node == nil {
+		return nil
+	}
+	if boolNode, ok := node.Node.(*pg_query.Node_Boolean); ok {
+		val := boolNode.Boolean.Boolval
+		return &val
+	}
+	return nil
 }
 
 // Helper: extract list of string values from a node (for function bodies, etc.)

@@ -2,6 +2,8 @@ package parser
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
@@ -81,6 +83,10 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 				return nil, fmt.Errorf("failed to parse constraint: %w", err)
 			}
 		}
+	}
+
+	if len(stmt.Options) > 0 {
+		table.RelOptions = p.parseRelOptions(stmt.Options)
 	}
 
 	// Auto-generate names for unnamed constraints to match PostgreSQL's auto-naming
@@ -308,11 +314,7 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 
 	case pg_query.ConstrType_CONSTR_IDENTITY:
 		// IDENTITY column
-		// Note: pg_query_go doesn't expose the ALWAYS/BY DEFAULT distinction easily
-		// Defaulting to ALWAYS for now
-		column.Identity = &schema.IdentitySpec{
-			Always: true,
-		}
+		column.Identity = p.buildIdentitySpec(constraint)
 
 	case pg_query.ConstrType_CONSTR_GENERATED:
 		// GENERATED column
@@ -489,6 +491,108 @@ func (p *Parser) parseFkMatchTypeString(matchType string) schema.MatchType {
 		return schema.MatchSimple
 	default:
 		return schema.MatchSimple
+	}
+}
+
+func (p *Parser) buildIdentitySpec(constraint *pg_query.Constraint) *schema.IdentitySpec {
+	spec := &schema.IdentitySpec{
+		Always: strings.EqualFold(constraint.GeneratedWhen, "a") || strings.EqualFold(constraint.GeneratedWhen, "always"),
+	}
+
+	for _, option := range constraint.Options {
+		defElem := option.GetDefElem()
+		if defElem == nil {
+			continue
+		}
+		if seqOpt := p.normalizeIdentityOption(defElem); seqOpt != nil {
+			spec.SequenceOptions = append(spec.SequenceOptions, *seqOpt)
+		}
+	}
+
+	return spec
+}
+
+func (p *Parser) normalizeIdentityOption(defElem *pg_query.DefElem) *schema.SequenceOption {
+	if defElem == nil {
+		return nil
+	}
+
+	switch strings.ToLower(defElem.Defname) {
+	case "start":
+		if val := p.extractIntValue(defElem.Arg); val != nil {
+			return &schema.SequenceOption{Type: "START WITH", Value: *val, HasValue: true}
+		}
+	case "increment":
+		if val := p.extractIntValue(defElem.Arg); val != nil {
+			return &schema.SequenceOption{Type: "INCREMENT BY", Value: *val, HasValue: true}
+		}
+	case "minvalue":
+		if val := p.extractIntValue(defElem.Arg); val != nil {
+			return &schema.SequenceOption{Type: "MINVALUE", Value: *val, HasValue: true}
+		}
+		return &schema.SequenceOption{Type: "NO MINVALUE"}
+	case "maxvalue":
+		if val := p.extractIntValue(defElem.Arg); val != nil {
+			return &schema.SequenceOption{Type: "MAXVALUE", Value: *val, HasValue: true}
+		}
+		return &schema.SequenceOption{Type: "NO MAXVALUE"}
+	case "cache":
+		if val := p.extractIntValue(defElem.Arg); val != nil {
+			return &schema.SequenceOption{Type: "CACHE", Value: *val, HasValue: true}
+		}
+	case "cycle":
+		if boolVal := p.extractBoolValue(defElem.Arg); boolVal != nil {
+			if *boolVal {
+				return &schema.SequenceOption{Type: "CYCLE"}
+			}
+			return &schema.SequenceOption{Type: "NO CYCLE"}
+		}
+		return &schema.SequenceOption{Type: "CYCLE"}
+	}
+
+	return nil
+}
+
+func (p *Parser) parseRelOptions(nodes []*pg_query.Node) []string {
+	var options []string
+
+	for _, node := range nodes {
+		defElem := node.GetDefElem()
+		if defElem == nil || defElem.Defname == "" {
+			continue
+		}
+
+		if defElem.Arg != nil {
+			value := p.relOptionValue(defElem)
+			options = append(options, fmt.Sprintf("%s=%s", defElem.Defname, value))
+		} else {
+			options = append(options, defElem.Defname)
+		}
+	}
+
+	sort.Strings(options)
+	return options
+}
+
+func (p *Parser) relOptionValue(defElem *pg_query.DefElem) string {
+	if defElem == nil || defElem.Arg == nil {
+		return ""
+	}
+
+	switch value := defElem.Arg.Node.(type) {
+	case *pg_query.Node_Integer:
+		return strconv.FormatInt(int64(value.Integer.Ival), 10)
+	case *pg_query.Node_Float:
+		return value.Float.Fval
+	case *pg_query.Node_String_:
+		return fmt.Sprintf("'%s'", strings.ReplaceAll(value.String_.Sval, "'", "''"))
+	case *pg_query.Node_Boolean:
+		if value.Boolean.Boolval {
+			return "true"
+		}
+		return "false"
+	default:
+		return p.deparseExpr(defElem.Arg)
 	}
 }
 
