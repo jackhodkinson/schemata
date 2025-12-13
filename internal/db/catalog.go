@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -422,20 +423,43 @@ func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]sch
 
 func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaName, tableName schema.TableName) ([]schema.Column, error) {
 	query := `
-		SELECT
-			a.attname as column_name,
-			format_type(a.atttypid, a.atttypmod) as column_type,
-			a.attnotnull as not_null,
-			pg_get_expr(ad.adbin, ad.adrelid) as default_expr,
-			a.attgenerated::text as generated,
-			a.attidentity::text as identity,
-			col.collname as collation,
-			col_description(a.attrelid, a.attnum) as comment
+    SELECT
+        a.attname as column_name,
+        format_type(a.atttypid, a.atttypmod) as column_type,
+        a.attnotnull as not_null,
+        pg_get_expr(ad.adbin, ad.adrelid) as default_expr,
+        a.attgenerated::text as generated,
+        a.attidentity::text as identity,
+        seq.seqstart,
+        seq.seqincrement,
+        seq.seqmin,
+        seq.seqmax,
+        seq.seqcache,
+        seq.seqcycle,
+        col.collname as collation,
+        col_description(a.attrelid, a.attnum) as comment
 		FROM pg_attribute a
 		JOIN pg_class c ON a.attrelid = c.oid
 		JOIN pg_namespace n ON c.relnamespace = n.oid
-		LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-		LEFT JOIN pg_collation col ON a.attcollation = col.oid AND a.attcollation != 0
+    LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+    LEFT JOIN LATERAL (
+        SELECT
+            s.seqstart,
+            s.seqincrement,
+            s.seqmin,
+            s.seqmax,
+            s.seqcache,
+            s.seqcycle
+        FROM pg_depend d
+        JOIN pg_class seq_class ON d.objid = seq_class.oid AND d.deptype = 'a'
+        JOIN pg_sequence s ON s.seqrelid = seq_class.oid
+        WHERE d.classid = 'pg_class'::regclass
+          AND d.refclassid = 'pg_class'::regclass
+          AND d.refobjid = c.oid
+          AND d.refobjsubid = a.attnum
+        LIMIT 1
+    ) seq ON true
+    LEFT JOIN pg_collation col ON a.attcollation = col.oid AND a.attcollation != 0
 		WHERE n.nspname = $1
 			AND c.relname = $2
 			AND a.attnum > 0
@@ -453,8 +477,12 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
 	for rows.Next() {
 		var col schema.Column
 		var defaultExpr, generated, identity, collation, comment *string
+		var seqStart, seqIncrement, seqMin, seqMax, seqCache sql.NullInt64
+		var seqCycle sql.NullBool
 
-		if err := rows.Scan(&col.Name, &col.Type, &col.NotNull, &defaultExpr, &generated, &identity, &collation, &comment); err != nil {
+		if err := rows.Scan(&col.Name, &col.Type, &col.NotNull, &defaultExpr, &generated, &identity,
+			&seqStart, &seqIncrement, &seqMin, &seqMax, &seqCache, &seqCycle,
+			&collation, &comment); err != nil {
 			return nil, err
 		}
 
@@ -477,9 +505,40 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
 
 		if identity != nil && len(*identity) > 0 {
 			// 'a' = ALWAYS, 'd' = BY DEFAULT
-			col.Identity = &schema.IdentitySpec{
+			spec := &schema.IdentitySpec{
 				Always: (*identity)[0] == 'a',
 			}
+
+			var startPtr, incrementPtr, minPtr, maxPtr, cachePtr *int64
+			var cyclePtr *bool
+
+			if seqStart.Valid {
+				val := seqStart.Int64
+				startPtr = &val
+			}
+			if seqIncrement.Valid {
+				val := seqIncrement.Int64
+				incrementPtr = &val
+			}
+			if seqMin.Valid {
+				val := seqMin.Int64
+				minPtr = &val
+			}
+			if seqMax.Valid {
+				val := seqMax.Int64
+				maxPtr = &val
+			}
+			if seqCache.Valid {
+				val := seqCache.Int64
+				cachePtr = &val
+			}
+			if seqCycle.Valid {
+				val := seqCycle.Bool
+				cyclePtr = &val
+			}
+
+			spec.SequenceOptions = schema.IdentityOptionsFromParameters(col.Type, startPtr, incrementPtr, minPtr, maxPtr, cachePtr, cyclePtr)
+			col.Identity = spec
 		}
 
 		// Normalize default collation to nil
@@ -504,9 +563,10 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 			con.contype::text as constraint_type,
 			array_agg(a.attname ORDER BY u.pos) FILTER (WHERE a.attname IS NOT NULL) as columns,
 			array_agg(af.attname ORDER BY uf.pos) FILTER (WHERE af.attname IS NOT NULL) as ref_columns,
-			con.condeferrable as deferrable,
-			con.condeferred as deferred,
-			pg_get_constraintdef(con.oid, true) as definition,
+        con.condeferrable as deferrable,
+        con.condeferred as deferred,
+        con.convalidated as validated,
+        pg_get_constraintdef(con.oid, true) as definition,
 			fn.nspname as foreign_schema,
 			fc.relname as foreign_table,
 			con.confupdtype::text as update_action,
@@ -522,7 +582,7 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 		LEFT JOIN pg_class fc ON con.confrelid = fc.oid
 		LEFT JOIN pg_namespace fn ON fc.relnamespace = fn.oid
 		WHERE n.nspname = $1 AND c.relname = $2
-		GROUP BY con.oid, con.conname, con.contype, con.condeferrable, con.condeferred, fn.nspname, fc.relname, con.confupdtype, con.confdeltype, con.confmatchtype
+    GROUP BY con.oid, con.conname, con.contype, con.condeferrable, con.condeferred, con.convalidated, fn.nspname, fc.relname, con.confupdtype, con.confdeltype, con.confmatchtype
 		ORDER BY con.contype, con.conname
 	`
 
@@ -542,10 +602,11 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 		var columns []string
 		var refColumns []string
 		var deferrable, deferred bool
+		var validated bool
 		var foreignSchema, foreignTable *string
 		var updateAction, deleteAction, matchType *string
 
-		if err := rows.Scan(&name, &contype, &columns, &refColumns, &deferrable, &deferred, &definition,
+		if err := rows.Scan(&name, &contype, &columns, &refColumns, &deferrable, &deferred, &validated, &definition,
 			&foreignSchema, &foreignTable, &updateAction, &deleteAction, &matchType); err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -574,6 +635,7 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 				NullsDistinct:     true, // Default
 				Deferrable:        deferrable,
 				InitiallyDeferred: deferred,
+				NotValid:          !validated,
 			})
 
 		case "c": // Check
@@ -586,6 +648,7 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 				Expr:              schema.Expr(expr),
 				Deferrable:        deferrable,
 				InitiallyDeferred: deferred,
+				NotValid:          !validated,
 			})
 
 		case "f": // Foreign key
@@ -613,6 +676,7 @@ func (c *Catalog) extractConstraints(ctx context.Context, schemaName schema.Sche
 				Match:             parseMatchType(matchType),
 				Deferrable:        deferrable,
 				InitiallyDeferred: deferred,
+				NotValid:          !validated,
 			})
 		}
 	}
@@ -676,9 +740,9 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 			i.relname as index_name,
 			ix.indisunique as is_unique,
 			am.amname as method,
-			ix.indexrelid::int8 as index_oid,
-			ix.indoption as options,
-			pg_get_expr(ix.indpred, ix.indrelid, true) as predicate,
+        ix.indexrelid::int8 as index_oid,
+        pg_get_expr(ix.indpred, ix.indrelid, true) as predicate,
+			pg_get_indexdef(ix.indexrelid) as source,
 			obj_description(i.oid, 'pg_class') as comment
 		FROM pg_index ix
 		JOIN pg_class c ON ix.indrelid = c.oid
@@ -702,21 +766,11 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 		var idx schema.Index
 		var indexOID int64
 		var comment, predicate *string
+		var source string
 		var method string
-		var optionsStr string
 
-		if err := rows.Scan(&idx.Schema, &idx.Table, &idx.Name, &idx.Unique, &method, &indexOID, &optionsStr, &predicate, &comment); err != nil {
+		if err := rows.Scan(&idx.Schema, &idx.Table, &idx.Name, &idx.Unique, &method, &indexOID, &predicate, &source, &comment); err != nil {
 			return nil, err
-		}
-
-		// Parse options from int2vector format (space-separated integers)
-		var options []int16
-		if optionsStr != "" {
-			for _, s := range strings.Fields(optionsStr) {
-				var opt int16
-				fmt.Sscanf(s, "%d", &opt)
-				options = append(options, opt)
-			}
 		}
 
 		// Skip implicit indexes
@@ -734,63 +788,166 @@ func (c *Catalog) extractIndexes(ctx context.Context, schemaFilter string, table
 			idx.Predicate = &pred
 		}
 
-		// Extract key expressions by querying pg_get_indexdef for each column
-		// This gets the actual expression text for each index column
-		keyExprsQuery := `
-			SELECT
-				pg_get_indexdef($1, k, true) as expr
-			FROM generate_series(1, (
-				SELECT array_length(indkey, 1)
-				FROM pg_index
-				WHERE indexrelid = $1
-			)) k
-		`
-		keyRows, err := c.pool.Query(ctx, keyExprsQuery, indexOID)
+		// Extract key expressions by parsing the canonical `pg_get_indexdef()` output. This matches
+		// what pg stores as the index definition, and avoids false positives from implicit/default
+		// collations/opclasses and ordering/nulls semantics.
+		keyExprs, includeCols, whereExpr, err := parseIndexDefinition(source)
 		if err != nil {
-			return nil, fmt.Errorf("failed to extract key expressions for index %s: %w", idx.Name, err)
+			return nil, fmt.Errorf("failed to parse index definition for %s: %w", idx.Name, err)
 		}
-
-		var keyExprs []schema.IndexKeyExpr
-		keyIndex := 0
-		for keyRows.Next() {
-			var expr string
-			if err := keyRows.Scan(&expr); err != nil {
-				keyRows.Close()
-				return nil, err
-			}
-
-			keyExpr := schema.IndexKeyExpr{Expr: schema.Expr(expr)}
-
-			// Parse ordering from indoption array
-			// indoption is a bitmask: bit 0 = DESC, bit 1 = NULLS FIRST
-			if keyIndex < len(options) {
-				option := options[keyIndex]
-				// Bit 0 (value 1): DESC instead of ASC
-				if option&1 != 0 {
-					ordering := schema.Desc
-					keyExpr.Ordering = &ordering
-				}
-				// Bit 1 (value 2): NULLS FIRST instead of NULLS LAST (for DESC) or NULLS FIRST instead of default
-				if option&2 != 0 {
-					nullsOrdering := schema.NullsFirst
-					keyExpr.NullsOrdering = &nullsOrdering
-				}
-			}
-
-			keyExprs = append(keyExprs, keyExpr)
-			keyIndex++
-		}
-		keyRows.Close()
-
-		if err := keyRows.Err(); err != nil {
-			return nil, err
-		}
-
 		idx.KeyExprs = keyExprs
+		if len(includeCols) > 0 {
+			idx.Include = includeCols
+		}
+		if whereExpr != nil {
+			idx.Predicate = whereExpr
+		}
+
 		objects = append(objects, idx)
 	}
 
 	return objects, rows.Err()
+}
+
+func parseIndexDefinition(source string) ([]schema.IndexKeyExpr, []schema.ColumnName, *schema.Expr, error) {
+	result, err := pg_query.Parse(source)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(result.Stmts) == 0 || result.Stmts[0].Stmt == nil {
+		return nil, nil, nil, fmt.Errorf("empty parse result")
+	}
+
+	stmt := result.Stmts[0].Stmt
+	indexNode, ok := stmt.Node.(*pg_query.Node_IndexStmt)
+	if !ok || indexNode.IndexStmt == nil {
+		return nil, nil, nil, fmt.Errorf("expected IndexStmt, got %T", stmt.Node)
+	}
+
+	indexStmt := indexNode.IndexStmt
+
+	var keyExprs []schema.IndexKeyExpr
+	for _, param := range indexStmt.IndexParams {
+		if param == nil {
+			continue
+		}
+		indexElemNode, ok := param.Node.(*pg_query.Node_IndexElem)
+		if !ok || indexElemNode.IndexElem == nil {
+			continue
+		}
+		keyExprs = append(keyExprs, parseIndexElem(indexElemNode.IndexElem))
+	}
+
+	var includeCols []schema.ColumnName
+	for _, incl := range indexStmt.IndexIncludingParams {
+		if incl == nil {
+			continue
+		}
+		indexElemNode, ok := incl.Node.(*pg_query.Node_IndexElem)
+		if !ok || indexElemNode.IndexElem == nil {
+			continue
+		}
+		if indexElemNode.IndexElem.Name != "" {
+			includeCols = append(includeCols, schema.ColumnName(indexElemNode.IndexElem.Name))
+		}
+	}
+
+	var predicate *schema.Expr
+	if indexStmt.WhereClause != nil {
+		exprStr := deparseExpr(indexStmt.WhereClause)
+		if exprStr != "" {
+			tmp := schema.Expr(exprStr)
+			predicate = &tmp
+		}
+	}
+
+	return keyExprs, includeCols, predicate, nil
+}
+
+func parseIndexElem(elem *pg_query.IndexElem) schema.IndexKeyExpr {
+	keyExpr := schema.IndexKeyExpr{}
+
+	if elem.Name != "" {
+		keyExpr.Expr = schema.Expr(elem.Name)
+	} else if elem.Expr != nil {
+		keyExpr.Expr = schema.Expr(deparseExpr(elem.Expr))
+	}
+
+	if elem.Collation != nil && len(elem.Collation) > 0 {
+		collation := extractLastName(elem.Collation)
+		if collation != "" {
+			keyExpr.Collation = &collation
+		}
+	}
+
+	if elem.Opclass != nil && len(elem.Opclass) > 0 {
+		opclass := extractLastName(elem.Opclass)
+		if opclass != "" {
+			keyExpr.OpClass = &opclass
+		}
+	}
+
+	if elem.Ordering != pg_query.SortByDir_SORTBY_DEFAULT {
+		if elem.Ordering == pg_query.SortByDir_SORTBY_ASC {
+			ordering := schema.Asc
+			keyExpr.Ordering = &ordering
+		} else if elem.Ordering == pg_query.SortByDir_SORTBY_DESC {
+			ordering := schema.Desc
+			keyExpr.Ordering = &ordering
+		}
+	}
+
+	if elem.NullsOrdering != pg_query.SortByNulls_SORTBY_NULLS_DEFAULT {
+		if elem.NullsOrdering == pg_query.SortByNulls_SORTBY_NULLS_FIRST {
+			nulls := schema.NullsFirst
+			keyExpr.NullsOrdering = &nulls
+		} else if elem.NullsOrdering == pg_query.SortByNulls_SORTBY_NULLS_LAST {
+			nulls := schema.NullsLast
+			keyExpr.NullsOrdering = &nulls
+		}
+	}
+
+	return keyExpr
+}
+
+func extractLastName(nodes []*pg_query.Node) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	if strNode, ok := nodes[len(nodes)-1].Node.(*pg_query.Node_String_); ok {
+		return strNode.String_.Sval
+	}
+	return ""
+}
+
+func deparseExpr(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	result, err := pg_query.Deparse(&pg_query.ParseResult{
+		Stmts: []*pg_query.RawStmt{{Stmt: &pg_query.Node{
+			Node: &pg_query.Node_SelectStmt{
+				SelectStmt: &pg_query.SelectStmt{
+					TargetList: []*pg_query.Node{{
+						Node: &pg_query.Node_ResTarget{
+							ResTarget: &pg_query.ResTarget{
+								Val: node,
+							},
+						},
+					}},
+				},
+			},
+		}}},
+	})
+	if err != nil {
+		return ""
+	}
+
+	result = strings.TrimSpace(result)
+	result = strings.TrimPrefix(result, "SELECT ")
+	result = strings.TrimSuffix(result, ";")
+	return strings.TrimSpace(result)
 }
 
 func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
@@ -961,6 +1118,12 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			return nil, err
 		}
 
+		parsedArgs, err := parseFunctionIdentityArguments(args)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse function %s.%s identity args %q: %w", fn.Schema, fn.Name, args, err)
+		}
+		fn.Args = parsedArgs
+
 		fn.Language = schema.Language(language)
 		fn.Strict = isStrict
 		fn.SecurityDefiner = securityDefiner
@@ -991,13 +1154,148 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			fn.Parallel = schema.ParallelUnsafe
 		}
 
-		// TODO: Parse args and returns properly
-		fn.Returns = schema.ReturnsType{Type: schema.TypeName(returns)}
+		parsedReturn, err := parseFunctionReturn(returns)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse function %s.%s return %q: %w", fn.Schema, fn.Name, returns, err)
+		}
+		fn.Returns = parsedReturn
 
 		objects = append(objects, fn)
 	}
 
 	return objects, rows.Err()
+}
+
+func parseFunctionIdentityArguments(args string) ([]schema.FunctionArg, error) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return nil, nil
+	}
+
+	parts := splitTopLevelComma(args)
+	out := make([]schema.FunctionArg, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		arg := schema.FunctionArg{Mode: schema.InMode}
+
+		upper := strings.ToUpper(part)
+		if strings.HasPrefix(upper, "VARIADIC ") {
+			arg.Mode = schema.VariadicMode
+			part = strings.TrimSpace(part[len("VARIADIC "):])
+		}
+
+		arg.Type = schema.NormalizeTypeName(schema.TypeName(part))
+		out = append(out, arg)
+	}
+
+	return out, nil
+}
+
+func parseFunctionReturn(returns string) (schema.FunctionReturn, error) {
+	returns = strings.TrimSpace(returns)
+	if returns == "" {
+		return schema.ReturnsType{Type: "void"}, nil
+	}
+
+	upper := strings.ToUpper(returns)
+	if strings.HasPrefix(upper, "SETOF ") {
+		typ := strings.TrimSpace(returns[len("SETOF "):])
+		return schema.ReturnsSetOf{Type: schema.NormalizeTypeName(schema.TypeName(typ))}, nil
+	}
+
+	if strings.HasPrefix(upper, "TABLE") {
+		rest := strings.TrimSpace(returns[len("TABLE"):])
+		if !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
+			return nil, fmt.Errorf("invalid TABLE return syntax")
+		}
+		inside := strings.TrimSpace(rest[1 : len(rest)-1])
+		if inside == "" {
+			return schema.ReturnsTable{Columns: nil}, nil
+		}
+		colParts := splitTopLevelComma(inside)
+		cols := make([]schema.TableColumn, 0, len(colParts))
+		for _, colPart := range colParts {
+			colPart = strings.TrimSpace(colPart)
+			if colPart == "" {
+				continue
+			}
+			name, typ, ok := splitIdentifierAndType(colPart)
+			if !ok {
+				return nil, fmt.Errorf("invalid TABLE column %q", colPart)
+			}
+			cols = append(cols, schema.TableColumn{
+				Name: name,
+				Type: schema.NormalizeTypeName(schema.TypeName(typ)),
+			})
+		}
+		return schema.ReturnsTable{Columns: cols}, nil
+	}
+
+	return schema.ReturnsType{Type: schema.NormalizeTypeName(schema.TypeName(returns))}, nil
+}
+
+func splitTopLevelComma(s string) []string {
+	var parts []string
+	start := 0
+	depth := 0
+	inQuotes := false
+
+	for i, r := range s {
+		switch r {
+		case '"':
+			inQuotes = !inQuotes
+		case '(':
+			if !inQuotes {
+				depth++
+			}
+		case ')':
+			if !inQuotes && depth > 0 {
+				depth--
+			}
+		case ',':
+			if !inQuotes && depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+
+	parts = append(parts, s[start:])
+	return parts
+}
+
+func splitIdentifierAndType(s string) (name string, typ string, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "", false
+	}
+
+	// Column name may be quoted; type may contain spaces and parentheses.
+	if s[0] == '"' {
+		end := strings.Index(s[1:], `"`)
+		if end == -1 {
+			return "", "", false
+		}
+		name = s[1 : 1+end]
+		rest := strings.TrimSpace(s[2+end:])
+		if rest == "" {
+			return "", "", false
+		}
+		return name, rest, true
+	}
+
+	fields := strings.Fields(s)
+	if len(fields) < 2 {
+		return "", "", false
+	}
+
+	name = fields[0]
+	typ = strings.TrimSpace(s[len(name):])
+	return name, typ, true
 }
 
 func (c *Catalog) extractTriggers(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
@@ -1099,7 +1397,21 @@ func (c *Catalog) extractPolicies(ctx context.Context, schemaFilter string) ([]s
 			pol.polname as policy_name,
 			pol.polpermissive as is_permissive,
 			pol.polcmd::text as command,
-			pol.polroles,
+			COALESCE((
+				SELECT array_agg(
+					CASE
+						WHEN role_oid.oid = 0 THEN 'public'
+						ELSE r.rolname
+					END
+					ORDER BY
+					CASE
+						WHEN role_oid.oid = 0 THEN 'public'
+						ELSE r.rolname
+					END
+				)
+				FROM unnest(pol.polroles) AS role_oid(oid)
+				LEFT JOIN pg_roles r ON r.oid = role_oid.oid
+			), ARRAY[]::text[]) as roles,
 			pg_get_expr(pol.polqual, pol.polrelid) as using_expr,
 			pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check_expr
 		FROM pg_policy pol
@@ -1119,7 +1431,7 @@ func (c *Catalog) extractPolicies(ctx context.Context, schemaFilter string) ([]s
 	for rows.Next() {
 		var pol schema.Policy
 		var command string
-		var roles []int32
+		var roles []string
 		var usingExpr, withCheckExpr *string
 
 		if err := rows.Scan(&pol.Schema, &pol.Table, &pol.Name, &pol.Permissive, &command, &roles, &usingExpr, &withCheckExpr); err != nil {
@@ -1149,8 +1461,7 @@ func (c *Catalog) extractPolicies(ctx context.Context, schemaFilter string) ([]s
 			pol.WithCheck = &expr
 		}
 
-		// TODO: Convert role OIDs to role names
-		pol.To = []string{"public"} // Placeholder
+		pol.To = roles
 
 		objects = append(objects, pol)
 	}

@@ -145,7 +145,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 5: Generate DDL for the differences
 	fmt.Println("Generating DDL...")
-	ddlGen := planner.NewDDLGenerator()
+	ddlGen := planner.NewDDLGenerator(planner.WithAllowCascade(allowCascade))
 	ddl, err := ddlGen.GenerateDDL(diff, desiredSchema)
 	if err != nil {
 		return fmt.Errorf("failed to generate DDL: %w", err)

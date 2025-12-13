@@ -210,6 +210,7 @@ type UniqueConstraint struct {
 	NullsDistinct     bool
 	Deferrable        bool
 	InitiallyDeferred bool
+	NotValid          bool
 }
 
 // CheckConstraint represents a check constraint
@@ -219,6 +220,7 @@ type CheckConstraint struct {
 	NoInherit         bool
 	Deferrable        bool
 	InitiallyDeferred bool
+	NotValid          bool
 	// ColumnName is set for column-level CHECK constraints to track the associated column
 	// Used for generating auto-names following PostgreSQL's pattern: {table}_{column}_check
 	ColumnName *ColumnName
@@ -234,6 +236,7 @@ type ForeignKey struct {
 	Match             MatchType
 	Deferrable        bool
 	InitiallyDeferred bool
+	NotValid          bool
 }
 
 type ForeignKeyRef struct {

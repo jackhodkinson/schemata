@@ -152,6 +152,50 @@ func TestGenerateCreateTableWithForeignKey(t *testing.T) {
 	assert.Contains(t, stmt, "ON DELETE CASCADE")
 }
 
+func TestGenerateCreateTableWithNotValidConstraints(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	table := schema.Table{
+		Schema: "public",
+		Name:   "orders",
+		Columns: []schema.Column{
+			{Name: "id", Type: "INTEGER", NotNull: true},
+			{Name: "customer_id", Type: "INTEGER"},
+			{Name: "code", Type: "TEXT"},
+		},
+		PrimaryKey: &schema.PrimaryKey{
+			Cols: []schema.ColumnName{"id"},
+		},
+		Uniques: []schema.UniqueConstraint{
+			{Name: "orders_code_key", Cols: []schema.ColumnName{"code"}, NullsDistinct: true, NotValid: true},
+		},
+		Checks: []schema.CheckConstraint{
+			{Name: "orders_id_positive", Expr: "id > 0", NotValid: true},
+		},
+		ForeignKeys: []schema.ForeignKey{
+			{
+				Name: "orders_customer_fk",
+				Cols: []schema.ColumnName{"customer_id"},
+				Ref: schema.ForeignKeyRef{
+					Schema: "public",
+					Table:  "customers",
+					Cols:   []schema.ColumnName{"id"},
+				},
+				OnDelete: schema.NoAction,
+				OnUpdate: schema.NoAction,
+				NotValid: true,
+			},
+		},
+	}
+
+	stmt, err := gen.GenerateCreateStatement(table)
+	require.NoError(t, err)
+
+	assert.Contains(t, stmt, "CONSTRAINT orders_code_key UNIQUE (code) NOT VALID")
+	assert.Contains(t, stmt, "CONSTRAINT orders_id_positive CHECK (id > 0) NOT VALID")
+	assert.Contains(t, stmt, "CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES public.customers (id) NOT VALID")
+}
+
 func TestGenerateCreateIndex(t *testing.T) {
 	gen := NewDDLGenerator()
 
@@ -371,6 +415,22 @@ func TestGenerateDropTable(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, stmt, "DROP TABLE IF EXISTS public.users")
+	assert.NotContains(t, stmt, "CASCADE")
+}
+
+func TestGenerateDropTableWithCascadeEnabled(t *testing.T) {
+	gen := NewDDLGenerator(WithAllowCascade(true))
+
+	key := schema.ObjectKey{
+		Kind:   schema.TableKind,
+		Schema: "public",
+		Name:   "users",
+	}
+
+	stmt, err := gen.generateDrop(key)
+	require.NoError(t, err)
+
+	assert.Contains(t, stmt, "DROP TABLE IF EXISTS public.users")
 	assert.Contains(t, stmt, "CASCADE")
 }
 
@@ -526,7 +586,8 @@ func TestGenerateAlterTableAddGeneratedColumn(t *testing.T) {
 		NewObject: newTable,
 	}
 
-	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+	statements, err := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.NoError(t, err)
 	require.Len(t, statements, 1)
 	assert.Equal(t,
 		"ALTER TABLE public.users ADD COLUMN full_name TEXT GENERATED ALWAYS AS (COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')) STORED;",
@@ -572,12 +633,60 @@ func TestGenerateAlterTableModifyGeneratedColumn(t *testing.T) {
 		NewObject: newTable,
 	}
 
-	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+	statements, err := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.NoError(t, err)
 	require.Len(t, statements, 2)
 	assert.Equal(t, "ALTER TABLE public.users ALTER COLUMN full_name DROP EXPRESSION;", statements[0])
 	assert.Equal(t,
 		"ALTER TABLE public.users ALTER COLUMN full_name ADD GENERATED ALWAYS AS (UPPER(COALESCE(first_name, '') || ' ' || COALESCE(last_name, ''))) STORED;",
 		statements[1])
+}
+
+func TestGenerateAlterTableIdentitySpecChanged(t *testing.T) {
+	gen := NewDDLGenerator()
+
+	oldTable := schema.Table{
+		Schema: "public",
+		Name:   "accounts",
+		Columns: []schema.Column{
+			{
+				Name:     "id",
+				Type:     "BIGINT",
+				Identity: &schema.IdentitySpec{Always: false},
+			},
+		},
+	}
+
+	newTable := schema.Table{
+		Schema: "public",
+		Name:   "accounts",
+		Columns: []schema.Column{
+			{
+				Name: "id",
+				Type: "BIGINT",
+				Identity: &schema.IdentitySpec{
+					Always: true,
+					SequenceOptions: []schema.SequenceOption{
+						{Type: "START WITH", Value: 100, HasValue: true},
+						{Type: "INCREMENT BY", Value: 10, HasValue: true},
+					},
+				},
+			},
+		},
+	}
+
+	alter := differ.AlterOperation{
+		Key:       schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "accounts"},
+		Changes:   []string{"alter column id: identity spec changed"},
+		OldObject: oldTable,
+		NewObject: newTable,
+	}
+
+	statements, err := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.NoError(t, err)
+	require.Len(t, statements, 2)
+	assert.Equal(t, "ALTER TABLE public.accounts ALTER COLUMN id DROP IDENTITY IF EXISTS;", statements[0])
+	assert.Equal(t, "ALTER TABLE public.accounts ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10);", statements[1])
 }
 
 func TestGenerateAlterTableHandlesCollationAndCommentChanges(t *testing.T) {
@@ -618,7 +727,8 @@ func TestGenerateAlterTableHandlesCollationAndCommentChanges(t *testing.T) {
 		NewObject: newTable,
 	}
 
-	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+	statements, err := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.NoError(t, err)
 
 	require.Contains(t, statements, "ALTER TABLE public.users ALTER COLUMN email TYPE TEXT COLLATE \"en-US-x-icu\";")
 	require.Contains(t, statements, "COMMENT ON COLUMN public.users.email IS 'New email comment';")
@@ -658,7 +768,8 @@ func TestGenerateAlterTableAddColumnWithCollationAndComment(t *testing.T) {
 		NewObject: newTable,
 	}
 
-	statements := gen.generateAlterTable(newTable, &oldTable, alter)
+	statements, err := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.NoError(t, err)
 
 	require.Contains(t, statements, "ALTER TABLE public.users ADD COLUMN display_name TEXT COLLATE \"en-US-x-icu\";")
 	require.Contains(t, statements, "COMMENT ON COLUMN public.users.display_name IS 'Display name';")

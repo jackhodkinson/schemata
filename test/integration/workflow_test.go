@@ -1,3 +1,6 @@
+//go:build integration
+// +build integration
+
 package integration
 
 import (
@@ -586,23 +589,12 @@ func cleanup(t *testing.T, ctx context.Context, devPool, targetPool *db.Pool) {
 	t.Helper()
 
 	if devPool != nil {
-		// Drop all functions first (CASCADE will handle triggers)
-		_, _ = devPool.Exec(ctx, "DROP FUNCTION IF EXISTS update_updated_at_column CASCADE")
 		_, _ = devPool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS users CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS posts CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS comments CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS test_alters CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS test_migration_table CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS test_dryrun_table CASCADE")
+		_ = resetPublicSchema(ctx, devPool)
 	}
 
 	if targetPool != nil {
-		// Drop all functions first (CASCADE will handle triggers)
-		_, _ = targetPool.Exec(ctx, "DROP FUNCTION IF EXISTS update_updated_at_column CASCADE")
 		_, _ = targetPool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
-		_, _ = targetPool.Exec(ctx, "DROP TABLE IF EXISTS users CASCADE")
-		_, _ = targetPool.Exec(ctx, "DROP TABLE IF EXISTS posts CASCADE")
-		_, _ = targetPool.Exec(ctx, "DROP TABLE IF EXISTS comments CASCADE")
+		_ = resetPublicSchema(ctx, targetPool)
 	}
 }

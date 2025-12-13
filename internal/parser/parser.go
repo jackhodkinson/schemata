@@ -13,6 +13,18 @@ import (
 // Parser parses SQL files using pg_query_go and extracts schema objects
 type Parser struct{}
 
+type UnsupportedStatementError struct {
+	StatementType string
+	Remediation   string
+}
+
+func (e *UnsupportedStatementError) Error() string {
+	if e.Remediation != "" {
+		return fmt.Sprintf("unsupported statement type %s; remediation: %s", e.StatementType, e.Remediation)
+	}
+	return fmt.Sprintf("unsupported statement type %s", e.StatementType)
+}
+
 // NewParser creates a new SQL parser
 func NewParser() *Parser {
 	return &Parser{}
@@ -56,8 +68,11 @@ func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
 		// Extract object based on statement type
 		obj, err := p.extractObject(rawStmt.Stmt)
 		if err != nil {
-			// Log but continue - some statements might not be schema objects
-			continue
+			snippet := extractStatementSnippet(sql, int(rawStmt.StmtLocation), int(rawStmt.StmtLen))
+			if snippet != "" {
+				return nil, fmt.Errorf("failed to parse statement: %w\n\nStatement snippet:\n%s", err, snippet)
+			}
+			return nil, fmt.Errorf("failed to parse statement: %w", err)
 		}
 		if obj != nil {
 			objects = append(objects, obj)
@@ -70,6 +85,28 @@ func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
 
 	// Build object map with hashing
 	return p.buildObjectMap(objects)
+}
+
+func extractStatementSnippet(sql string, location, length int) string {
+	if location < 0 || location >= len(sql) {
+		return ""
+	}
+
+	end := len(sql)
+	if length > 0 && location+length <= len(sql) {
+		end = location + length
+	}
+
+	snippet := strings.TrimSpace(sql[location:end])
+	if snippet == "" {
+		return ""
+	}
+
+	const maxLen = 800
+	if len(snippet) > maxLen {
+		return snippet[:maxLen] + "…"
+	}
+	return snippet
 }
 
 // extractObject extracts a schema object from a pg_query statement node
@@ -101,16 +138,27 @@ func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, erro
 	case *pg_query.Node_CreateSchemaStmt:
 		return p.parseCreateSchema(node.CreateSchemaStmt)
 	case *pg_query.Node_GrantStmt:
-		// GRANT statements - we'll handle these by attaching grants to objects
-		// For now, skip as standalone objects (grants are properties of tables/views/functions)
-		return nil, nil
+		return nil, &UnsupportedStatementError{
+			StatementType: fmt.Sprintf("%T", node),
+			Remediation:   "schemata does not currently model GRANT/REVOKE; remove it from the schema file or apply it separately",
+		}
 	case *pg_query.Node_AlterOwnerStmt:
-		// ALTER ... OWNER TO statements
-		// For now, skip as standalone objects (owner is a property of objects)
+		return nil, &UnsupportedStatementError{
+			StatementType: fmt.Sprintf("%T", node),
+			Remediation:   "schemata does not currently model ownership changes; remove it from the schema file or apply it separately",
+		}
+	case *pg_query.Node_VariableSetStmt,
+		*pg_query.Node_VariableShowStmt,
+		*pg_query.Node_TransactionStmt,
+		*pg_query.Node_SelectStmt:
+		// These statements are commonly present in dumps/fixtures and do not define schema objects directly.
 		return nil, nil
 	default:
-		// Not a schema object we track (e.g., INSERT, UPDATE, etc.)
-		return nil, nil
+		// Fail closed: unknown statements may affect schema correctness (e.g., ALTER, DO, DROP).
+		return nil, &UnsupportedStatementError{
+			StatementType: fmt.Sprintf("%T", node),
+			Remediation:   "schemata only supports a subset of DDL; remove or rewrite this statement, or apply it separately",
+		}
 	}
 }
 
@@ -224,11 +272,7 @@ func (p *Parser) getObjectKey(obj schema.DatabaseObject) schema.ObjectKey {
 
 // getFunctionSignature generates a signature string for function overloading
 func (p *Parser) getFunctionSignature(fn schema.Function) string {
-	argTypes := make([]string, len(fn.Args))
-	for i, arg := range fn.Args {
-		argTypes[i] = string(arg.Type)
-	}
-	return fmt.Sprintf("(%s)", fmt.Sprint(argTypes))
+	return schema.FunctionSignature(fn.Args)
 }
 
 // Helper to extract qualified name from RangeVar

@@ -61,7 +61,7 @@ func (g *Generator) Generate(name, sql string) (*Migration, error) {
 
 // CreateEmpty creates an empty migration file (for manual migrations)
 func (g *Generator) CreateEmpty(name string) (*Migration, error) {
-	return g.Generate(name, "-- TODO: Add migration SQL here\n")
+	return g.Generate(name, "-- Add migration SQL here\n")
 }
 
 // generateVersion creates a timestamp-based version string

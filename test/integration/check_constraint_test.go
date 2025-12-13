@@ -1,3 +1,6 @@
+//go:build integration
+// +build integration
+
 package integration
 
 import (
@@ -112,17 +115,8 @@ func TestUnnamedCheckConstraints(t *testing.T) {
 	require.NoError(t, err)
 	defer devPool.Close()
 
-	// Clean up
-	_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS products CASCADE")
-	_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS orders CASCADE")
-	_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS ranges CASCADE")
-	_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS mixed CASCADE")
-	defer func() {
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS products CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS orders CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS ranges CASCADE")
-		_, _ = devPool.Exec(ctx, "DROP TABLE IF EXISTS mixed CASCADE")
-	}()
+	require.NoError(t, resetPublicSchema(ctx, devPool))
+	t.Cleanup(func() { _ = resetPublicSchema(ctx, devPool) })
 
 	// Apply DDL
 	for _, ddl := range ddlStatements {

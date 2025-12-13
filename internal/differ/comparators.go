@@ -202,6 +202,9 @@ func compareUniqueConstraints(desired, actual []schema.UniqueConstraint) []strin
 			if desiredUq.InitiallyDeferred != actualUq.InitiallyDeferred {
 				changes = append(changes, fmt.Sprintf("unique constraint %s initially deferred changed", name))
 			}
+			if desiredUq.NotValid != actualUq.NotValid {
+				changes = append(changes, fmt.Sprintf("unique constraint %s validation changed", name))
+			}
 		}
 	}
 
@@ -250,6 +253,9 @@ func compareCheckConstraints(desired, actual []schema.CheckConstraint) []string 
 			}
 			if desiredCk.InitiallyDeferred != actualCk.InitiallyDeferred {
 				changes = append(changes, fmt.Sprintf("check constraint %s initially deferred changed", name))
+			}
+			if desiredCk.NotValid != actualCk.NotValid {
+				changes = append(changes, fmt.Sprintf("check constraint %s validation changed", name))
 			}
 		}
 	}
@@ -308,6 +314,9 @@ func compareForeignKeys(desired, actual []schema.ForeignKey) []string {
 			}
 			if desiredFk.InitiallyDeferred != actualFk.InitiallyDeferred {
 				changes = append(changes, fmt.Sprintf("foreign key %s initially deferred changed", name))
+			}
+			if desiredFk.NotValid != actualFk.NotValid {
+				changes = append(changes, fmt.Sprintf("foreign key %s validation changed", name))
 			}
 		}
 	}
@@ -786,7 +795,29 @@ func foreignKeyRefEqual(a, b schema.ForeignKeyRef) bool {
 func indexKeyExprEqual(a, b schema.IndexKeyExpr) bool {
 	return a.Expr == b.Expr &&
 		stringPtrEqual(a.Collation, b.Collation) &&
-		stringPtrEqual(a.OpClass, b.OpClass)
+		stringPtrEqual(a.OpClass, b.OpClass) &&
+		indexOrderingPtrEqual(a.Ordering, b.Ordering) &&
+		nullsOrderingPtrEqual(a.NullsOrdering, b.NullsOrdering)
+}
+
+func indexOrderingPtrEqual(a, b *schema.IndexOrdering) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func nullsOrderingPtrEqual(a, b *schema.NullsOrdering) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
 
 func checkOptionPtrEqual(a, b *schema.CheckOption) bool {

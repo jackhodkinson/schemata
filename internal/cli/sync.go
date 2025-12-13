@@ -52,7 +52,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Drop all objects from dev database
 	fmt.Println("Dropping all objects from dev database...")
-	if err := dropAllObjects(ctx, pool); err != nil {
+	if err := dropAllObjects(ctx, pool, allowCascade); err != nil {
 		return fmt.Errorf("failed to drop objects: %w", err)
 	}
 
@@ -88,7 +88,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 }
 
 // dropAllObjects drops all objects from the dev database by dropping and recreating schemas
-func dropAllObjects(ctx context.Context, pool *db.Pool) error {
+func dropAllObjects(ctx context.Context, pool *db.Pool, allowCascade bool) error {
 	// Get list of user schemas (excluding system schemas)
 	query := `
 		SELECT nspname
@@ -118,11 +118,20 @@ func dropAllObjects(ctx context.Context, pool *db.Pool) error {
 		return fmt.Errorf("error reading schema rows: %w", err)
 	}
 
+	// Determine drop mode based on allowCascade flag
+	dropMode := "RESTRICT"
+	if allowCascade {
+		dropMode = "CASCADE"
+	}
+
 	// Drop each schema and recreate it
 	for _, schemaName := range schemas {
 		fmt.Printf("  - Dropping schema: %s\n", schemaName)
-		dropSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName)
+		dropSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS %s %s", schemaName, dropMode)
 		if _, err := pool.Exec(ctx, dropSQL); err != nil {
+			if !allowCascade {
+				return fmt.Errorf("failed to drop schema %s: %w\n\nHint: Schema has dependent objects. Use --allow-cascade to drop with CASCADE (this will drop all dependent objects)", schemaName, err)
+			}
 			return fmt.Errorf("failed to drop schema %s: %w", schemaName, err)
 		}
 
@@ -134,8 +143,11 @@ func dropAllObjects(ctx context.Context, pool *db.Pool) error {
 	}
 
 	// Also drop the schemata tracking schema if it exists
-	dropTrackingSQL := "DROP SCHEMA IF EXISTS schemata CASCADE"
+	dropTrackingSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS schemata %s", dropMode)
 	if _, err := pool.Exec(ctx, dropTrackingSQL); err != nil {
+		if !allowCascade {
+			return fmt.Errorf("failed to drop schemata tracking schema: %w\n\nHint: Schema has dependent objects. Use --allow-cascade to drop with CASCADE (this will drop all dependent objects)", err)
+		}
 		return fmt.Errorf("failed to drop schemata tracking schema: %w", err)
 	}
 

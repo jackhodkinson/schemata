@@ -117,9 +117,5 @@ func getObjectKey(obj schema.DatabaseObject) schema.ObjectKey {
 
 // getFunctionSignature generates a signature string for function overloading
 func getFunctionSignature(fn schema.Function) string {
-	argTypes := make([]string, len(fn.Args))
-	for i, arg := range fn.Args {
-		argTypes[i] = string(arg.Type)
-	}
-	return fmt.Sprintf("(%s)", fmt.Sprint(argTypes))
+	return schema.FunctionSignature(fn.Args)
 }

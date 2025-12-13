@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
@@ -177,7 +176,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	// Generate DDL preview
 	fmt.Println("DDL Preview:")
 	fmt.Println("---")
-	ddlGen := planner.NewDDLGenerator()
+	ddlGen := planner.NewDDLGenerator(planner.WithAllowCascade(allowCascade))
 	ddl, err := ddlGen.GenerateDDL(diff, desiredSchema)
 	if err != nil {
 		return fmt.Errorf("failed to generate DDL: %w", err)
@@ -185,9 +184,8 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	fmt.Println(ddl)
 	fmt.Println("---")
 
-	// Exit with code 1 to indicate differences found
-	os.Exit(1)
-	return nil
+	// Return error to indicate differences found (Cobra will handle exit code)
+	return fmt.Errorf("schemas differ")
 }
 
 func applyMigrationsForDiff(ctx context.Context, cfg *config.Config, pool *db.Pool) error {

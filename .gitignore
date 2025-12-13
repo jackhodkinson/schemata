@@ -1,6 +1,8 @@
 # Binaries
 /schemata
+/schemata-final
 /cmd/schemata/schemata
+/bin/
 *.exe
 *.exe~
 *.dll

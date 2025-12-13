@@ -1,8 +1,13 @@
+//go:build integration
+// +build integration
+
 package integration
 
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/jackhodkinson/schemata/internal/config"
@@ -22,7 +27,7 @@ func TestEndToEnd_SchemataMigrate(t *testing.T) {
 	// Skip if no database available
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgresql://postgres:dev_password@localhost:54320/dev_db"
+		dbURL = devDBURL
 	}
 
 	ctx := context.Background()
@@ -35,11 +40,11 @@ func TestEndToEnd_SchemataMigrate(t *testing.T) {
 
 	// Clean database and apply schema
 	t.Log("Cleaning database and applying schema...")
-	err = cleanAndApplySchema(ctx, pool)
+	schemaFile := fixturePath(t, "../../testdata/schemas/end_to_end.sql")
+	err = cleanAndApplySchema(ctx, pool, schemaFile)
 	require.NoError(t, err, "Failed to apply schema")
 
 	// Parse schema.sql file (what the user wrote)
-	schemaFile := "../../../test-schemata/schema.sql"
 	p := parser.NewParser()
 	desiredSchema, err := p.ParseFile(schemaFile)
 	require.NoError(t, err, "Failed to parse schema.sql")
@@ -105,8 +110,18 @@ func TestEndToEnd_SchemataMigrate(t *testing.T) {
 		len(diff.ToCreate), len(diff.ToDrop), len(diff.ToAlter))
 }
 
-// cleanAndApplySchema drops all objects and applies the schema from testdata/schema.sql
-func cleanAndApplySchema(ctx context.Context, pool *db.Pool) error {
+func fixturePath(t *testing.T, rel string) string {
+	t.Helper()
+
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("failed to locate test file path")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(currentFile), rel))
+}
+
+// cleanAndApplySchema drops all objects and applies the schema SQL from `schemaFile`.
+func cleanAndApplySchema(ctx context.Context, pool *db.Pool, schemaFile string) error {
 	// Drop all objects by dropping and recreating the public schema
 	dropSQL := `
 		DROP SCHEMA IF EXISTS public CASCADE;
@@ -120,7 +135,7 @@ func cleanAndApplySchema(ctx context.Context, pool *db.Pool) error {
 	}
 
 	// Read schema.sql
-	schemaSQL, err := os.ReadFile("../../../test-schemata/schema.sql")
+	schemaSQL, err := os.ReadFile(schemaFile)
 	if err != nil {
 		return err
 	}
@@ -129,4 +144,3 @@ func cleanAndApplySchema(ctx context.Context, pool *db.Pool) error {
 	_, err = pool.Exec(ctx, string(schemaSQL))
 	return err
 }
-

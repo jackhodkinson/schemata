@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run unit tests
+        run: go test ./...
+      - name: Run go vet
+        run: go vet ./...
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Start Docker Compose
+        run: docker compose up -d
+      - name: Wait for databases
+        run: sleep 5
+      - name: Run integration tests
+        run: go test -tags=integration -v ./test/integration/...
+      - name: Stop Docker Compose
+        if: always()
+        run: docker compose down

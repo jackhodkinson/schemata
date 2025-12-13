@@ -76,7 +76,7 @@ func normalizeTable(tbl schema.Table) schema.Table {
 	normalizedCols := make([]schema.Column, len(tbl.Columns))
 	copy(normalizedCols, tbl.Columns)
 	for i := range normalizedCols {
-		normalizedCols[i].Type = normalizeTypeName(normalizedCols[i].Type)
+		normalizedCols[i].Type = schema.NormalizeTypeName(normalizedCols[i].Type)
 		// Normalize default expressions
 		if normalizedCols[i].Default != nil {
 			normalized := normalizeExpr(*normalizedCols[i].Default)
@@ -145,13 +145,48 @@ func normalizeIndex(idx schema.Index) schema.Index {
 }
 
 func normalizeView(view schema.View) schema.View {
-	// Normalize query text (strip extra whitespace, etc.)
-	// For now, just trim
-	// TODO: More sophisticated normalization
+	query := strings.TrimSpace(view.Definition.Query)
+	if query == "" {
+		return view
+	}
+
+	parsed, err := pg_query.Parse(query)
+	if err != nil {
+		return view
+	}
+	deparsed, err := pg_query.Deparse(parsed)
+	if err != nil {
+		return view
+	}
+	deparsed = strings.TrimSpace(deparsed)
+	deparsed = strings.TrimSuffix(deparsed, ";")
+	view.Definition.Query = deparsed
 	return view
 }
 
 func normalizeFunction(fn schema.Function) schema.Function {
+	for i := range fn.Args {
+		fn.Args[i].Type = schema.NormalizeTypeName(fn.Args[i].Type)
+		if fn.Args[i].Default != nil {
+			normalized := normalizeExpr(*fn.Args[i].Default)
+			fn.Args[i].Default = &normalized
+		}
+	}
+
+	switch ret := fn.Returns.(type) {
+	case schema.ReturnsType:
+		ret.Type = schema.NormalizeTypeName(ret.Type)
+		fn.Returns = ret
+	case schema.ReturnsSetOf:
+		ret.Type = schema.NormalizeTypeName(ret.Type)
+		fn.Returns = ret
+	case schema.ReturnsTable:
+		for i := range ret.Columns {
+			ret.Columns[i].Type = schema.NormalizeTypeName(ret.Columns[i].Type)
+		}
+		fn.Returns = ret
+	}
+
 	// Normalize function body
 	// 1. Trim leading/trailing whitespace
 	// 2. Normalize internal whitespace (multiple spaces/newlines to single space)
@@ -225,66 +260,6 @@ func normalizePolicy(pol schema.Policy) schema.Policy {
 		pol.To = sorted
 	}
 	return pol
-}
-
-// normalizeTypeName normalizes type names to their canonical form
-func normalizeTypeName(typeName schema.TypeName) schema.TypeName {
-	typeStr := strings.TrimSpace(string(typeName))
-
-	// Handle common aliases - normalize TO the SQL standard names
-	switch strings.ToLower(typeStr) {
-	case "int", "int4":
-		return "integer"
-	case "int8":
-		return "bigint"
-	case "int2":
-		return "smallint"
-	case "bool":
-		return "boolean"
-	case "timestamptz":
-		return "timestamp with time zone"
-	case "timestamp":
-		return "timestamp without time zone"
-	case "timetz":
-		return "time with time zone"
-	case "time":
-		return "time without time zone"
-	case "character varying":
-		// Extract length if present
-		re := regexp.MustCompile(`character varying\((\d+)\)`)
-		if matches := re.FindStringSubmatch(typeStr); len(matches) > 0 {
-			return schema.TypeName("varchar(" + matches[1] + ")")
-		}
-		return "varchar"
-	case "character":
-		// Extract length if present
-		re := regexp.MustCompile(`character\((\d+)\)`)
-		if matches := re.FindStringSubmatch(typeStr); len(matches) > 0 {
-			return schema.TypeName("char(" + matches[1] + ")")
-		}
-		return "char"
-	}
-
-	// Handle parameterized types by converting them to lowercase
-	// but preserving the structure
-	if strings.Contains(typeStr, "(") {
-		// Extract base type and parameters
-		parts := strings.SplitN(typeStr, "(", 2)
-		if len(parts) == 2 {
-			baseType := strings.ToLower(strings.TrimSpace(parts[0]))
-			params := parts[1]
-
-			// Apply normalization to base type
-			switch baseType {
-			case "character varying":
-				return schema.TypeName("varchar(" + params)
-			case "character":
-				return schema.TypeName("char(" + params)
-			}
-		}
-	}
-
-	return typeName
 }
 
 // normalizeExpr normalizes SQL expressions to a canonical form

@@ -10,11 +10,47 @@ import (
 )
 
 // DDLGenerator generates DDL statements from diff operations
-type DDLGenerator struct{}
+type DDLGenerator struct {
+	allowCascade bool
+}
+
+type UnsupportedChangeError struct {
+	Key         schema.ObjectKey
+	Change      string
+	Remediation string
+}
+
+func (e *UnsupportedChangeError) Error() string {
+	key := fmt.Sprintf("%s/%s/%s", e.Key.Kind, e.Key.Schema, e.Key.Name)
+	if e.Key.TableName != "" {
+		key += fmt.Sprintf("/%s", e.Key.TableName)
+	}
+	if e.Key.Signature != "" {
+		key += e.Key.Signature
+	}
+	if e.Remediation != "" {
+		return fmt.Sprintf("unsupported change (%s): %s; remediation: %s", key, e.Change, e.Remediation)
+	}
+	return fmt.Sprintf("unsupported change (%s): %s", key, e.Change)
+}
+
+type DDLGeneratorOption func(*DDLGenerator)
+
+func WithAllowCascade(allow bool) DDLGeneratorOption {
+	return func(g *DDLGenerator) {
+		g.allowCascade = allow
+	}
+}
 
 // NewDDLGenerator creates a new DDL generator
-func NewDDLGenerator() *DDLGenerator {
-	return &DDLGenerator{}
+func NewDDLGenerator(opts ...DDLGeneratorOption) *DDLGenerator {
+	g := &DDLGenerator{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(g)
+		}
+	}
+	return g
 }
 
 // GenerateDDL generates DDL statements for a diff
@@ -226,6 +262,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 			uqClause += " NULLS NOT DISTINCT"
 		}
 		uqClause += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
+		uqClause += formatConstraintValidation(uq.NotValid)
 		colDefs = append(colDefs, uqClause)
 	}
 
@@ -237,6 +274,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 				checkClause += " NO INHERIT"
 			}
 			checkClause += formatConstraintTiming(check.Deferrable, check.InitiallyDeferred)
+			checkClause += formatConstraintValidation(check.NotValid)
 			colDefs = append(colDefs, checkClause)
 		} else {
 			checkClause := fmt.Sprintf("  CHECK (%s)", check.Expr)
@@ -244,6 +282,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 				checkClause += " NO INHERIT"
 			}
 			checkClause += formatConstraintTiming(check.Deferrable, check.InitiallyDeferred)
+			checkClause += formatConstraintValidation(check.NotValid)
 			colDefs = append(colDefs, checkClause)
 		}
 	}
@@ -273,6 +312,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 			fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
 		}
 		fkDef += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
+		fkDef += formatConstraintValidation(fk.NotValid)
 		colDefs = append(colDefs, fkDef)
 	}
 
@@ -386,8 +426,15 @@ func (g *DDLGenerator) generateCreateFunction(fn schema.Function) string {
 	case schema.ReturnsType:
 		returnsClause = fmt.Sprintf("RETURNS %s", ret.Type)
 	case schema.ReturnsTable:
-		// TODO: Format table return type
-		returnsClause = "RETURNS TABLE"
+		if len(ret.Columns) == 0 {
+			returnsClause = "RETURNS TABLE ()"
+		} else {
+			cols := make([]string, len(ret.Columns))
+			for i, col := range ret.Columns {
+				cols[i] = fmt.Sprintf("%s %s", quoteIdentifier(col.Name), col.Type)
+			}
+			returnsClause = fmt.Sprintf("RETURNS TABLE (%s)", strings.Join(cols, ", "))
+		}
 	case schema.ReturnsSetOf:
 		returnsClause = fmt.Sprintf("RETURNS SETOF %s", ret.Type)
 	}
@@ -523,24 +570,36 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 		if oldObj, ok := alter.OldObject.(schema.Table); ok {
 			oldTable = &oldObj
 		}
-		return g.generateAlterTable(obj, oldTable, alter), nil
+		return g.generateAlterTable(obj, oldTable, alter)
 	case schema.View:
 		// Views: DROP and CREATE
-		dropStmt, _ := g.generateDrop(alter.Key)
-		createStmt, _ := g.generateCreate(alter.NewObject)
+		dropStmt, err := g.generateDrop(alter.Key)
+		if err != nil {
+			return nil, err
+		}
+		createStmt, err := g.generateCreate(alter.NewObject)
+		if err != nil {
+			return nil, err
+		}
 		return []string{dropStmt, createStmt}, nil
 	case schema.Function:
 		// Functions: CREATE OR REPLACE
 		return []string{g.generateCreateFunction(obj)}, nil
 	default:
 		// For other objects, drop and recreate
-		dropStmt, _ := g.generateDrop(alter.Key)
-		createStmt, _ := g.generateCreate(alter.NewObject)
+		dropStmt, err := g.generateDrop(alter.Key)
+		if err != nil {
+			return nil, err
+		}
+		createStmt, err := g.generateCreate(alter.NewObject)
+		if err != nil {
+			return nil, err
+		}
 		return []string{dropStmt, createStmt}, nil
 	}
 }
 
-func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Table, alter differ.AlterOperation) []string {
+func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Table, alter differ.AlterOperation) ([]string, error) {
 	var statements []string
 
 	// Build column and constraint maps for quick lookup (new table)
@@ -603,15 +662,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 		} else if strings.HasPrefix(change, "drop column ") {
 			colName := strings.TrimPrefix(change, "drop column ")
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP COLUMN %s;", tbl.Schema, tbl.Name, colName))
-		} else if strings.HasPrefix(change, "alter column ") {
-			// Parse "alter column <name>: <details>"
-			parts := strings.SplitN(strings.TrimPrefix(change, "alter column "), ": ", 2)
-			if len(parts) == 2 {
-				colName := parts[0]
-				changeDetail := parts[1]
-				statements = append(statements, g.generateColumnAlter(tbl, oldTable, colName, changeDetail)...)
-			}
-		} else if strings.HasPrefix(change, "add primary key") {
+			} else if strings.HasPrefix(change, "alter column ") {
+				// Parse "alter column <name>: <details>"
+				parts := strings.SplitN(strings.TrimPrefix(change, "alter column "), ": ", 2)
+				if len(parts) == 2 {
+					colName := parts[0]
+					changeDetail := parts[1]
+					colStatements, err := g.generateColumnAlter(tbl, oldTable, colName, changeDetail)
+					if err != nil {
+						return nil, err
+					}
+					statements = append(statements, colStatements...)
+				}
+			} else if strings.HasPrefix(change, "add primary key") {
 			if tbl.PrimaryKey != nil {
 				pkCols := make([]string, len(tbl.PrimaryKey.Cols))
 				for i, col := range tbl.PrimaryKey.Cols {
@@ -626,13 +689,22 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				pkStmt += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
 				statements = append(statements, pkStmt+";")
 			}
-		} else if strings.HasPrefix(change, "drop primary key") {
-			if oldPKName != "" {
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-					tbl.Schema, tbl.Name, oldPKName))
-			} else {
-				statements = append(statements, fmt.Sprintf("-- TODO: %s (old constraint name not available)", change))
-			}
+			} else if strings.HasPrefix(change, "drop primary key") {
+				if oldPKName != "" {
+					statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+						tbl.Schema, tbl.Name, oldPKName))
+				} else {
+					return nil, &UnsupportedChangeError{
+						Key: schema.ObjectKey{
+							Kind:      schema.TableKind,
+							Schema:    tbl.Schema,
+							Name:      string(tbl.Name),
+							TableName: "",
+						},
+						Change:      change,
+						Remediation: "The old primary key constraint name is not available. Manually drop the primary key using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " DROP CONSTRAINT <constraint_name>;",
+					}
+				}
 		} else if strings.HasPrefix(change, "primary key columns changed") || strings.Contains(change, "primary key") && strings.Contains(change, "changed") {
 			// Drop old primary key and add new one
 			if oldPKName != "" {
@@ -657,17 +729,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			constraintName := strings.TrimPrefix(change, "add unique constraint ")
 			for _, uq := range tbl.Uniques {
 				if uq.Name == constraintName {
-					uqCols := make([]string, len(uq.Cols))
-					for i, col := range uq.Cols {
-						uqCols[i] = string(col)
-					}
-					uqStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s)",
-						tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", "))
-					if !uq.NullsDistinct {
-						uqStmt += " NULLS NOT DISTINCT"
-					}
-					uqStmt += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
-					statements = append(statements, uqStmt+";")
+					statements = append(statements, buildAddUniqueConstraintStatement(tbl, uq)+";")
 					break
 				}
 			}
@@ -679,19 +741,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			constraintName := strings.TrimPrefix(change, "add check constraint ")
 			for _, ck := range tbl.Checks {
 				if ck.Name == constraintName {
-					checkStmt := ""
-					if ck.Name != "" {
-						checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s)",
-							tbl.Schema, tbl.Name, ck.Name, ck.Expr)
-					} else {
-						checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s)",
-							tbl.Schema, tbl.Name, ck.Expr)
-					}
-					if ck.NoInherit {
-						checkStmt += " NO INHERIT"
-					}
-					checkStmt += formatConstraintTiming(ck.Deferrable, ck.InitiallyDeferred)
-					statements = append(statements, checkStmt+";")
+					statements = append(statements, buildAddCheckConstraintStatement(tbl, ck)+";")
 					break
 				}
 			}
@@ -703,30 +753,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			constraintName := strings.TrimPrefix(change, "add foreign key ")
 			for _, fk := range tbl.ForeignKeys {
 				if fk.Name == constraintName {
-					fkCols := make([]string, len(fk.Cols))
-					for i, col := range fk.Cols {
-						fkCols[i] = string(col)
-					}
-					refCols := make([]string, len(fk.Ref.Cols))
-					for i, col := range fk.Ref.Cols {
-						refCols[i] = string(col)
-					}
-					fkDef := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
-						tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
-					switch fk.Match {
-					case schema.MatchFull:
-						fkDef += " MATCH FULL"
-					case schema.MatchPartial:
-						fkDef += " MATCH PARTIAL"
-					}
-					if fk.OnDelete != schema.NoAction {
-						fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
-					}
-					if fk.OnUpdate != schema.NoAction {
-						fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
-					}
-					fkDef += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
-					statements = append(statements, fkDef+";")
+					statements = append(statements, buildAddForeignKeyStatement(tbl, fk)+";")
 					break
 				}
 			}
@@ -734,6 +761,38 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			constraintName := strings.TrimPrefix(change, "drop foreign key ")
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
 				tbl.Schema, tbl.Name, constraintName))
+		} else if strings.HasPrefix(change, "unique constraint ") && strings.HasSuffix(change, " validation changed") {
+			constraintName := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(change, "unique constraint "), " validation changed"))
+
+			if constraintName != "" {
+				if uq, ok := oldUniqueMap[constraintName]; ok && !uq.NotValid {
+					// Old constraint existed; drop only if moving to NOT VALID
+					if newUq := findUniqueConstraint(tbl.Uniques, constraintName); newUq != nil && newUq.NotValid {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, buildAddUniqueConstraintStatement(tbl, *newUq)+";")
+					} else {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+					}
+				} else {
+					if newUq := findUniqueConstraint(tbl.Uniques, constraintName); newUq != nil {
+						if newUq.NotValid {
+							statements = append(statements, buildAddUniqueConstraintStatement(tbl, *newUq)+";")
+						} else {
+							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						}
+					} else {
+						return nil, &UnsupportedChangeError{
+							Key: schema.ObjectKey{
+								Kind:   schema.TableKind,
+								Schema: tbl.Schema,
+								Name:   string(tbl.Name),
+							},
+							Change:      fmt.Sprintf("unique constraint %s validation changed (constraint details not available)", constraintName),
+							Remediation: "manually validate or recreate the constraint in a migration",
+						}
+					}
+				}
+			}
 		} else if strings.Contains(change, "unique constraint") && strings.Contains(change, "changed") {
 			// Modified unique constraint: drop and recreate
 			// Parse "unique constraint <name> <property> changed"
@@ -746,22 +805,44 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				// Add new
 				for _, uq := range tbl.Uniques {
 					if uq.Name == constraintName {
-						uqCols := make([]string, len(uq.Cols))
-						for i, col := range uq.Cols {
-							uqCols[i] = string(col)
-						}
-						uqStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s)",
-							tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", "))
-						if !uq.NullsDistinct {
-							uqStmt += " NULLS NOT DISTINCT"
-						}
-						uqStmt += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
-						statements = append(statements, uqStmt+";")
+						statements = append(statements, buildAddUniqueConstraintStatement(tbl, uq)+";")
 						break
 					}
 				}
 			}
-		} else if strings.Contains(change, "check constraint") && strings.Contains(change, "changed") {
+		} else if strings.HasPrefix(change, "check constraint ") && strings.HasSuffix(change, " validation changed") {
+			constraintName := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(change, "check constraint "), " validation changed"))
+
+			if constraintName != "" {
+				if ck, ok := oldCheckMap[constraintName]; ok && !ck.NotValid {
+					if newCk := findCheckConstraint(tbl.Checks, constraintName); newCk != nil && newCk.NotValid {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, buildAddCheckConstraintStatement(tbl, *newCk)+";")
+					} else {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+					}
+				} else {
+					if newCk := findCheckConstraint(tbl.Checks, constraintName); newCk != nil {
+						if newCk.NotValid {
+							statements = append(statements, buildAddCheckConstraintStatement(tbl, *newCk)+";")
+						} else {
+							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						}
+						} else {
+							return nil, &UnsupportedChangeError{
+								Key: schema.ObjectKey{
+									Kind:      schema.TableKind,
+									Schema:    tbl.Schema,
+									Name:      string(tbl.Name),
+									TableName: "",
+								},
+								Change:      fmt.Sprintf("check constraint %s validation changed", constraintName),
+								Remediation: "The check constraint details are not available in the old schema. Manually validate the constraint using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " VALIDATE CONSTRAINT " + constraintName + ";",
+							}
+						}
+					}
+				}
+			} else if strings.Contains(change, "check constraint") && strings.Contains(change, "changed") {
 			// Modified check constraint: drop and recreate
 			parts := strings.Fields(change)
 			if len(parts) >= 3 {
@@ -772,23 +853,43 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				// Add new
 				for _, ck := range tbl.Checks {
 					if ck.Name == constraintName {
-						checkStmt := ""
-						if ck.Name != "" {
-							checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s)",
-								tbl.Schema, tbl.Name, ck.Name, ck.Expr)
-						} else {
-							checkStmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s)",
-								tbl.Schema, tbl.Name, ck.Expr)
-						}
-						if ck.NoInherit {
-							checkStmt += " NO INHERIT"
-						}
-						checkStmt += formatConstraintTiming(ck.Deferrable, ck.InitiallyDeferred)
-						statements = append(statements, checkStmt+";")
+						statements = append(statements, buildAddCheckConstraintStatement(tbl, ck)+";")
 						break
 					}
 				}
 			}
+		} else if strings.HasPrefix(change, "foreign key ") && strings.HasSuffix(change, " validation changed") {
+			constraintName := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(change, "foreign key "), " validation changed"))
+
+			if constraintName != "" {
+				if fk, ok := oldFKMap[constraintName]; ok && !fk.NotValid {
+					if newFk := findForeignKey(tbl.ForeignKeys, constraintName); newFk != nil && newFk.NotValid {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, buildAddForeignKeyStatement(tbl, *newFk)+";")
+					} else {
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+					}
+				} else {
+					if newFk := findForeignKey(tbl.ForeignKeys, constraintName); newFk != nil {
+						if newFk.NotValid {
+							statements = append(statements, buildAddForeignKeyStatement(tbl, *newFk)+";")
+						} else {
+							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						}
+						} else {
+							return nil, &UnsupportedChangeError{
+								Key: schema.ObjectKey{
+									Kind:      schema.TableKind,
+									Schema:    tbl.Schema,
+									Name:      string(tbl.Name),
+									TableName: "",
+								},
+								Change:      fmt.Sprintf("foreign key %s validation changed", constraintName),
+								Remediation: "The foreign key constraint details are not available in the old schema. Manually validate the constraint using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " VALIDATE CONSTRAINT " + constraintName + ";",
+							}
+						}
+					}
+				}
 		} else if strings.Contains(change, "foreign key") && strings.Contains(change, "changed") {
 			// Modified foreign key: drop and recreate
 			parts := strings.Fields(change)
@@ -800,44 +901,30 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				// Add new
 				for _, fk := range tbl.ForeignKeys {
 					if fk.Name == constraintName {
-						fkCols := make([]string, len(fk.Cols))
-						for i, col := range fk.Cols {
-							fkCols[i] = string(col)
-						}
-						refCols := make([]string, len(fk.Ref.Cols))
-						for i, col := range fk.Ref.Cols {
-							refCols[i] = string(col)
-						}
-						fkDef := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
-							tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
-						switch fk.Match {
-						case schema.MatchFull:
-							fkDef += " MATCH FULL"
-						case schema.MatchPartial:
-							fkDef += " MATCH PARTIAL"
-						}
-						if fk.OnDelete != schema.NoAction {
-							fkDef += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
-						}
-						if fk.OnUpdate != schema.NoAction {
-							fkDef += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
-						}
-						fkDef += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
-						statements = append(statements, fkDef+";")
+						statements = append(statements, buildAddForeignKeyStatement(tbl, fk)+";")
 						break
 					}
 				}
 			}
-		} else {
-			// Fallback for other changes
-			statements = append(statements, fmt.Sprintf("-- TODO: %s", change))
+			} else {
+				// Fallback for other changes
+				return nil, &UnsupportedChangeError{
+					Key: schema.ObjectKey{
+						Kind:      schema.TableKind,
+						Schema:    tbl.Schema,
+						Name:      string(tbl.Name),
+						TableName: "",
+					},
+					Change:      change,
+					Remediation: "This table change type is not yet supported by schemata. Review the diff output and apply the change manually.",
+				}
+			}
 		}
+
+		return statements, nil
 	}
 
-	return statements
-}
-
-func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Table, colName, changeDetail string) []string {
+func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Table, colName, changeDetail string) ([]string, error) {
 	var statements []string
 	tableName := fmt.Sprintf("%s.%s", tbl.Schema, tbl.Name)
 
@@ -893,6 +980,15 @@ func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Ta
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD %s;",
 				tableName, colName, formatGeneratedClause(*newCol.Generated)))
 		}
+	} else if changeDetail == "identity spec changed" {
+		if oldCol != nil && oldCol.Identity != nil {
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP IDENTITY IF EXISTS;",
+				tableName, colName))
+		}
+		if newCol != nil && newCol.Identity != nil {
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD %s;",
+				tableName, colName, formatIdentityClause(*newCol.Identity)))
+		}
 	} else if changeDetail == "collation changed" {
 		if newCol != nil {
 			if newCol.Collation != nil {
@@ -910,12 +1006,109 @@ func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Ta
 		}
 		statements = append(statements, formatColumnCommentStatement(tbl.Schema, tbl.Name, schema.ColumnName(colName), comment))
 	} else {
-		// For other column changes, generate a TODO
-		statements = append(statements, fmt.Sprintf("-- TODO: ALTER TABLE %s ALTER COLUMN %s: %s",
-			tableName, colName, changeDetail))
+		return nil, &UnsupportedChangeError{
+			Key: schema.ObjectKey{
+				Kind:      schema.ColumnKind,
+				Schema:    tbl.Schema,
+				Name:      string(colName),
+				TableName: tbl.Name,
+			},
+			Change:      fmt.Sprintf("alter column %s: %s", colName, changeDetail),
+			Remediation: "This column change type is not yet supported by schemata. Review the diff output and apply the change manually using ALTER TABLE " + tableName + " ALTER COLUMN " + colName + ";",
+		}
 	}
 
-	return statements
+	return statements, nil
+}
+
+func findUniqueConstraint(constraints []schema.UniqueConstraint, name string) *schema.UniqueConstraint {
+	for i := range constraints {
+		if constraints[i].Name == name {
+			return &constraints[i]
+		}
+	}
+	return nil
+}
+
+func findCheckConstraint(constraints []schema.CheckConstraint, name string) *schema.CheckConstraint {
+	for i := range constraints {
+		if constraints[i].Name == name {
+			return &constraints[i]
+		}
+	}
+	return nil
+}
+
+func findForeignKey(constraints []schema.ForeignKey, name string) *schema.ForeignKey {
+	for i := range constraints {
+		if constraints[i].Name == name {
+			return &constraints[i]
+		}
+	}
+	return nil
+}
+
+func buildAddUniqueConstraintStatement(tbl schema.Table, uq schema.UniqueConstraint) string {
+	uqCols := make([]string, len(uq.Cols))
+	for i, col := range uq.Cols {
+		uqCols[i] = string(col)
+	}
+
+	stmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s)",
+		tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", "))
+	if !uq.NullsDistinct {
+		stmt += " NULLS NOT DISTINCT"
+	}
+	stmt += formatConstraintTiming(uq.Deferrable, uq.InitiallyDeferred)
+	stmt += formatConstraintValidation(uq.NotValid)
+	return stmt
+}
+
+func buildAddCheckConstraintStatement(tbl schema.Table, ck schema.CheckConstraint) string {
+	var stmt string
+	if ck.Name != "" {
+		stmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s)",
+			tbl.Schema, tbl.Name, ck.Name, ck.Expr)
+	} else {
+		stmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s)",
+			tbl.Schema, tbl.Name, ck.Expr)
+	}
+	if ck.NoInherit {
+		stmt += " NO INHERIT"
+	}
+	stmt += formatConstraintTiming(ck.Deferrable, ck.InitiallyDeferred)
+	stmt += formatConstraintValidation(ck.NotValid)
+	return stmt
+}
+
+func buildAddForeignKeyStatement(tbl schema.Table, fk schema.ForeignKey) string {
+	fkCols := make([]string, len(fk.Cols))
+	for i, col := range fk.Cols {
+		fkCols[i] = string(col)
+	}
+	refCols := make([]string, len(fk.Ref.Cols))
+	for i, col := range fk.Ref.Cols {
+		refCols[i] = string(col)
+	}
+
+	stmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
+		tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+
+	switch fk.Match {
+	case schema.MatchFull:
+		stmt += " MATCH FULL"
+	case schema.MatchPartial:
+		stmt += " MATCH PARTIAL"
+	}
+	if fk.OnDelete != schema.NoAction {
+		stmt += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
+	}
+	if fk.OnUpdate != schema.NoAction {
+		stmt += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
+	}
+	stmt += formatConstraintTiming(fk.Deferrable, fk.InitiallyDeferred)
+	stmt += formatConstraintValidation(fk.NotValid)
+	return stmt
 }
 
 func formatGeneratedClause(spec schema.GeneratedSpec) string {
@@ -1008,6 +1201,13 @@ func formatConstraintTiming(deferrable, initiallyDeferred bool) string {
 	return " DEFERRABLE INITIALLY IMMEDIATE"
 }
 
+func formatConstraintValidation(notValid bool) string {
+	if !notValid {
+		return ""
+	}
+	return " NOT VALID"
+}
+
 func formatTableCommentStatement(schemaName schema.SchemaName, tableName schema.TableName, comment *string) string {
 	qualified := fmt.Sprintf("%s.%s", schemaName, tableName)
 	if comment == nil {
@@ -1060,17 +1260,17 @@ func quoteIdentifier(ident string) string {
 func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
 	switch key.Kind {
 	case schema.TableKind:
-		return fmt.Sprintf("DROP TABLE IF EXISTS %s.%s CASCADE;", key.Schema, key.Name), nil
+		return fmt.Sprintf("DROP TABLE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.IndexKind:
 		return fmt.Sprintf("DROP INDEX IF EXISTS %s.%s;", key.Schema, key.Name), nil
 	case schema.ViewKind:
-		return fmt.Sprintf("DROP VIEW IF EXISTS %s.%s CASCADE;", key.Schema, key.Name), nil
+		return fmt.Sprintf("DROP VIEW IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.FunctionKind:
-		return fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s CASCADE;", key.Schema, key.Name), nil
+		return fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.SequenceKind:
-		return fmt.Sprintf("DROP SEQUENCE IF EXISTS %s.%s CASCADE;", key.Schema, key.Name), nil
+		return fmt.Sprintf("DROP SEQUENCE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.TypeKind:
-		return fmt.Sprintf("DROP TYPE IF EXISTS %s.%s CASCADE;", key.Schema, key.Name), nil
+		return fmt.Sprintf("DROP TYPE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.TriggerKind:
 		return fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s.%s;", key.Name, key.Schema, key.TableName), nil
 	case schema.PolicyKind:
@@ -1078,4 +1278,11 @@ func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported object kind for DROP: %s", key.Kind)
 	}
+}
+
+func (g *DDLGenerator) cascadeClause() string {
+	if g.allowCascade {
+		return " CASCADE"
+	}
+	return ""
 }

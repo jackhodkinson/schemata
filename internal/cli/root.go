@@ -7,6 +7,7 @@ import (
 var (
 	cfgFile string
 	verbose bool
+	allowCascade bool
 )
 
 var rootCmd = &cobra.Command{
@@ -25,6 +26,7 @@ func Execute() error {
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "schemata.yaml", "config file path")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
+	rootCmd.PersistentFlags().BoolVar(&allowCascade, "allow-cascade", false, "Allow CASCADE drops when generating DDL (dangerous)")
 
 	// Add subcommands
 	rootCmd.AddCommand(initCmd)

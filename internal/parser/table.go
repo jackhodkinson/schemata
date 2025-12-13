@@ -301,6 +301,7 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 				NoInherit:         constraint.IsNoInherit,
 				Deferrable:        constraint.Deferrable,
 				InitiallyDeferred: constraint.Initdeferred,
+				NotValid:          constraint.SkipValidation,
 			}
 			return false, false, nil, check
 		}
@@ -314,7 +315,7 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 
 	case pg_query.ConstrType_CONSTR_IDENTITY:
 		// IDENTITY column
-		column.Identity = p.buildIdentitySpec(constraint)
+		column.Identity = p.buildIdentitySpec(constraint, column.Type)
 
 	case pg_query.ConstrType_CONSTR_GENERATED:
 		// GENERATED column
@@ -365,6 +366,7 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 			Match:             p.parseFkMatchTypeString(constraint.FkMatchtype),
 			Deferrable:        constraint.Deferrable,
 			InitiallyDeferred: constraint.Initdeferred,
+			NotValid:          constraint.SkipValidation,
 		}
 
 		return false, false, fk, nil
@@ -401,6 +403,7 @@ func (p *Parser) parseTableConstraint(constraint *pg_query.Constraint, table *sc
 			NullsDistinct:     !constraint.NullsNotDistinct, // Note: inverted logic
 			Deferrable:        constraint.Deferrable,
 			InitiallyDeferred: constraint.Initdeferred,
+			NotValid:          constraint.SkipValidation,
 		})
 
 	case pg_query.ConstrType_CONSTR_CHECK:
@@ -413,6 +416,7 @@ func (p *Parser) parseTableConstraint(constraint *pg_query.Constraint, table *sc
 				NoInherit:         constraint.IsNoInherit,
 				Deferrable:        constraint.Deferrable,
 				InitiallyDeferred: constraint.Initdeferred,
+				NotValid:          constraint.SkipValidation,
 			})
 		}
 
@@ -442,6 +446,7 @@ func (p *Parser) parseTableConstraint(constraint *pg_query.Constraint, table *sc
 			Match:             p.parseFkMatchTypeString(constraint.FkMatchtype),
 			Deferrable:        constraint.Deferrable,
 			InitiallyDeferred: constraint.Initdeferred,
+			NotValid:          constraint.SkipValidation,
 		})
 	}
 
@@ -494,7 +499,7 @@ func (p *Parser) parseFkMatchTypeString(matchType string) schema.MatchType {
 	}
 }
 
-func (p *Parser) buildIdentitySpec(constraint *pg_query.Constraint) *schema.IdentitySpec {
+func (p *Parser) buildIdentitySpec(constraint *pg_query.Constraint, columnType schema.TypeName) *schema.IdentitySpec {
 	spec := &schema.IdentitySpec{
 		Always: strings.EqualFold(constraint.GeneratedWhen, "a") || strings.EqualFold(constraint.GeneratedWhen, "always"),
 	}
@@ -508,6 +513,8 @@ func (p *Parser) buildIdentitySpec(constraint *pg_query.Constraint) *schema.Iden
 			spec.SequenceOptions = append(spec.SequenceOptions, *seqOpt)
 		}
 	}
+
+	spec.SequenceOptions = schema.NormalizeIdentityOptions(columnType, spec.SequenceOptions)
 
 	return spec
 }

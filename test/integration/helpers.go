@@ -1,11 +1,26 @@
+//go:build integration
+// +build integration
+
 package integration
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/jackhodkinson/schemata/internal/db"
 	"github.com/jackhodkinson/schemata/internal/differ"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
+
+func resetPublicSchema(ctx context.Context, pool *db.Pool) error {
+	_, err := pool.Exec(ctx, `
+		DROP SCHEMA IF EXISTS public CASCADE;
+		CREATE SCHEMA public;
+		GRANT ALL ON SCHEMA public TO postgres;
+		GRANT ALL ON SCHEMA public TO public;
+	`)
+	return err
+}
 
 // buildObjectMapFromObjects converts a slice of DatabaseObjects into a SchemaObjectMap
 func buildObjectMapFromObjects(objects []schema.DatabaseObject) (schema.SchemaObjectMap, error) {
@@ -117,9 +132,5 @@ func getObjectKey(obj schema.DatabaseObject) schema.ObjectKey {
 
 // getFunctionSignature generates a signature string for function overloading
 func getFunctionSignature(fn schema.Function) string {
-	argTypes := make([]string, len(fn.Args))
-	for i, arg := range fn.Args {
-		argTypes[i] = string(arg.Type)
-	}
-	return fmt.Sprintf("(%s)", fmt.Sprint(argTypes))
+	return schema.FunctionSignature(fn.Args)
 }

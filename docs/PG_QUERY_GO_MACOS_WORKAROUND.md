@@ -30,7 +30,7 @@ The rest of the module is untouched—it is the stock `v5.1.0` release.
 
 ## How To Verify
 
-1. Ensure the repo is clean and running Go 1.25.3.
+1. Ensure the repo is clean and running Go 1.23+.
 2. Run `go clean -cache` (optional but avoids stale CGO objects).
 3. Build locally: `go build ./cmd/schemata`.
 4. Run the full test suite: `go test ./...`.
