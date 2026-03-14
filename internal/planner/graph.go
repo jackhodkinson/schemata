@@ -83,10 +83,11 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 
 		// If table uses custom types, it depends on those types
 		for _, col := range v.Columns {
-			// Check if column type is a custom type (enum, domain, composite)
-			// Format: schema.typename
-			if strings.Contains(string(col.Type), ".") {
-				parts := strings.Split(string(col.Type), ".")
+			colType := string(col.Type)
+
+			// Check for schema-qualified type (schema.typename)
+			if strings.Contains(colType, ".") {
+				parts := strings.Split(colType, ".")
 				if len(parts) == 2 {
 					typeKey := schema.ObjectKey{
 						Kind:   schema.TypeKind,
@@ -96,6 +97,16 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 					if _, exists := objectMap[typeKey]; exists {
 						graph.AddDependency(key, typeKey)
 					}
+				}
+			} else {
+				// Check for unqualified type name in the table's own schema
+				typeKey := schema.ObjectKey{
+					Kind:   schema.TypeKind,
+					Schema: key.Schema,
+					Name:   colType,
+				}
+				if _, exists := objectMap[typeKey]; exists {
+					graph.AddDependency(key, typeKey)
 				}
 			}
 		}

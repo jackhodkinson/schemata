@@ -262,14 +262,16 @@ func (p *Parser) parseCreateTrigger(stmt *pg_query.CreateTrigStmt) (schema.Datab
 		Events:     []schema.TriggerEvent{},
 	}
 
-	// Parse timing (bitfield: 2=BEFORE, 4=AFTER, 64=INSTEAD OF)
+	// Parse timing (bitfield: 2=BEFORE, 64=INSTEAD OF, 0=AFTER)
+	// Note: AFTER is the default in PostgreSQL (TRIGGER_TYPE_AFTER = 0),
+	// so it's the absence of BEFORE and INSTEAD OF bits.
 	timing := stmt.Timing
 	if timing&2 != 0 {
 		trigger.Timing = schema.Before
-	} else if timing&4 != 0 {
-		trigger.Timing = schema.After
 	} else if timing&64 != 0 {
 		trigger.Timing = schema.InsteadOf
+	} else {
+		trigger.Timing = schema.After
 	}
 
 	// Parse events (bitfield: 4=INSERT, 8=DELETE, 16=UPDATE, 32=TRUNCATE)

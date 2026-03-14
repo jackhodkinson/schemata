@@ -21,10 +21,20 @@ func NewMigrationTracker(pool *Pool) *MigrationTracker {
 	return &MigrationTracker{pool: pool}
 }
 
-// EnsureSchema creates the schemata schema and version table if they don't exist
+// EnsureSchema creates the schemata schema and version table if they don't exist.
+// This is safe to call concurrently from multiple processes.
 func (mt *MigrationTracker) EnsureSchema(ctx context.Context) error {
+	// Use an advisory lock to prevent concurrent CREATE SCHEMA races.
+	// PostgreSQL's CREATE SCHEMA IF NOT EXISTS can fail with a unique
+	// constraint violation when two sessions race.
+	_, err := mt.pool.Exec(ctx, "SELECT pg_advisory_lock(hashtext('schemata_ensure_schema'))")
+	if err != nil {
+		return fmt.Errorf("failed to acquire schema lock: %w", err)
+	}
+	defer mt.pool.Exec(ctx, "SELECT pg_advisory_unlock(hashtext('schemata_ensure_schema'))") //nolint:errcheck
+
 	// Create schema
-	_, err := mt.pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaName))
+	_, err = mt.pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaName))
 	if err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
 	}

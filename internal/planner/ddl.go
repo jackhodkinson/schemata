@@ -53,21 +53,49 @@ func NewDDLGenerator(opts ...DDLGeneratorOption) *DDLGenerator {
 	return g
 }
 
-// GenerateDDL generates DDL statements for a diff
-// Order: CREATE (new objects), ALTER (modify existing), DROP (remove old)
-func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObjectMap) (string, error) {
+// GenerateDDL generates DDL statements for a diff.
+//
+// Order: CREATE structural → ALTER → CREATE dependent → DROP
+//
+// Structural objects (types, tables, functions, sequences, extensions, views)
+// are created first so that ALTERs can reference them.
+// Dependent objects (indexes, triggers, policies) are created after ALTERs
+// because they may reference columns added by ALTER TABLE.
+// GenerateDDL generates DDL statements for a diff.
+//
+// objectMap is the desired schema (used for CREATE ordering).
+// actualObjectMap, if provided, is the current database schema (used for DROP
+// ordering). When omitted, objectMap is used for both.
+func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObjectMap, actualObjectMap ...schema.SchemaObjectMap) (string, error) {
 	var statements []string
 
-	// 1. Generate CREATE statements (in dependency order)
-	if len(diff.ToCreate) > 0 {
-		createStatements, err := g.generateCreateStatements(diff.ToCreate, objectMap)
+	// Use actual schema for drop ordering if provided, otherwise fall back to desired.
+	dropMap := objectMap
+	if len(actualObjectMap) > 0 && actualObjectMap[0] != nil {
+		dropMap = actualObjectMap[0]
+	}
+
+	// Split creates into structural (before ALTER) and dependent (after ALTER).
+	var structuralKeys, dependentKeys []schema.ObjectKey
+	for _, key := range diff.ToCreate {
+		switch key.Kind {
+		case schema.IndexKind, schema.TriggerKind, schema.PolicyKind:
+			dependentKeys = append(dependentKeys, key)
+		default:
+			structuralKeys = append(structuralKeys, key)
+		}
+	}
+
+	// 1. Create structural objects (types, tables, functions, etc.)
+	if len(structuralKeys) > 0 {
+		stmts, err := g.generateCreateStatements(structuralKeys, objectMap)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate CREATE statements: %w", err)
 		}
-		statements = append(statements, createStatements...)
+		statements = append(statements, stmts...)
 	}
 
-	// 2. Generate ALTER statements
+	// 2. ALTER existing objects (may add columns that new indexes reference)
 	for _, alter := range diff.ToAlter {
 		stmts, err := g.generateAlter(alter)
 		if err != nil {
@@ -76,9 +104,18 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 		statements = append(statements, stmts...)
 	}
 
-	// 3. Generate DROP statements (in reverse dependency order)
+	// 3. Create dependent objects (indexes, triggers, policies)
+	if len(dependentKeys) > 0 {
+		stmts, err := g.generateCreateStatements(dependentKeys, objectMap)
+		if err != nil {
+			return "", fmt.Errorf("failed to generate dependent CREATE statements: %w", err)
+		}
+		statements = append(statements, stmts...)
+	}
+
+	// 4. DROP statements (in reverse dependency order, using actual schema)
 	if len(diff.ToDrop) > 0 {
-		dropStatements, err := g.generateDropStatements(diff.ToDrop, objectMap)
+		dropStatements, err := g.generateDropStatements(diff.ToDrop, dropMap)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate DROP statements: %w", err)
 		}
@@ -111,9 +148,18 @@ func (g *DDLGenerator) generateCreateStatements(keys []schema.ObjectKey, objectM
 		return nil, err
 	}
 
-	// Generate CREATE statements in sorted order
+	// Build set of keys that actually need CREATE (not just dependency-ordering nodes)
+	createSet := make(map[schema.ObjectKey]bool, len(keys))
+	for _, k := range keys {
+		createSet[k] = true
+	}
+
+	// Generate CREATE statements in sorted order, skipping dependency-only nodes
 	var statements []string
 	for _, key := range sortedKeys {
+		if !createSet[key] {
+			continue // included only for ordering, already exists
+		}
 		if obj, exists := objectMap[key]; exists {
 			stmt, err := g.generateCreate(obj.Payload)
 			if err != nil {
@@ -257,7 +303,12 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 		for i, col := range uq.Cols {
 			uqCols[i] = string(col)
 		}
-		uqClause := fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", uq.Name, strings.Join(uqCols, ", "))
+		var uqClause string
+		if uq.Name != "" {
+			uqClause = fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", uq.Name, strings.Join(uqCols, ", "))
+		} else {
+			uqClause = fmt.Sprintf("  UNIQUE (%s)", strings.Join(uqCols, ", "))
+		}
 		if !uq.NullsDistinct {
 			uqClause += " NULLS NOT DISTINCT"
 		}

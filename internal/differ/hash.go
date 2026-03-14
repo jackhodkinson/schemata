@@ -96,6 +96,19 @@ func normalizeTable(tbl schema.Table) schema.Table {
 	})
 	tbl.Columns = normalizedCols
 
+	// Assign auto-generated names to unnamed unique constraints.
+	// PostgreSQL names unnamed UNIQUE constraints as {table}_{cols}_key.
+	// Without this, the parser's empty name won't match the catalog's auto-name.
+	for i := range tbl.Uniques {
+		if tbl.Uniques[i].Name == "" && len(tbl.Uniques[i].Cols) > 0 {
+			colParts := make([]string, len(tbl.Uniques[i].Cols))
+			for j, col := range tbl.Uniques[i].Cols {
+				colParts[j] = string(col)
+			}
+			tbl.Uniques[i].Name = string(tbl.Name) + "_" + strings.Join(colParts, "_") + "_key"
+		}
+	}
+
 	// Sort constraints by name for consistent hashing
 	sort.Slice(tbl.Uniques, func(i, j int) bool {
 		return tbl.Uniques[i].Name < tbl.Uniques[j].Name

@@ -5,6 +5,22 @@ import (
 	"strings"
 )
 
+// normalizeTypeParams normalizes whitespace around commas in type parameters.
+// e.g., "10,2)" → "10, 2)" and "10 , 2)" → "10, 2)"
+func normalizeTypeParams(params string) string {
+	// Split on commas, trim each part, rejoin with ", "
+	closeParen := ""
+	if strings.HasSuffix(params, ")") {
+		closeParen = ")"
+		params = strings.TrimSuffix(params, ")")
+	}
+	parts := strings.Split(params, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return strings.Join(parts, ", ") + closeParen
+}
+
 // NormalizeTypeName normalizes type names to a canonical form suitable for
 // stable hashing and function signature identity.
 func NormalizeTypeName(typeName TypeName) TypeName {
@@ -68,11 +84,16 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 			baseType := strings.ToLower(strings.TrimSpace(parts[0]))
 			params := parts[1]
 
+			// Normalize whitespace inside parameters: "10,2" and "10, 2" → "10, 2"
+			params = normalizeTypeParams(params)
+
 			switch baseType {
 			case "character varying":
 				return TypeName("varchar(" + params)
 			case "character":
 				return TypeName("char(" + params)
+			default:
+				return TypeName(baseType + "(" + params)
 			}
 		}
 	}
