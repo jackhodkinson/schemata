@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile architecture deadcode clean docker-up docker-down
+.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile test-orderfail architecture deadcode clean docker-up docker-down
 
 BIN_DIR := bin
 
@@ -49,6 +49,10 @@ test-integration:
 	go test -tags=integration -v ./internal/cli/...
 	@echo "Stopping Docker databases..."
 	@docker compose down
+
+# Intentionally RED tests: dependency-aware per-schema file order is not implemented yet.
+test-orderfail:
+	go test -tags=orderfail -count=1 -v ./internal/cli/... -run TestDumpOrdering
 
 # Compile integration test binary without polluting repo root
 test-integration-compile:
