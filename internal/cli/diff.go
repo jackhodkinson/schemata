@@ -175,6 +175,5 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	fmt.Println(ddl)
 	fmt.Println("---")
 
-	// Return error to indicate differences found (Cobra will handle exit code)
-	return fmt.Errorf("schemas differ")
+	return ErrDriftDetected
 }

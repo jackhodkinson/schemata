@@ -79,12 +79,9 @@ schemata diff --config schemata.yaml --from migrations
 
 ## Exit behavior
 
-Current behavior:
-
 - Exit `0`: schemas are in sync.
-- Exit `1`: drift was found or runtime/config/connectivity failure occurred.
-
-Because both outcomes currently return `1`, automation that needs separate handling should add a wrapper script and classify based on command output.
+- Exit `1`: drift was found.
+- Exit `2`: runtime/config/connectivity failure occurred.
 
 ## GitHub Actions example (pull request gate)
 
@@ -154,32 +151,6 @@ jobs:
         env:
           PROD_URL: ${{ secrets.PROD_URL }}
         run: schemata diff --config schemata.yaml --target prod
-```
-
-## Generic shell wrapper (optional)
-
-If you want clearer CI messaging with current exit behavior:
-
-```bash
-set +e
-output="$(schemata diff --config schemata.yaml 2>&1)"
-status=$?
-set -e
-
-if [ "$status" -eq 0 ]; then
-  echo "Schema check passed: in sync"
-  exit 0
-fi
-
-echo "$output"
-
-if echo "$output" | grep -q "Schema differences found"; then
-  echo "Schema drift detected"
-  exit 1
-fi
-
-echo "Schemata failed to run (non-drift failure)"
-exit 2
 ```
 
 ## Common pitfalls

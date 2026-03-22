@@ -62,12 +62,11 @@ For multi-target configs:
 schemata diff --config schemata.yaml --target prod
 ```
 
-### Exit behavior (current)
+### Exit behavior
 
 - Exit `0`: schemas are in sync.
-- Exit `1`: drift was found or `schemata` failed to run (for example config or connectivity errors).
-
-`schemata` currently uses a single non-zero exit code for both drift and runtime failures. If your pipeline needs to separate these outcomes, use a wrapper step that inspects command output.
+- Exit `1`: drift was found.
+- Exit `2`: `schemata` failed to run (for example config or connectivity errors).
 
 ### GitHub Actions example
 
