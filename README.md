@@ -35,6 +35,86 @@ Download prebuilt binaries and checksums from [GitHub Releases](https://github.c
 - Configure `schemata` with a config.yaml file
 - Dump an existing database with optional filtering rules
 
+## CI Drift Detection
+
+You can use `schemata diff` as a CI gate to ensure your target schema stays in sync with your committed `schema.sql`.
+
+### Which diff should I use?
+
+- `schemata diff`: compare `schema.sql` against a configured target database. Use this for environment drift checks (for example "is staging in sync?").
+- `schemata diff --from migrations`: apply migrations to `dev` and compare the resulting schema to `schema.sql`. Use this as a pull request gate to ensure migrations and desired schema match.
+
+For pull request validation, prefer `--from migrations` against an ephemeral CI database instead of a shared long-lived dev database.
+
+### CI quickstart
+
+1. Ensure your repository has `schemata.yaml`, `schema.sql`, and a migrations directory.
+2. Store database credentials in CI secrets and expose them as environment variables.
+3. Run `schemata diff` in your workflow.
+
+```bash
+schemata diff --config schemata.yaml
+```
+
+For multi-target configs:
+
+```bash
+schemata diff --config schemata.yaml --target prod
+```
+
+### Exit behavior (current)
+
+- Exit `0`: schemas are in sync.
+- Exit `1`: drift was found or `schemata` failed to run (for example config or connectivity errors).
+
+`schemata` currently uses a single non-zero exit code for both drift and runtime failures. If your pipeline needs to separate these outcomes, use a wrapper step that inspects command output.
+
+### GitHub Actions example
+
+```yaml
+name: schema-drift
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: schemata_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d schemata_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install schemata
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://raw.githubusercontent.com/jackhodkinson/schemata/main/install.sh | VERSION=v0.1.0 INSTALL_DIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run drift check
+        env:
+          DEV_URL: postgres://postgres:postgres@localhost:5432/schemata_ci?sslmode=disable
+        run: schemata diff --config schemata.yaml --from migrations
+```
+
+### More CI examples
+
+See `docs/drift-detection.md` for additional patterns, troubleshooting, migration-based pull request checks, and operational environment drift monitoring.
+
 ## Commands
 
 If you are starting from an existing db without any local schema file or migrations directory you can do this:
