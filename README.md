@@ -32,7 +32,7 @@ Download prebuilt binaries and checksums from [GitHub Releases](https://github.c
 
 - Define your schema in raw SQL
 - Generate migrations from changes to your schema
-- Configure `schemata` with a config.yaml file
+- Configure `schemata` with a `schemata.yaml` file
 - Dump an existing database with optional filtering rules
 
 ## CI Drift Detection
