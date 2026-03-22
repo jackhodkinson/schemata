@@ -26,7 +26,7 @@ pg_query_go yet, so we vendor a patched copy locally.
 - `go.mod` contains a `replace` directive that points pg_query_go to that
   patched directory.
 
-The rest of the module is untouched—it is the stock `v5.1.0` release.
+The rest of the module is untouched-it is the stock `v5.1.0` release.
 
 ## How To Verify
 
