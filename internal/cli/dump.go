@@ -3,12 +3,12 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
+	"path/filepath"
 
-	"github.com/spf13/cobra"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
 	"github.com/jackhodkinson/schemata/internal/planner"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -18,15 +18,24 @@ var (
 
 var dumpCmd = &cobra.Command{
 	Use:   "dump",
-	Short: "Dump database schema to SQL file",
-	Long: `Dump the target database schema to a SQL file.
+	Short: "Dump database schema to SQL file(s)",
+	Long: `Dump the target database schema to SQL.
+
+If the schema path ends with ".sql", output is written to that single file.
+
+If the schema path does not end with ".sql", it is treated as a directory: the
+directory is created if needed, and one "<schema>.sql" file is written per
+PostgreSQL schema (for example public.sql, sales.sql).
 
 Examples:
   # Dump using config file
   schemata dump
 
-  # Dump to specific file
+  # Dump to a single file
   schemata dump --schema my-schema.sql
+
+  # Dump one file per schema into a directory (created if missing)
+  schemata dump --schema ./schema
 
   # Dump specific target
   schemata dump --target staging
@@ -35,7 +44,7 @@ Examples:
 }
 
 func init() {
-	dumpCmd.Flags().StringVar(&dumpSchema, "schema", "", "Schema file path (overrides config)")
+	dumpCmd.Flags().StringVar(&dumpSchema, "schema", "", "Schema path: .sql file or directory for per-schema .sql files (overrides config)")
 	dumpCmd.Flags().StringVar(&dumpTarget, "target", "", "Target name (for multi-target configs)")
 }
 
@@ -60,13 +69,26 @@ func runDump(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Determine schema file path
+	// Determine schema path
 	schemaPath := dumpSchema
 	if schemaPath == "" {
 		schemaPath = cfg.Schema.GetSchemaPath()
 	}
 
-	fmt.Printf("Dumping database schema to %s...\n", schemaPath)
+	fileMode := isDumpSchemaFilePath(schemaPath)
+	if err := validateDumpSchemaPath(schemaPath, fileMode); err != nil {
+		return err
+	}
+
+	if fileMode {
+		fmt.Printf("Dumping database schema to file %s...\n", schemaPath)
+	} else {
+		abs, err := filepath.Abs(schemaPath)
+		if err != nil {
+			abs = schemaPath
+		}
+		fmt.Printf("Dumping database schema to directory %s (one .sql file per schema)...\n", abs)
+	}
 
 	// Connect to target database
 	ctx := context.Background()
@@ -84,28 +106,20 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to extract schema objects: %w", err)
 	}
 
-	// Generate DDL
 	ddlGen := planner.NewDDLGenerator()
-	var ddlStatements []string
-	for _, obj := range objects {
-		stmt, err := ddlGen.GenerateCreateStatement(obj)
-		if err != nil {
-			fmt.Printf("Warning: failed to generate DDL for object: %v\n", err)
-			continue
+
+	if fileMode {
+		if _, err := writeDumpSingleFile(schemaPath, objects, ddlGen); err != nil {
+			return err
 		}
-		ddlStatements = append(ddlStatements, stmt)
+		fmt.Printf("Successfully dumped %d database objects\n", len(objects))
+		return nil
 	}
 
-	// Write to file
-	ddl := ""
-	for _, stmt := range ddlStatements {
-		ddl += stmt + "\n\n"
+	nFiles, err := writeDumpPerSchemaDir(schemaPath, objects, ddlGen)
+	if err != nil {
+		return err
 	}
-
-	if err := os.WriteFile(schemaPath, []byte(ddl), 0644); err != nil {
-		return fmt.Errorf("failed to write schema file: %w", err)
-	}
-
-	fmt.Printf("Successfully dumped %d database objects\n", len(objects))
+	fmt.Printf("Successfully dumped %d database objects into %d schema file(s)\n", len(objects), nFiles)
 	return nil
 }
