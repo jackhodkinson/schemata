@@ -18,16 +18,16 @@ var (
 var diffCmd = &cobra.Command{
 	Use:   "diff",
 	Short: "Show schema differences",
-	Long: `Show differences between target database and schema file.
+	Long: `Show differences between target database and schema path.
 
 Examples:
-  # Compare target DB to schema.sql
+  # Compare target DB to configured schema path
   schemata diff
 
-  # Compare dev DB (with migrations applied) to schema.sql
+  # Compare dev DB (with migrations applied) to configured schema path
   schemata diff --from migrations
 
-  # Compare specific target to schema.sql
+  # Compare specific target to configured schema path
   schemata diff --target prod
 `,
 	RunE: runDiff,
@@ -96,19 +96,19 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Parse schema file
-	schemaFile := cfg.Schema.GetSchemaPath()
-	if schemaFile == "" {
-		return fmt.Errorf("no schema file configured")
+	// Parse schema path
+	schemaPath := cfg.Schema.GetSchemaPath()
+	if schemaPath == "" {
+		return fmt.Errorf("no schema path configured")
 	}
 
-	desiredSchema, err := service.ParseSchemaFile(schemaFile)
+	desiredSchema, err := service.ParseSchemaPath(schemaPath)
 	if err != nil {
 		return err
 	}
 
 	if verbose {
-		fmt.Printf("Parsed %d objects from schema file\n", len(desiredSchema))
+		fmt.Printf("Parsed %d objects from schema path\n", len(desiredSchema))
 	}
 
 	// Query actual schema from database
@@ -133,7 +133,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("Schema differences found between %s and %s:\n\n", schemaFile, dbName)
+	fmt.Printf("Schema differences found between %s and %s:\n\n", schemaPath, dbName)
 
 	// Display creates
 	if len(diff.ToCreate) > 0 {

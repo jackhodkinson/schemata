@@ -47,12 +47,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Pre-flight check: ensure migrations are in sync with schema.sql
+	// Pre-flight check: ensure migrations are in sync with configured schema path
 	fmt.Println("Running pre-flight check (diff --from migrations)...")
 	if err := service.CheckMigrationsInSync(ctx, cfg); err != nil {
 		return fmt.Errorf("pre-flight check failed: %w\n\nHint: Run 'schemata generate <name>' to create a migration for the differences", err)
 	}
-	fmt.Println("✓ Migrations are in sync with schema.sql")
+	fmt.Println("✓ Migrations are in sync with configured schema path")
 
 	// Determine target connection
 	var targetConn *config.DBConnection

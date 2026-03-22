@@ -3,8 +3,8 @@ package cli
 import (
 	"fmt"
 
-	"github.com/spf13/cobra"
 	"github.com/jackhodkinson/schemata/internal/config"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -33,7 +33,7 @@ func init() {
 	initCmd.Flags().StringVar(&initDev, "dev", "", "Dev database connection (required)")
 	initCmd.Flags().StringVar(&initTarget, "target", "", "Target database connection (required)")
 	initCmd.Flags().StringVar(&initMigrations, "migrations", "./migrations", "Migrations directory path")
-	initCmd.Flags().StringVar(&initSchema, "schema", "schema.sql", "Schema file path")
+	initCmd.Flags().StringVar(&initSchema, "schema", "schema.sql", "Schema path (file or directory)")
 
 	initCmd.MarkFlagRequired("dev")
 	initCmd.MarkFlagRequired("target")

@@ -15,11 +15,11 @@ import (
 var generateCmd = &cobra.Command{
 	Use:   "generate <migration-name>",
 	Short: "Generate a migration from schema changes",
-	Long: `Generate a migration file by comparing the schema file to the dev database.
+	Long: `Generate a migration file by comparing the schema path to the dev database.
 
 This command will:
 1. Apply all existing migrations to the dev database
-2. Compare the dev database to your schema.sql file
+2. Compare the dev database to your configured schema path
 3. Generate DDL for the differences
 4. Create a new migration file with the generated DDL
 
@@ -47,10 +47,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no migrations directory configured")
 	}
 
-	// Ensure schema file exists
-	schemaFile := cfg.Schema.GetSchemaPath()
-	if schemaFile == "" {
-		return fmt.Errorf("no schema file configured")
+	// Ensure schema path exists
+	schemaPath := cfg.Schema.GetSchemaPath()
+	if schemaPath == "" {
+		return fmt.Errorf("no schema path configured")
 	}
 
 	// Connect to dev database
@@ -77,15 +77,15 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 2: Parse schema.sql to get desired state
-	fmt.Printf("Parsing schema file: %s\n", schemaFile)
-	desiredSchema, err := service.ParseSchemaFile(schemaFile)
+	// Step 2: Parse schema path to get desired state
+	fmt.Printf("Parsing schema path: %s\n", schemaPath)
+	desiredSchema, err := service.ParseSchemaPath(schemaPath)
 	if err != nil {
 		return err
 	}
 
 	if verbose {
-		fmt.Printf("Parsed %d objects from schema file\n", len(desiredSchema))
+		fmt.Printf("Parsed %d objects from schema path\n", len(desiredSchema))
 	}
 
 	// Step 3: Query actual schema from dev database

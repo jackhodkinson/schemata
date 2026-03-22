@@ -44,14 +44,14 @@ func (s *Service) ApplyMigrations(ctx context.Context, pool *db.Pool, migrations
 	return nil
 }
 
-func (s *Service) ParseSchemaFile(schemaFile string) (schema.SchemaObjectMap, error) {
-	if schemaFile == "" {
-		return nil, fmt.Errorf("no schema file configured")
+func (s *Service) ParseSchemaPath(schemaPath string) (schema.SchemaObjectMap, error) {
+	if schemaPath == "" {
+		return nil, fmt.Errorf("no schema path configured")
 	}
 	p := parser.NewParser()
-	desiredSchema, err := p.ParseFile(schemaFile)
+	desiredSchema, err := p.ParsePath(schemaPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse schema file '%s': %w", schemaFile, err)
+		return nil, fmt.Errorf("failed to parse schema path '%s': %w", schemaPath, err)
 	}
 	return desiredSchema, nil
 }
@@ -113,8 +113,8 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 		}
 	}
 
-	schemaFile := cfg.Schema.GetSchemaPath()
-	desiredSchema, err := s.ParseSchemaFile(schemaFile)
+	schemaPath := cfg.Schema.GetSchemaPath()
+	desiredSchema, err := s.ParseSchemaPath(schemaPath)
 	if err != nil {
 		return err
 	}
@@ -130,7 +130,7 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 	}
 
 	if !diff.IsEmpty() {
-		return fmt.Errorf("migrations are out of sync with schema.sql:\n  %d to create, %d to drop, %d to alter",
+		return fmt.Errorf("migrations are out of sync with configured schema path:\n  %d to create, %d to drop, %d to alter",
 			len(diff.ToCreate), len(diff.ToDrop), len(diff.ToAlter))
 	}
 

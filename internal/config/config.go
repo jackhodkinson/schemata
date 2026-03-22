@@ -11,11 +11,11 @@ import (
 
 // Config represents the main schemata configuration
 type Config struct {
-	Dev        *DBConnection         `yaml:"dev,omitempty"`
-	Target     *DBConnection         `yaml:"target,omitempty"`
+	Dev        *DBConnection           `yaml:"dev,omitempty"`
+	Target     *DBConnection           `yaml:"target,omitempty"`
 	Targets    map[string]DBConnection `yaml:"targets,omitempty"`
-	Schema     SchemaConfig          `yaml:"schema"`
-	Migrations string                `yaml:"migrations"`
+	Schema     SchemaConfig            `yaml:"schema"`
+	Migrations string                  `yaml:"migrations"`
 }
 
 // DBConnection can be either a URL string or connection details
@@ -84,7 +84,7 @@ const (
 	SSLVerifyFull SSLMode = "verify-full"
 )
 
-// SchemaConfig can be either a simple file path or detailed configuration
+// SchemaConfig can be either a simple schema path or detailed configuration
 type SchemaConfig struct {
 	// Simple format (just a file path string)
 	FilePath *string `yaml:"-"`
@@ -141,7 +141,7 @@ func (sc SchemaConfig) MarshalYAML() (interface{}, error) {
 	}, nil
 }
 
-// GetSchemaPath returns the schema file path from the config
+// GetSchemaPath returns the schema path from the config
 func (sc *SchemaConfig) GetSchemaPath() string {
 	if sc.FilePath != nil {
 		return *sc.FilePath
@@ -212,9 +212,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("must have either 'target' or 'targets' in config")
 	}
 
-	// Schema must be specified
+	// Schema path must be specified
 	if c.Schema.GetSchemaPath() == "" {
-		return fmt.Errorf("schema file path must be specified")
+		return fmt.Errorf("schema path must be specified")
 	}
 
 	// Migrations directory must be specified

@@ -1,8 +1,12 @@
 package parser
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/jackhodkinson/schemata/internal/objectmap"
@@ -16,6 +20,16 @@ type Parser struct{}
 type UnsupportedStatementError struct {
 	StatementType string
 	Remediation   string
+}
+
+type DuplicateObjectError struct {
+	Key        schema.ObjectKey
+	FirstPath  string
+	SecondPath string
+}
+
+func (e *DuplicateObjectError) Error() string {
+	return fmt.Sprintf("duplicate schema object %s found in both '%s' and '%s'", formatObjectKey(e.Key), e.FirstPath, e.SecondPath)
 }
 
 func (e *UnsupportedStatementError) Error() string {
@@ -32,17 +46,85 @@ func NewParser() *Parser {
 
 // ParseFile parses a SQL file and returns a SchemaObjectMap
 func (p *Parser) ParseFile(filePath string) (schema.SchemaObjectMap, error) {
-	// Read file
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
+	return p.parseSQLWithSource(string(content), filePath)
+}
 
-	return p.ParseSQL(string(content))
+// ParsePath parses a schema path that may be either a SQL file or directory.
+// Directory mode recursively scans for .sql files in deterministic path order.
+func (p *Parser) ParsePath(path string) (schema.SchemaObjectMap, error) {
+	if path == "" {
+		return nil, fmt.Errorf("no schema path configured")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect schema path '%s': %w", path, err)
+	}
+
+	if !info.IsDir() {
+		return p.ParseFile(path)
+	}
+
+	files, err := collectSchemaFiles(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return p.buildObjectMap([]schema.DatabaseObject{})
+	}
+
+	var objects []schema.DatabaseObject
+	objectSources := make(map[schema.ObjectKey]string)
+
+	for _, filePath := range files {
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read schema file '%s': %w", filePath, err)
+		}
+		fileObjects, err := p.parseSQLObjects(string(content))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse schema file '%s': %w", filePath, err)
+		}
+
+		for _, obj := range fileObjects {
+			key := objectmap.Key(obj)
+			if prior, exists := objectSources[key]; exists {
+				return nil, &DuplicateObjectError{
+					Key:        key,
+					FirstPath:  prior,
+					SecondPath: filePath,
+				}
+			}
+			objectSources[key] = filePath
+			objects = append(objects, obj)
+		}
+	}
+
+	return p.buildObjectMap(objects)
 }
 
 // ParseSQL parses SQL text and returns a SchemaObjectMap
 func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
+	return p.parseSQLWithSource(sql, "")
+}
+
+func (p *Parser) parseSQLWithSource(sql string, sourcePath string) (schema.SchemaObjectMap, error) {
+	objects, err := p.parseSQLObjects(sql)
+	if err != nil {
+		if sourcePath != "" {
+			return nil, fmt.Errorf("failed to parse schema file '%s': %w", sourcePath, err)
+		}
+		return nil, err
+	}
+
+	return p.buildObjectMap(objects)
+}
+
+func (p *Parser) parseSQLObjects(sql string) ([]schema.DatabaseObject, error) {
 	// Parse using pg_query_go
 	result, err := pg_query.Parse(sql)
 	if err != nil {
@@ -85,8 +167,7 @@ func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
 
 	objects = p.mergeGrantsAndOwners(objects, result)
 
-	// Build object map with hashing
-	return p.buildObjectMap(objects)
+	return objects, nil
 }
 
 func extractStatementSnippet(sql string, location, length int) string {
@@ -327,4 +408,93 @@ func extractStringList(node *pg_query.Node) []string {
 		}
 	}
 	return values
+}
+
+func collectSchemaFiles(root string) ([]string, error) {
+	var relPaths []string
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		name := d.Name()
+		if d.IsDir() {
+			if path != root && strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if shouldIgnoreSchemaFile(name) {
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(name), ".sql") {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("failed to compute schema file path: %w", err)
+		}
+		relPaths = append(relPaths, filepath.ToSlash(relPath))
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan schema directory '%s': %w", root, err)
+	}
+
+	sort.Strings(relPaths)
+	files := make([]string, 0, len(relPaths))
+	for _, rel := range relPaths {
+		files = append(files, filepath.Join(root, filepath.FromSlash(rel)))
+	}
+	return files, nil
+}
+
+func shouldIgnoreSchemaFile(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	if strings.HasSuffix(name, "~") || strings.HasSuffix(name, ".swp") || strings.HasSuffix(name, ".tmp") {
+		return true
+	}
+	if strings.HasPrefix(name, "#") {
+		return true
+	}
+	return strings.HasPrefix(name, ".#")
+}
+
+func formatObjectKey(key schema.ObjectKey) string {
+	var b strings.Builder
+	if key.Kind != "" {
+		b.WriteString(string(key.Kind))
+	} else {
+		b.WriteString("unknown")
+	}
+	b.WriteString(":")
+	if key.Schema != "" {
+		b.WriteString(string(key.Schema))
+		b.WriteString(".")
+	}
+	if key.Name != "" {
+		b.WriteString(key.Name)
+	}
+	if key.TableName != "" {
+		b.WriteString(" table=")
+		b.WriteString(string(key.TableName))
+	}
+	if key.ColumnName != "" {
+		b.WriteString(" column=")
+		b.WriteString(string(key.ColumnName))
+	}
+	if key.Signature != "" {
+		b.WriteString(" signature=")
+		b.WriteString(string(key.Signature))
+	}
+	return b.String()
+}
+
+func IsDuplicateObjectError(err error) bool {
+	var dupErr *DuplicateObjectError
+	return errors.As(err, &dupErr)
 }
