@@ -8,8 +8,31 @@ permissions:
   contents: read
 
 jobs:
+  pgquery-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run pg_query smoke tests
+        run: make test-pgquery-smoke
+
   unit-tests:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -21,8 +44,23 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+  integration-compile-macos:
+    runs-on: macos-latest
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile integration tests on macOS
+        run: go test -tags=integration -c ./test/integration
+
   integration-tests:
     runs-on: ubuntu-latest
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

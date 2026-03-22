@@ -1,6 +1,6 @@
-.PHONY: build test test-unit test-integration clean docker-up docker-down
+.PHONY: build test test-unit test-pgquery-smoke test-integration clean docker-up docker-down
 
-# CGO flags required for macOS 15+ compatibility with pg_query_go
+# CGO compatibility flag for environments where strchrnul detection differs.
 export CGO_CFLAGS := -DHAVE_STRCHRNUL=1
 
 # Build the CLI binary
@@ -31,6 +31,10 @@ test-unit:
 	go test -v ./internal/config/...
 	go test -v ./internal/migration/...
 	go test -v ./test -run TestPgQuery
+
+# Run focused pg_query parser smoke tests (cross-platform CI guardrail)
+test-pgquery-smoke:
+	go test -v ./test -run '^TestPgQuery(Basic|Select|MultipleStatements|DDLStatements|ComplexSchema|Normalization|ErrorHandling)$$'
 
 # Run integration tests (requires Docker)
 test-integration:
