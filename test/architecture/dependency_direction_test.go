@@ -106,8 +106,11 @@ const (
 	layerDB        = "db"
 	layerDiffer    = "differ"
 	layerMigration = "migration"
+	layerNormalize = "normalize"
+	layerObjectMap = "objectmap"
 	layerParser    = "parser"
 	layerPlanner   = "planner"
+	layerVersion   = "version"
 	layerPkg       = "pkg"
 )
 
@@ -127,10 +130,16 @@ func classifyLayer(importPath string) string {
 		return layerDiffer
 	case strings.HasPrefix(importPath, modulePath+"/internal/migration"):
 		return layerMigration
+	case strings.HasPrefix(importPath, modulePath+"/internal/normalize"):
+		return layerNormalize
+	case strings.HasPrefix(importPath, modulePath+"/internal/objectmap"):
+		return layerObjectMap
 	case strings.HasPrefix(importPath, modulePath+"/internal/parser"):
 		return layerParser
 	case strings.HasPrefix(importPath, modulePath+"/internal/planner"):
 		return layerPlanner
+	case strings.HasPrefix(importPath, modulePath+"/internal/version"):
+		return layerVersion
 	case strings.HasPrefix(importPath, modulePath+"/pkg/"):
 		return layerPkg
 	case strings.HasPrefix(importPath, modulePath+"/internal/"):
@@ -151,8 +160,10 @@ func isAllowedLayerDependency(from, to string) bool {
 			layerDB:        true,
 			layerDiffer:    true,
 			layerMigration: true,
+			layerObjectMap: true,
 			layerParser:    true,
 			layerPlanner:   true,
+			layerVersion:   true,
 			layerPkg:       true,
 		},
 		layerApp: {
@@ -160,29 +171,41 @@ func isAllowedLayerDependency(from, to string) bool {
 			layerDB:        true,
 			layerDiffer:    true,
 			layerMigration: true,
+			layerObjectMap: true,
 			layerParser:    true,
 			layerPlanner:   true,
 			layerPkg:       true,
 		},
 		layerConfig: {},
 		layerDB: {
-			layerConfig: true,
-			layerPkg:    true,
+			layerConfig:    true,
+			layerObjectMap: true,
+			layerPkg:       true,
 		},
 		layerDiffer: {
-			layerPkg: true,
+			layerNormalize: true,
+			layerPkg:       true,
 		},
 		layerMigration: {
 			layerDB: true,
 		},
-		layerParser: {
+		layerNormalize: {
+			layerPkg: true,
+		},
+		layerObjectMap: {
 			layerDiffer: true,
 			layerPkg:    true,
+		},
+		layerParser: {
+			layerDiffer:    true,
+			layerObjectMap: true,
+			layerPkg:       true,
 		},
 		layerPlanner: {
 			layerDiffer: true,
 			layerPkg:    true,
 		},
+		layerVersion: {},
 		layerPkg: {},
 	}
 

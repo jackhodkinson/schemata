@@ -37,52 +37,16 @@ func normalize(obj schema.DatabaseObject) schema.DatabaseObject {
 	return normalizer.Object(obj)
 }
 
-func normalizeTable(tbl schema.Table) schema.Table {
-	return normalizer.Object(tbl).(schema.Table)
-}
-
 func normalizeIndex(idx schema.Index) schema.Index {
 	return normalizer.Object(idx).(schema.Index)
-}
-
-func normalizeView(view schema.View) schema.View {
-	return normalizer.Object(view).(schema.View)
 }
 
 func normalizeFunction(fn schema.Function) schema.Function {
 	return normalizer.Object(fn).(schema.Function)
 }
 
-func normalizeFunctionBody(body string) string {
-	return normalizer.FunctionBody(body)
-}
-
-func normalizeSequence(seq schema.Sequence) schema.Sequence {
-	return normalizer.Object(seq).(schema.Sequence)
-}
-
-func normalizeEnum(enum schema.EnumDef) schema.EnumDef {
-	return normalizer.Object(enum).(schema.EnumDef)
-}
-
-func normalizeDomain(domain schema.DomainDef) schema.DomainDef {
-	return normalizer.Object(domain).(schema.DomainDef)
-}
-
-func normalizeComposite(comp schema.CompositeDef) schema.CompositeDef {
-	return normalizer.Object(comp).(schema.CompositeDef)
-}
-
 func normalizeTrigger(trig schema.Trigger) schema.Trigger {
 	return normalizer.Object(trig).(schema.Trigger)
-}
-
-func normalizePolicy(pol schema.Policy) schema.Policy {
-	return normalizer.Object(pol).(schema.Policy)
-}
-
-func normalizeExtension(ext schema.Extension) schema.Extension {
-	return normalizer.Object(ext).(schema.Extension)
 }
 
 // normalizeExpr normalizes SQL expressions to a canonical form

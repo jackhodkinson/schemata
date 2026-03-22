@@ -182,7 +182,7 @@ target:
     client-key: /path/to/client-key.key
 ```
 
-All of these fields are optional. If you do not specify them we will default to the postgres defaults:
+All of these fields are optional. If you omit them, `schemata` leaves those connection settings unset and PostgreSQL/libpq fallback behavior applies (for example, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE`):
 
 ```yaml
 target:
