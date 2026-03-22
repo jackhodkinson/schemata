@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile deadcode clean docker-up docker-down
+.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile architecture deadcode clean docker-up docker-down
 
 BIN_DIR := bin
 
@@ -93,6 +93,10 @@ fmt:
 # Run linter
 lint:
 	go vet ./...
+
+# Enforce package dependency direction rules
+architecture:
+	go test -v ./test/architecture/...
 
 # Detect dead/unused code via static and reachability analysis
 deadcode:

@@ -41,6 +41,8 @@ jobs:
           cache: true
       - name: Run unit tests
         run: go test ./...
+      - name: Enforce package dependency direction
+        run: make architecture
       - name: Run go vet
         run: go vet ./...
 
