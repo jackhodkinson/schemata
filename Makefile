@@ -37,7 +37,7 @@ test-unit:
 
 # Run focused pg_query parser smoke tests (cross-platform CI guardrail)
 test-pgquery-smoke:
-	go test -v ./test -run '^TestPgQuery(Basic|Select|MultipleStatements|DDLStatements|ComplexSchema|Normalization|ErrorHandling)$$'
+	go test -v ./test -run '^TestPgQuery(Basic|Select|MultipleStatements|DDLStatements|ComplexSchema|Normalization|ErrorHandling|PatchContract)$$'
 
 # Run integration tests (requires Docker)
 test-integration:
