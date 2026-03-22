@@ -46,6 +46,7 @@ test-integration:
 	@echo "Waiting for databases to be ready..."
 	@sleep 5
 	go test -tags=integration -v ./test/integration/...
+	go test -tags=integration -v ./internal/cli/...
 	@echo "Stopping Docker databases..."
 	@docker compose down
 

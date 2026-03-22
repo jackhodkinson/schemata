@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/jackhodkinson/schemata/internal/planner"
@@ -23,6 +24,14 @@ func TestSafeSchemaSQLFileName(t *testing.T) {
 	assert.Equal(t, "_empty", safeSchemaSQLFileName(""))
 	assert.Equal(t, "public", safeSchemaSQLFileName("public"))
 	assert.Equal(t, "a_b", safeSchemaSQLFileName("a/b"))
+}
+
+// TestLexicographicFileOrder_ExtensionFootgun_EarlyBeforePublic documents that schema names sort
+// lexically: "early" before "public", so per-schema dumps would emit early.sql before public.sql.
+func TestLexicographicFileOrder_ExtensionFootgun_EarlyBeforePublic(t *testing.T) {
+	names := []string{"public", "early"}
+	sort.Strings(names)
+	assert.Equal(t, []string{"early", "public"}, names)
 }
 
 func TestValidateDumpSchemaPath(t *testing.T) {
