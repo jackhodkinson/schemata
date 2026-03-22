@@ -80,19 +80,6 @@ func (mt *MigrationTracker) GetAppliedVersions(ctx context.Context) ([]string, e
 	return versions, nil
 }
 
-// IsApplied checks if a specific version has been applied
-func (mt *MigrationTracker) IsApplied(ctx context.Context, version string) (bool, error) {
-	query := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s.%s WHERE version_num = $1)", schemaName, tableName)
-
-	var exists bool
-	err := mt.pool.QueryRow(ctx, query, version).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("failed to check if version is applied: %w", err)
-	}
-
-	return exists, nil
-}
-
 // MarkApplied marks a migration version as applied
 // The executor parameter allows this to run within a transaction
 func (mt *MigrationTracker) MarkApplied(ctx context.Context, executor Executor, version string) error {
@@ -133,28 +120,3 @@ func (mt *MigrationTracker) GetPendingVersions(ctx context.Context, availableVer
 	return pending, nil
 }
 
-// RemoveVersion removes a version from the tracking table (for rollback scenarios)
-func (mt *MigrationTracker) RemoveVersion(ctx context.Context, version string) error {
-	query := fmt.Sprintf("DELETE FROM %s.%s WHERE version_num = $1", schemaName, tableName)
-
-	_, err := mt.pool.Exec(ctx, query, version)
-	if err != nil {
-		return fmt.Errorf("failed to remove version: %w", err)
-	}
-
-	return nil
-}
-
-// GetLatestVersion returns the most recently applied version
-func (mt *MigrationTracker) GetLatestVersion(ctx context.Context) (string, error) {
-	query := fmt.Sprintf("SELECT version_num FROM %s.%s ORDER BY version_num DESC LIMIT 1", schemaName, tableName)
-
-	var version string
-	err := mt.pool.QueryRow(ctx, query).Scan(&version)
-	if err != nil {
-		// No versions applied yet
-		return "", nil
-	}
-
-	return version, nil
-}

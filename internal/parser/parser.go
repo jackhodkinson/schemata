@@ -440,8 +440,3 @@ func extractStringList(node *pg_query.Node) []string {
 	}
 	return values
 }
-
-func quoteIdentifier(name string) string {
-	escaped := strings.ReplaceAll(name, `"`, `""`)
-	return fmt.Sprintf(`"%s"`, escaped)
-}

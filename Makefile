@@ -1,11 +1,14 @@
-.PHONY: build test test-unit test-pgquery-smoke test-integration clean docker-up docker-down
+.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile deadcode clean docker-up docker-down
+
+BIN_DIR := bin
 
 # CGO compatibility flag for environments where strchrnul detection differs.
 export CGO_CFLAGS := -DHAVE_STRCHRNUL=1
 
 # Build the CLI binary
 build:
-	go build -o bin/schemata ./cmd/schemata
+	@mkdir -p $(BIN_DIR)
+	go build -o $(BIN_DIR)/schemata ./cmd/schemata
 
 # Install to /usr/local/bin (requires sudo on some systems)
 install: build
@@ -46,6 +49,11 @@ test-integration:
 	@echo "Stopping Docker databases..."
 	@docker compose down
 
+# Compile integration test binary without polluting repo root
+test-integration-compile:
+	@mkdir -p $(BIN_DIR)
+	go test -tags=integration -c -o $(BIN_DIR)/integration.test ./test/integration
+
 # Run end-to-end test (requires Docker databases to be running)
 test-e2e:
 	@echo "Running end-to-end test..."
@@ -64,6 +72,7 @@ docker-down:
 # Clean build artifacts
 clean:
 	rm -rf bin/
+	rm -f integration.test schemata
 	go clean
 
 # Install development dependencies
@@ -84,3 +93,10 @@ fmt:
 # Run linter
 lint:
 	go vet ./...
+
+# Detect dead/unused code via static and reachability analysis
+deadcode:
+	@echo "Running staticcheck unused-declaration pass (U1000)..."
+	go run honnef.co/go/tools/cmd/staticcheck@latest -checks=U1000 ./...
+	@echo "Running reachability dead code analysis across packages (integration tags enabled)..."
+	go run golang.org/x/tools/cmd/deadcode@latest -test -tags=integration ./...

@@ -53,7 +53,7 @@ Run this locally when touching parser dependencies:
 
 ```bash
 make test-pgquery-smoke
-go test -tags=integration -c ./test/integration
+go test -tags=integration -c -o bin/integration.test ./test/integration
 ```
 
 ## References

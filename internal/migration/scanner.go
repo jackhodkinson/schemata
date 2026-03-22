@@ -70,41 +70,6 @@ func (s *Scanner) Scan() ([]Migration, error) {
 	return migrations, nil
 }
 
-// GetVersions returns only the version numbers
-func (s *Scanner) GetVersions() ([]string, error) {
-	migrations, err := s.Scan()
-	if err != nil {
-		return nil, err
-	}
-
-	versions := make([]string, len(migrations))
-	for i, m := range migrations {
-		versions[i] = m.Version
-	}
-
-	return versions, nil
-}
-
-// FindByVersion finds a migration by its version
-func (s *Scanner) FindByVersion(version string) (*Migration, error) {
-	migrations, err := s.Scan()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, m := range migrations {
-		if m.Version == version {
-			// Load SQL content
-			if err := m.LoadSQL(); err != nil {
-				return nil, err
-			}
-			return &m, nil
-		}
-	}
-
-	return nil, fmt.Errorf("migration with version %s not found", version)
-}
-
 // LoadSQL loads the SQL content of a migration
 func (m *Migration) LoadSQL() error {
 	if m.SQL != "" {

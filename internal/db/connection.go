@@ -51,7 +51,3 @@ func (p *Pool) Close() {
 	}
 }
 
-// EnsureConnected verifies the connection is active
-func (p *Pool) EnsureConnected(ctx context.Context) error {
-	return p.Pool.Ping(ctx)
-}

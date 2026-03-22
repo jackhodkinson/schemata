@@ -33,7 +33,7 @@ func TestDatabaseConnection(t *testing.T) {
 	defer pool.Close()
 
 	// Test ping
-	err = pool.EnsureConnected(ctx)
+	err = pool.Ping(ctx)
 	assert.NoError(t, err, "should be able to ping database")
 
 	// Execute a simple query
@@ -79,15 +79,9 @@ func TestMigrationTracking(t *testing.T) {
 	assert.Len(t, versions, 1)
 	assert.Equal(t, "20231015120530", versions[0])
 
-	// Check if version is applied
-	applied, err := tracker.IsApplied(ctx, "20231015120530")
-	require.NoError(t, err)
-	assert.True(t, applied)
-
-	// Check unapplied version
-	applied, err = tracker.IsApplied(ctx, "20231015130000")
-	require.NoError(t, err)
-	assert.False(t, applied)
+	// Confirm membership by reading applied versions
+	assert.Contains(t, versions, "20231015120530")
+	assert.NotContains(t, versions, "20231015130000")
 
 	// Test GetPendingVersions
 	allVersions := []string{"20231015120530", "20231015130000", "20231016090000"}
@@ -100,10 +94,10 @@ func TestMigrationTracking(t *testing.T) {
 	err = tracker.MarkApplied(ctx, pool, "20231015130000")
 	require.NoError(t, err)
 
-	// Get latest version
-	latest, err := tracker.GetLatestVersion(ctx)
+	// Confirm the second version was applied
+	versions, err = tracker.GetAppliedVersions(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, "20231015130000", latest)
+	assert.Equal(t, []string{"20231015120530", "20231015130000"}, versions)
 
 	// Clean up
 	_, _ = pool.Exec(ctx, "DROP SCHEMA schemata CASCADE")

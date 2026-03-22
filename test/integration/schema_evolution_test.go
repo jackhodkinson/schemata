@@ -5,10 +5,8 @@ package integration
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 
@@ -1253,23 +1251,3 @@ func TestDropAndRecreateEverything(t *testing.T) {
 	assert.True(t, verifyDiff.IsEmpty(), "round-trip after full replacement should be clean")
 }
 
-// =============================================================================
-// Helpers to display migration content in failure logs
-// =============================================================================
-
-func summarizeDiff(diff *differ.Diff) string {
-	parts := []string{}
-	if len(diff.ToCreate) > 0 {
-		parts = append(parts, fmt.Sprintf("%d creates", len(diff.ToCreate)))
-	}
-	if len(diff.ToDrop) > 0 {
-		parts = append(parts, fmt.Sprintf("%d drops", len(diff.ToDrop)))
-	}
-	if len(diff.ToAlter) > 0 {
-		parts = append(parts, fmt.Sprintf("%d alters", len(diff.ToAlter)))
-	}
-	if len(parts) == 0 {
-		return "empty"
-	}
-	return strings.Join(parts, ", ")
-}

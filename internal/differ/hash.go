@@ -26,12 +26,6 @@ func Hash(obj schema.DatabaseObject) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
-// HashString computes a SHA-256 hash of a string
-func HashString(s string) string {
-	hash := sha256.Sum256([]byte(s))
-	return fmt.Sprintf("%x", hash)
-}
-
 // NormalizeAndHash normalizes an object and computes its hash
 // Normalization ensures that equivalent objects produce the same hash
 func NormalizeAndHash(obj schema.DatabaseObject) (string, error) {
