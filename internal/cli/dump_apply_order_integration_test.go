@@ -1,11 +1,5 @@
 //go:build integration
 
-// Integration tests here PASS: they assert Postgres returns an error when the first file
-// (lexicographic order) is applied alone. That documents runtime failure modes.
-//
-// For Go tests that FAIL until dependency-aware ordering exists, see
-// dump_order_unimplemented_test.go (build tag: orderfail) and `make test-orderfail`.
-
 package cli
 
 import (
