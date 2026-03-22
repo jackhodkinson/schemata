@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackhodkinson/schemata/internal/objectmap"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
@@ -87,11 +88,7 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 							seq.OwnedBy.Schema == normalizedTable.Schema &&
 							seq.OwnedBy.Table == normalizedTable.Name &&
 							seq.OwnedBy.Column == col.Name {
-							key := schema.ObjectKey{
-								Kind:   schema.SequenceKind,
-								Schema: seq.Schema,
-								Name:   string(seq.Name),
-							}
+							key := objectmap.Key(seq)
 							serialSequences[key] = true
 						}
 					}
@@ -106,11 +103,7 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 	// Add only non-SERIAL sequences to objects (filter out auto-generated sequences)
 	for _, obj := range sequenceObjs {
 		if seq, ok := obj.(schema.Sequence); ok {
-			key := schema.ObjectKey{
-				Kind:   schema.SequenceKind,
-				Schema: seq.Schema,
-				Name:   string(seq.Name),
-			}
+			key := objectmap.Key(seq)
 			if !serialSequences[key] {
 				objects = append(objects, seq)
 			}
