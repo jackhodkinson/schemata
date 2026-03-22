@@ -167,7 +167,7 @@ Diff is NOT empty:
 
 **Root Cause**: **SERIAL Normalization Inconsistency**
 
-This is a well-documented issue mentioned in `PLAN.md` (lines 819-829, 885-960).
+This was previously documented in the historical implementation plan (now removed).
 
 **The Problem**:
 1. **Parser output** (from schema.sql):
@@ -195,9 +195,9 @@ This is a well-documented issue mentioned in `PLAN.md` (lines 819-829, 885-960).
 - Breaks the `migrate` command's preflight check
 - Users cannot use `schemata migrate` because it always reports "migrations out of sync"
 - Forces users to manually run `schemata apply` without validation
-- **This is Priority 2 in PLAN.md** (Critical)
+- **This was previously marked as a critical priority** in the historical implementation plan.
 
-**Fix Required** (from PLAN.md, lines 885-960):
+**Fix Required** (from the historical implementation plan):
 
 1. **SERIAL Expansion in Parser**:
    - When parsing `SERIAL`, expand to explicit sequence + integer + default
@@ -220,7 +220,7 @@ This is a well-documented issue mentioned in `PLAN.md` (lines 819-829, 885-960).
 - Apply normalization after both parsing and catalog extraction
 - Ensure both produce **identical** representations
 
-**Estimated Effort**: 6-8 hours (per PLAN.md)
+**Estimated Effort**: 6-8 hours (historical estimate)
 
 ---
 
@@ -302,7 +302,7 @@ Result: 5/6 packages fully passing
      - Update `internal/parser/table.go`
      - Update `internal/db/catalog.go`
    - **Issue**: Parser and catalog produce different representations
-   - **Fix**: Implement shared normalization as detailed in PLAN.md
+   - **Fix**: Implement shared normalization as detailed in the former implementation plan
    - **Effort**: 6-8 hours
    - **Impact**: HIGH (blocks `migrate` command)
 

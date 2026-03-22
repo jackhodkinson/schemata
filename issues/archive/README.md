@@ -2,21 +2,14 @@
 
 This directory contains historical documentation that has been superseded or resolved.
 
-## Status Documents (October 2025)
+## Status Documents
 
-These documents tracked implementation progress during initial development:
-
-- **IMPLEMENTATION_STATUS.md** - Implementation tracking (2025-10-16)
-- **BUILD_STATUS.md** - Build and test status (2025-10-16)
-- **PARSER_STATUS.md** - Parser implementation status (2025-10-16)
-- **TEST_RESULTS.md** - Test results and false positive fixes (2025-10-17)
-
-**Superseded by:** Current code and test suite
+Initial implementation status trackers from October 2025 were removed after completion because they were superseded by current code, tests, and CI.
 
 ## Root Cause Analysis Documents
 
 - **ROOT_CAUSE_ANALYSIS.md** - pg_query build issue on macOS (✅ RESOLVED)
-  - **Resolution:** Fixed with CGO_CFLAGS workaround (see PG_QUERY_FIX.md in root)
+  - **Resolution:** Fixed with CGO_CFLAGS workaround (see docs/engineering/PG_QUERY_FIX.md)
 
 - **RCA_FK_PARSER_BUG.md** - Foreign key parser bug (✅ RESOLVED)
   - **Resolution:** Fixed by using correct pg_query fields (FkAttrs instead of Keys)
@@ -27,8 +20,8 @@ For up-to-date documentation, see:
 
 - **README.md** - User documentation and commands
 - **ARCHITECTURE.md** - System design and architecture
-- **PLAN.md** - Implementation plan and current status
-- **PG_QUERY_FIX.md** - macOS build instructions
+- **docs/PRODUCTION_READINESS_PLAN.md** - Production readiness roadmap
+- **docs/engineering/PG_QUERY_FIX.md** - macOS build instructions
 - **docs/NORMALIZATION.md** - Schema normalization system
 - **test/integration/README.md** - Integration test documentation
 - **issues/** - Active issues and bug reports
