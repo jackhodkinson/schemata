@@ -1117,7 +1117,12 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 		FROM pg_proc p
 		JOIN pg_namespace n ON p.pronamespace = n.oid
 		JOIN pg_language l ON p.prolang = l.oid
-		WHERE %s AND p.prokind = 'f'
+		LEFT JOIN pg_depend d
+			ON d.classid = 'pg_proc'::regclass
+			AND d.objid = p.oid
+			AND d.refclassid = 'pg_extension'::regclass
+			AND d.deptype = 'e'
+		WHERE %s AND p.prokind = 'f' AND d.objid IS NULL
 		ORDER BY n.nspname, p.proname
 	`, schemaFilter)
 

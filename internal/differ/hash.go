@@ -59,6 +59,8 @@ func normalize(obj schema.DatabaseObject) schema.DatabaseObject {
 		return normalizeTrigger(v)
 	case schema.Policy:
 		return normalizePolicy(v)
+	case schema.Extension:
+		return normalizeExtension(v)
 	default:
 		// For Schema, Extension, and other simple types, no normalization needed
 		return obj
@@ -362,7 +364,15 @@ func normalizeEnum(enum schema.EnumDef) schema.EnumDef {
 }
 
 func normalizeDomain(domain schema.DomainDef) schema.DomainDef {
-	// Domains don't need special normalization
+	domain.BaseType = schema.NormalizeTypeName(domain.BaseType)
+	if domain.Default != nil {
+		normalized := normalizeExpr(*domain.Default)
+		domain.Default = &normalized
+	}
+	if domain.Check != nil {
+		normalized := normalizeExpr(*domain.Check)
+		domain.Check = &normalized
+	}
 	return domain
 }
 
@@ -400,7 +410,21 @@ func normalizePolicy(pol schema.Policy) schema.Policy {
 		sort.Strings(sorted)
 		pol.To = sorted
 	}
+	if pol.Using != nil {
+		normalized := normalizeExpr(*pol.Using)
+		pol.Using = &normalized
+	}
+	if pol.WithCheck != nil {
+		normalized := normalizeExpr(*pol.WithCheck)
+		pol.WithCheck = &normalized
+	}
 	return pol
+}
+
+func normalizeExtension(ext schema.Extension) schema.Extension {
+	// Do not treat extension version metadata as a schema diff signal.
+	ext.Version = nil
+	return ext
 }
 
 // normalizeExpr normalizes SQL expressions to a canonical form

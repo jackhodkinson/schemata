@@ -476,23 +476,23 @@ func compareSequences(desired, actual schema.Sequence) []string {
 		changes = append(changes, "type changed")
 	}
 
-	if !int64PtrEqual(desired.Start, actual.Start) {
+	if desired.Start != nil && !int64PtrEqual(desired.Start, actual.Start) {
 		changes = append(changes, "start value changed")
 	}
 
-	if !int64PtrEqual(desired.Increment, actual.Increment) {
+	if desired.Increment != nil && !int64PtrEqual(desired.Increment, actual.Increment) {
 		changes = append(changes, "increment changed")
 	}
 
-	if !int64PtrEqual(desired.MinValue, actual.MinValue) {
+	if desired.MinValue != nil && !int64PtrEqual(desired.MinValue, actual.MinValue) {
 		changes = append(changes, "min value changed")
 	}
 
-	if !int64PtrEqual(desired.MaxValue, actual.MaxValue) {
+	if desired.MaxValue != nil && !int64PtrEqual(desired.MaxValue, actual.MaxValue) {
 		changes = append(changes, "max value changed")
 	}
 
-	if !int64PtrEqual(desired.Cache, actual.Cache) {
+	if desired.Cache != nil && !int64PtrEqual(desired.Cache, actual.Cache) {
 		changes = append(changes, "cache changed")
 	}
 
@@ -500,7 +500,7 @@ func compareSequences(desired, actual schema.Sequence) []string {
 		changes = append(changes, "cycle changed")
 	}
 
-	if !sequenceOwnerEqual(desired.OwnedBy, actual.OwnedBy) {
+	if desired.OwnedBy != nil && !sequenceOwnerEqual(desired.OwnedBy, actual.OwnedBy) {
 		changes = append(changes, "owned by changed")
 	}
 
