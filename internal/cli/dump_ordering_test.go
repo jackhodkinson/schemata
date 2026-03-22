@@ -8,9 +8,43 @@ import (
 )
 
 func TestDumpOrdering_FKReferencedSchemaMustSortBeforeReferencing(t *testing.T) {
+	// Build realistic groups: alpha.child has a FK to zeta.parent.
+	// A dependency-aware schema sorter should place zeta before alpha.
 	groups := map[schema.SchemaName][]schema.DatabaseObject{
-		"alpha": nil,
-		"zeta":  nil,
+		"alpha": {
+			schema.Table{
+				Schema: "alpha",
+				Name:   "child",
+				Columns: []schema.Column{
+					{Name: "id", Type: "INTEGER", NotNull: true},
+					{Name: "parent_id", Type: "INTEGER", NotNull: true},
+				},
+				PrimaryKey: &schema.PrimaryKey{Cols: []schema.ColumnName{"id"}},
+				ForeignKeys: []schema.ForeignKey{
+					{
+						Name: "child_parent_fk",
+						Cols: []schema.ColumnName{"parent_id"},
+						Ref: schema.ForeignKeyRef{
+							Schema: "zeta",
+							Table:  "parent",
+							Cols:   []schema.ColumnName{"id"},
+						},
+						OnDelete: schema.NoAction,
+						OnUpdate: schema.NoAction,
+					},
+				},
+			},
+		},
+		"zeta": {
+			schema.Table{
+				Schema: "zeta",
+				Name:   "parent",
+				Columns: []schema.Column{
+					{Name: "id", Type: "INTEGER", NotNull: true},
+				},
+				PrimaryKey: &schema.PrimaryKey{Cols: []schema.ColumnName{"id"}},
+			},
+		},
 	}
 	got := sortedSchemaNames(groups)
 	want := []schema.SchemaName{"zeta", "alpha"}
