@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
-	"github.com/jackhodkinson/schemata/internal/differ"
-	"github.com/jackhodkinson/schemata/internal/migration"
-	"github.com/jackhodkinson/schemata/internal/parser"
 	"github.com/spf13/cobra"
 )
 
@@ -41,6 +39,7 @@ func init() {
 
 func runMigrate(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
+	service := app.NewService(allowCascade)
 
 	// Load config
 	cfg, err := config.Load(cfgFile)
@@ -50,7 +49,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	// Pre-flight check: ensure migrations are in sync with schema.sql
 	fmt.Println("Running pre-flight check (diff --from migrations)...")
-	if err := checkMigrationsInSync(ctx, cfg); err != nil {
+	if err := service.CheckMigrationsInSync(ctx, cfg); err != nil {
 		return fmt.Errorf("pre-flight check failed: %w\n\nHint: Run 'schemata generate <name>' to create a migration for the differences", err)
 	}
 	fmt.Println("✓ Migrations are in sync with schema.sql")
@@ -84,10 +83,9 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	defer targetPool.Close()
 
 	// Scan migrations
-	scanner := migration.NewScanner(cfg.Migrations)
-	migrations, err := scanner.Scan()
+	migrations, err := service.ScanMigrations(cfg.Migrations)
 	if err != nil {
-		return fmt.Errorf("failed to scan migrations: %w", err)
+		return err
 	}
 
 	if len(migrations) == 0 {
@@ -95,108 +93,19 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Load SQL for each migration
-	for i := range migrations {
-		if err := migrations[i].LoadSQL(); err != nil {
-			return fmt.Errorf("failed to load migration %s: %w", migrations[i].Version, err)
-		}
-	}
-
 	// Apply migrations
-	applier := migration.NewApplier(targetPool, migrateDryRun)
-	opts := migration.ApplyOptions{
-		DryRun:          migrateDryRun,
-		ContinueOnError: false,
-	}
-
 	if migrateDryRun {
 		fmt.Println("\n=== DRY RUN MODE ===")
 	}
 
-	if err := applier.Apply(ctx, migrations, opts); err != nil {
-		return fmt.Errorf("failed to apply migrations: %w", err)
+	if err := service.ApplyMigrations(ctx, targetPool, migrations, migrateDryRun); err != nil {
+		return err
 	}
 
 	if migrateDryRun {
 		fmt.Println("\n=== DRY RUN COMPLETE ===")
 	} else {
 		fmt.Println("\nMigrations applied successfully")
-	}
-
-	return nil
-}
-
-// checkMigrationsInSync verifies that applying migrations to dev DB results in schema.sql
-func checkMigrationsInSync(ctx context.Context, cfg *config.Config) error {
-	// Connect to dev database
-	if cfg.Dev == nil {
-		return fmt.Errorf("no dev database configured")
-	}
-
-	devPool, err := db.Connect(ctx, cfg.Dev)
-	if err != nil {
-		return fmt.Errorf("failed to connect to dev database: %w", err)
-	}
-	defer devPool.Close()
-
-	// Apply migrations to dev database
-	if cfg.Migrations != "" {
-		scanner := migration.NewScanner(cfg.Migrations)
-		migrations, err := scanner.Scan()
-		if err != nil {
-			return fmt.Errorf("failed to scan migrations: %w", err)
-		}
-
-		if len(migrations) > 0 {
-			applier := migration.NewApplier(devPool, false)
-			opts := migration.ApplyOptions{
-				DryRun:          false,
-				ContinueOnError: false,
-			}
-
-			if err := applier.Apply(ctx, migrations, opts); err != nil {
-				return fmt.Errorf("failed to apply migrations to dev: %w", err)
-			}
-		}
-	}
-
-	// Parse schema file
-	schemaFile := cfg.Schema.GetSchemaPath()
-	if schemaFile == "" {
-		return fmt.Errorf("no schema file configured")
-	}
-
-	p := parser.NewParser()
-	desiredSchema, err := p.ParseFile(schemaFile)
-	if err != nil {
-		return fmt.Errorf("failed to parse schema file '%s': %w", schemaFile, err)
-	}
-
-	// Query actual schema from dev database
-	catalog := db.NewCatalog(devPool)
-	includeSchemas, excludeSchemas := cfg.Schema.GetSchemaFilters()
-	actualObjects, err := catalog.ExtractAllObjects(ctx, includeSchemas, excludeSchemas)
-	if err != nil {
-		return fmt.Errorf("failed to query dev database schema: %w", err)
-	}
-
-	// Build object map with hashing
-	actualSchema, err := buildObjectMapFromObjects(actualObjects)
-	if err != nil {
-		return fmt.Errorf("failed to build object map: %w", err)
-	}
-
-	// Compute diff
-	d := differ.NewDiffer()
-	diff, err := d.Diff(desiredSchema, actualSchema)
-	if err != nil {
-		return fmt.Errorf("failed to compute diff: %w", err)
-	}
-
-	// Check if in sync
-	if !diff.IsEmpty() {
-		return fmt.Errorf("migrations are out of sync with schema.sql:\n  %d to create, %d to drop, %d to alter",
-			len(diff.ToCreate), len(diff.ToDrop), len(diff.ToAlter))
 	}
 
 	return nil

@@ -34,6 +34,12 @@ func TestGenerateCreateTable(t *testing.T) {
 	assert.Contains(t, stmt, "email TEXT NOT NULL")
 	assert.Contains(t, stmt, "name TEXT")
 	assert.Contains(t, stmt, "PRIMARY KEY (id)")
+	// Column definitions are emitted in sorted name order (email, id, name).
+	emailAt := strings.Index(stmt, "email TEXT")
+	idAt := strings.Index(stmt, "id INTEGER")
+	nameAt := strings.Index(stmt, "name TEXT")
+	assert.Less(t, emailAt, idAt)
+	assert.Less(t, idAt, nameAt)
 }
 
 func TestGenerateCreateTableWithConstraints(t *testing.T) {

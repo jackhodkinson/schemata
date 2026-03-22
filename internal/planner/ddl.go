@@ -85,6 +85,8 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 			structuralKeys = append(structuralKeys, key)
 		}
 	}
+	schema.SortObjectKeys(structuralKeys)
+	schema.SortObjectKeys(dependentKeys)
 
 	// 1. Create structural objects (types, tables, functions, etc.)
 	if len(structuralKeys) > 0 {
@@ -253,10 +255,10 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("CREATE TABLE %s.%s (", tbl.Schema, tbl.Name))
 
-	// Columns
+	// Columns (sorted by name for deterministic DDL; semantic column order in FKs/PK is unchanged)
 	var colDefs []string
 	var columnComments []string
-	for _, col := range tbl.Columns {
+	for _, col := range sortedColumns(tbl.Columns) {
 		base := fmt.Sprintf("  %s %s", col.Name, col.Type)
 		colParts := []string{base}
 
@@ -298,7 +300,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	}
 
 	// Unique constraints
-	for _, uq := range tbl.Uniques {
+	for _, uq := range sortedUniques(tbl.Uniques) {
 		uqCols := make([]string, len(uq.Cols))
 		for i, col := range uq.Cols {
 			uqCols[i] = string(col)
@@ -318,7 +320,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	}
 
 	// Check constraints
-	for _, check := range tbl.Checks {
+	for _, check := range sortedChecks(tbl.Checks) {
 		if check.Name != "" {
 			checkClause := fmt.Sprintf("  CONSTRAINT %s CHECK (%s)", check.Name, check.Expr)
 			if check.NoInherit {
@@ -339,7 +341,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	}
 
 	// Foreign keys
-	for _, fk := range tbl.ForeignKeys {
+	for _, fk := range sortedForeignKeys(tbl.ForeignKeys) {
 		fkCols := make([]string, len(fk.Cols))
 		for i, col := range fk.Cols {
 			fkCols[i] = string(col)
@@ -434,8 +436,9 @@ func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
 	}
 
 	if len(idx.Include) > 0 {
-		includeCols := make([]string, len(idx.Include))
-		for i, col := range idx.Include {
+		inc := sortedIncludeColumns(idx.Include)
+		includeCols := make([]string, len(inc))
+		for i, col := range inc {
 			includeCols[i] = string(col)
 		}
 		stmt += fmt.Sprintf(" INCLUDE (%s)", strings.Join(includeCols, ", "))
@@ -568,8 +571,9 @@ func (g *DDLGenerator) generateCreateExtension(ext schema.Extension) string {
 }
 
 func (g *DDLGenerator) generateCreateTrigger(trig schema.Trigger) string {
-	events := make([]string, len(trig.Events))
-	for i, event := range trig.Events {
+	sev := sortedTriggerEvents(trig.Events)
+	events := make([]string, len(sev))
+	for i, event := range sev {
 		events[i] = string(event)
 	}
 
@@ -595,7 +599,7 @@ func (g *DDLGenerator) generateCreatePolicy(pol schema.Policy) string {
 		pol.Name, pol.Schema, pol.Table, permissive, pol.For)
 
 	if len(pol.To) > 0 {
-		stmt += fmt.Sprintf(" TO %s", strings.Join(pol.To, ", "))
+		stmt += fmt.Sprintf(" TO %s", strings.Join(sortedPolicyRoles(pol.To), ", "))
 	}
 
 	if pol.Using != nil {
@@ -623,7 +627,30 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 		}
 		return g.generateAlterTable(obj, oldTable, alter)
 	case schema.View:
-		// Views: DROP and CREATE
+		if onlyOwnerOrGrantChanges(alter.Changes) {
+			return g.generateAlterViewOwnerAndGrants(obj, alter)
+		}
+		dropStmt, err := g.generateDrop(alter.Key)
+		if err != nil {
+			return nil, err
+		}
+		createStmt, err := g.generateCreate(alter.NewObject)
+		if err != nil {
+			return nil, err
+		}
+		out := []string{dropStmt, createStmt}
+		if obj.Owner != nil {
+			kw := viewAlterKeyword(obj)
+			out = append(out, fmt.Sprintf("ALTER %s %s.%s OWNER TO %s;", kw, obj.Schema, obj.Name, formatRoleIdent(*obj.Owner)))
+		}
+		out = append(out, grantStatementsFromView(obj)...)
+		return out, nil
+	case schema.Function:
+		return g.generateAlterFunction(obj, alter)
+	case schema.Sequence:
+		if onlyOwnerOrGrantChanges(alter.Changes) {
+			return g.generateAlterSequenceOwnerAndGrants(obj, alter)
+		}
 		dropStmt, err := g.generateDrop(alter.Key)
 		if err != nil {
 			return nil, err
@@ -633,9 +660,6 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 			return nil, err
 		}
 		return []string{dropStmt, createStmt}, nil
-	case schema.Function:
-		// Functions: CREATE OR REPLACE
-		return []string{g.generateCreateFunction(obj)}, nil
 	default:
 		// For other objects, drop and recreate
 		dropStmt, err := g.generateDrop(alter.Key)
@@ -682,7 +706,20 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 
 	// Process each change and generate appropriate DDL
 	for _, change := range alter.Changes {
-		if strings.HasPrefix(change, "add column ") {
+		if change == "owner changed" {
+			if tbl.Owner != nil {
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s OWNER TO %s;", tbl.Schema, tbl.Name, formatRoleIdent(*tbl.Owner)))
+			}
+		} else if strings.HasPrefix(change, "add grant\t") || strings.HasPrefix(change, "revoke grant\t") {
+			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(change)
+			if ok {
+				if revoke {
+					statements = append(statements, formatTableRevoke(tbl, grantee, privs, grantable))
+				} else {
+					statements = append(statements, formatTableGrant(tbl, grantee, privs, grantable))
+				}
+			}
+		} else if strings.HasPrefix(change, "add column ") {
 			colName := schema.ColumnName(strings.TrimPrefix(change, "add column "))
 			if col, exists := colMap[colName]; exists {
 				base := fmt.Sprintf("%s %s", col.Name, col.Type)

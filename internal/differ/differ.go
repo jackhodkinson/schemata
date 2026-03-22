@@ -2,6 +2,7 @@ package differ
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
@@ -50,6 +51,7 @@ func (d *Differ) Diff(desired, actual schema.SchemaObjectMap) (*Diff, error) {
 			diff.ToCreate = append(diff.ToCreate, key)
 		}
 	}
+	schema.SortObjectKeys(diff.ToCreate)
 
 	// Find objects to drop (in actual but not in desired)
 	for key := range actual {
@@ -57,6 +59,7 @@ func (d *Differ) Diff(desired, actual schema.SchemaObjectMap) (*Diff, error) {
 			diff.ToDrop = append(diff.ToDrop, key)
 		}
 	}
+	schema.SortObjectKeys(diff.ToDrop)
 
 	// Find objects that might need altering (in both, but different hashes)
 	for key := range desired {
@@ -72,6 +75,7 @@ func (d *Differ) Diff(desired, actual schema.SchemaObjectMap) (*Diff, error) {
 				}
 
 				if len(changes) > 0 {
+					SortAlterChanges(changes)
 					diff.ToAlter = append(diff.ToAlter, AlterOperation{
 						Key:       key,
 						Changes:   changes,
@@ -82,6 +86,9 @@ func (d *Differ) Diff(desired, actual schema.SchemaObjectMap) (*Diff, error) {
 			}
 		}
 	}
+	sort.Slice(diff.ToAlter, func(i, j int) bool {
+		return schema.ObjectKeyLess(diff.ToAlter[i].Key, diff.ToAlter[j].Key)
+	})
 
 	return diff, nil
 }

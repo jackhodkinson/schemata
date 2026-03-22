@@ -1,0 +1,243 @@
+package app
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackhodkinson/schemata/internal/config"
+	"github.com/jackhodkinson/schemata/internal/db"
+	"github.com/jackhodkinson/schemata/internal/differ"
+	"github.com/jackhodkinson/schemata/internal/migration"
+	"github.com/jackhodkinson/schemata/internal/parser"
+	"github.com/jackhodkinson/schemata/internal/planner"
+	"github.com/jackhodkinson/schemata/pkg/schema"
+)
+
+// Service holds application-level orchestration logic used by CLI commands.
+type Service struct {
+	allowCascade bool
+}
+
+func NewService(allowCascade bool) *Service {
+	return &Service{allowCascade: allowCascade}
+}
+
+func (s *Service) ScanMigrations(migrationsDir string) ([]migration.Migration, error) {
+	scanner := migration.NewScanner(migrationsDir)
+	migrations, err := scanner.Scan()
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan migrations: %w", err)
+	}
+	return migrations, nil
+}
+
+func (s *Service) ApplyMigrations(ctx context.Context, pool *db.Pool, migrations []migration.Migration, dryRun bool) error {
+	applier := migration.NewApplier(pool, dryRun)
+	opts := migration.ApplyOptions{
+		DryRun:          dryRun,
+		ContinueOnError: false,
+	}
+	if err := applier.Apply(ctx, migrations, opts); err != nil {
+		return fmt.Errorf("failed to apply migrations: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) ParseSchemaFile(schemaFile string) (schema.SchemaObjectMap, error) {
+	if schemaFile == "" {
+		return nil, fmt.Errorf("no schema file configured")
+	}
+	p := parser.NewParser()
+	desiredSchema, err := p.ParseFile(schemaFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse schema file '%s': %w", schemaFile, err)
+	}
+	return desiredSchema, nil
+}
+
+func (s *Service) ExtractSchemaFromDB(ctx context.Context, pool *db.Pool, cfg *config.Config) (schema.SchemaObjectMap, error) {
+	catalog := db.NewCatalog(pool)
+	includeSchemas, excludeSchemas := cfg.Schema.GetSchemaFilters()
+	actualObjects, err := catalog.ExtractAllObjects(ctx, includeSchemas, excludeSchemas)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query database schema: %w", err)
+	}
+
+	actualSchema, err := s.BuildObjectMapFromObjects(actualObjects)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build object map: %w", err)
+	}
+
+	return actualSchema, nil
+}
+
+func (s *Service) ComputeDiff(desired, actual schema.SchemaObjectMap) (*differ.Diff, error) {
+	d := differ.NewDiffer()
+	diff, err := d.Diff(desired, actual)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute diff: %w", err)
+	}
+	return diff, nil
+}
+
+func (s *Service) GenerateDDL(diff *differ.Diff, desired schema.SchemaObjectMap) (string, error) {
+	ddlGen := planner.NewDDLGenerator(planner.WithAllowCascade(s.allowCascade))
+	ddl, err := ddlGen.GenerateDDL(diff, desired)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate DDL: %w", err)
+	}
+	return ddl, nil
+}
+
+func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config) error {
+	if cfg.Dev == nil {
+		return fmt.Errorf("no dev database configured")
+	}
+
+	devPool, err := db.Connect(ctx, cfg.Dev)
+	if err != nil {
+		return fmt.Errorf("failed to connect to dev database: %w", err)
+	}
+	defer devPool.Close()
+
+	if cfg.Migrations != "" {
+		migrations, err := s.ScanMigrations(cfg.Migrations)
+		if err != nil {
+			return err
+		}
+		if len(migrations) > 0 {
+			if err := s.ApplyMigrations(ctx, devPool, migrations, false); err != nil {
+				return fmt.Errorf("failed to apply migrations to dev: %w", err)
+			}
+		}
+	}
+
+	schemaFile := cfg.Schema.GetSchemaPath()
+	desiredSchema, err := s.ParseSchemaFile(schemaFile)
+	if err != nil {
+		return err
+	}
+
+	actualSchema, err := s.ExtractSchemaFromDB(ctx, devPool, cfg)
+	if err != nil {
+		return fmt.Errorf("failed to query dev database schema: %w", err)
+	}
+
+	diff, err := s.ComputeDiff(desiredSchema, actualSchema)
+	if err != nil {
+		return err
+	}
+
+	if !diff.IsEmpty() {
+		return fmt.Errorf("migrations are out of sync with schema.sql:\n  %d to create, %d to drop, %d to alter",
+			len(diff.ToCreate), len(diff.ToDrop), len(diff.ToAlter))
+	}
+
+	return nil
+}
+
+func (s *Service) DropAllObjects(ctx context.Context, pool *db.Pool) error {
+	query := `
+		SELECT nspname
+		FROM pg_namespace
+		WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'schemata')
+		  AND nspname NOT LIKE 'pg_temp_%'
+		  AND nspname NOT LIKE 'pg_toast_temp_%'
+		ORDER BY nspname
+	`
+
+	rows, err := pool.Query(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to query schemas: %w", err)
+	}
+	defer rows.Close()
+
+	var schemas []string
+	for rows.Next() {
+		var schemaName string
+		if err := rows.Scan(&schemaName); err != nil {
+			return fmt.Errorf("failed to scan schema name: %w", err)
+		}
+		schemas = append(schemas, schemaName)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error reading schema rows: %w", err)
+	}
+
+	dropMode := "RESTRICT"
+	if s.allowCascade {
+		dropMode = "CASCADE"
+	}
+
+	for _, schemaName := range schemas {
+		dropSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS %s %s", schemaName, dropMode)
+		if _, err := pool.Exec(ctx, dropSQL); err != nil {
+			if !s.allowCascade {
+				return fmt.Errorf("failed to drop schema %s: %w\n\nHint: Schema has dependent objects. Use --allow-cascade to drop with CASCADE (this will drop all dependent objects)", schemaName, err)
+			}
+			return fmt.Errorf("failed to drop schema %s: %w", schemaName, err)
+		}
+
+		createSQL := fmt.Sprintf("CREATE SCHEMA %s", schemaName)
+		if _, err := pool.Exec(ctx, createSQL); err != nil {
+			return fmt.Errorf("failed to create schema %s: %w", schemaName, err)
+		}
+	}
+
+	dropTrackingSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS schemata %s", dropMode)
+	if _, err := pool.Exec(ctx, dropTrackingSQL); err != nil {
+		if !s.allowCascade {
+			return fmt.Errorf("failed to drop schemata tracking schema: %w\n\nHint: Schema has dependent objects. Use --allow-cascade to drop with CASCADE (this will drop all dependent objects)", err)
+		}
+		return fmt.Errorf("failed to drop schemata tracking schema: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Service) BuildObjectMapFromObjects(objects []schema.DatabaseObject) (schema.SchemaObjectMap, error) {
+	objectMap := make(schema.SchemaObjectMap)
+	for _, obj := range objects {
+		key := getObjectKey(obj)
+		hash, err := differ.NormalizeAndHash(obj)
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash object %v: %w", key, err)
+		}
+		objectMap[key] = schema.HashedObject{
+			Hash:    hash,
+			Payload: obj,
+		}
+	}
+	return objectMap, nil
+}
+
+func getObjectKey(obj schema.DatabaseObject) schema.ObjectKey {
+	switch v := obj.(type) {
+	case schema.Table:
+		return schema.ObjectKey{Kind: schema.TableKind, Schema: v.Schema, Name: string(v.Name)}
+	case schema.Index:
+		return schema.ObjectKey{Kind: schema.IndexKind, Schema: v.Schema, Name: v.Name, TableName: v.Table}
+	case schema.View:
+		return schema.ObjectKey{Kind: schema.ViewKind, Schema: v.Schema, Name: v.Name}
+	case schema.Function:
+		return schema.ObjectKey{Kind: schema.FunctionKind, Schema: v.Schema, Name: v.Name, Signature: schema.FunctionSignature(v.Args)}
+	case schema.Sequence:
+		return schema.ObjectKey{Kind: schema.SequenceKind, Schema: v.Schema, Name: v.Name}
+	case schema.EnumDef:
+		return schema.ObjectKey{Kind: schema.TypeKind, Schema: v.Schema, Name: string(v.Name)}
+	case schema.DomainDef:
+		return schema.ObjectKey{Kind: schema.TypeKind, Schema: v.Schema, Name: string(v.Name)}
+	case schema.CompositeDef:
+		return schema.ObjectKey{Kind: schema.TypeKind, Schema: v.Schema, Name: string(v.Name)}
+	case schema.Trigger:
+		return schema.ObjectKey{Kind: schema.TriggerKind, Schema: v.Schema, Name: v.Name, TableName: v.Table}
+	case schema.Policy:
+		return schema.ObjectKey{Kind: schema.PolicyKind, Schema: v.Schema, Name: v.Name, TableName: v.Table}
+	case schema.Extension:
+		return schema.ObjectKey{Kind: schema.ExtensionKind, Schema: v.Schema, Name: v.Name}
+	case schema.Schema:
+		return schema.ObjectKey{Kind: schema.SchemaKind, Schema: v.Name, Name: string(v.Name)}
+	default:
+		return schema.ObjectKey{}
+	}
+}

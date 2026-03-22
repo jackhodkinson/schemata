@@ -29,21 +29,22 @@ func compareTables(desired, actual schema.Table) []string {
 	}
 
 	// Find added columns
-	for name := range desiredCols {
+	for _, name := range sortedColumnNames(desiredCols) {
 		if _, exists := actualCols[name]; !exists {
 			changes = append(changes, fmt.Sprintf("add column %s", name))
 		}
 	}
 
 	// Find dropped columns
-	for name := range actualCols {
+	for _, name := range sortedColumnNames(actualCols) {
 		if _, exists := desiredCols[name]; !exists {
 			changes = append(changes, fmt.Sprintf("drop column %s", name))
 		}
 	}
 
 	// Find altered columns
-	for name, desiredCol := range desiredCols {
+	for _, name := range sortedColumnNames(desiredCols) {
+		desiredCol := desiredCols[name]
 		if actualCol, exists := actualCols[name]; exists {
 			colChanges := compareColumns(desiredCol, actualCol)
 			for _, change := range colChanges {
@@ -77,6 +78,8 @@ func compareTables(desired, actual schema.Table) []string {
 	if !stringPtrEqual(desired.Comment, actual.Comment) {
 		changes = append(changes, "comment changed")
 	}
+
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
 }
@@ -174,21 +177,22 @@ func compareUniqueConstraints(desired, actual []schema.UniqueConstraint) []strin
 	}
 
 	// Find added constraints
-	for name := range desiredMap {
+	for _, name := range sortedUniqueConstraintNames(desiredMap) {
 		if _, exists := actualMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("add unique constraint %s", name))
 		}
 	}
 
 	// Find dropped constraints
-	for name := range actualMap {
+	for _, name := range sortedUniqueConstraintNames(actualMap) {
 		if _, exists := desiredMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("drop unique constraint %s", name))
 		}
 	}
 
 	// Find altered constraints
-	for name, desiredUq := range desiredMap {
+	for _, name := range sortedUniqueConstraintNames(desiredMap) {
+		desiredUq := desiredMap[name]
 		if actualUq, exists := actualMap[name]; exists {
 			if !columnSliceEqual(desiredUq.Cols, actualUq.Cols) {
 				changes = append(changes, fmt.Sprintf("unique constraint %s columns changed", name))
@@ -226,21 +230,22 @@ func compareCheckConstraints(desired, actual []schema.CheckConstraint) []string 
 	}
 
 	// Find added constraints
-	for name := range desiredMap {
+	for _, name := range sortedCheckConstraintNames(desiredMap) {
 		if _, exists := actualMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("add check constraint %s", name))
 		}
 	}
 
 	// Find dropped constraints
-	for name := range actualMap {
+	for _, name := range sortedCheckConstraintNames(actualMap) {
 		if _, exists := desiredMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("drop check constraint %s", name))
 		}
 	}
 
 	// Find altered constraints
-	for name, desiredCk := range desiredMap {
+	for _, name := range sortedCheckConstraintNames(desiredMap) {
+		desiredCk := desiredMap[name]
 		if actualCk, exists := actualMap[name]; exists {
 			if desiredCk.Expr != actualCk.Expr {
 				changes = append(changes, fmt.Sprintf("check constraint %s expression changed", name))
@@ -278,21 +283,22 @@ func compareForeignKeys(desired, actual []schema.ForeignKey) []string {
 	}
 
 	// Find added constraints
-	for name := range desiredMap {
+	for _, name := range sortedForeignKeyNames(desiredMap) {
 		if _, exists := actualMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("add foreign key %s", name))
 		}
 	}
 
 	// Find dropped constraints
-	for name := range actualMap {
+	for _, name := range sortedForeignKeyNames(actualMap) {
 		if _, exists := desiredMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("drop foreign key %s", name))
 		}
 	}
 
 	// Find altered constraints
-	for name, desiredFk := range desiredMap {
+	for _, name := range sortedForeignKeyNames(desiredMap) {
+		desiredFk := desiredMap[name]
 		if actualFk, exists := actualMap[name]; exists {
 			if !columnSliceEqual(desiredFk.Cols, actualFk.Cols) {
 				changes = append(changes, fmt.Sprintf("foreign key %s columns changed", name))
@@ -395,12 +401,18 @@ func compareViews(desired, actual schema.View) []string {
 		changes = append(changes, "comment changed")
 	}
 
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
+
 	return changes
 }
 
 // compareFunctions compares two function objects
 func compareFunctions(desired, actual schema.Function) []string {
 	var changes []string
+
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
+		changes = append(changes, "owner changed")
+	}
 
 	if desired.Language != actual.Language {
 		changes = append(changes, "language changed")
@@ -447,12 +459,18 @@ func compareFunctions(desired, actual schema.Function) []string {
 		changes = append(changes, "comment changed")
 	}
 
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
+
 	return changes
 }
 
 // compareSequences compares two sequence objects
 func compareSequences(desired, actual schema.Sequence) []string {
 	var changes []string
+
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
+		changes = append(changes, "owner changed")
+	}
 
 	if desired.Type != actual.Type {
 		changes = append(changes, "type changed")
@@ -485,6 +503,8 @@ func compareSequences(desired, actual schema.Sequence) []string {
 	if !sequenceOwnerEqual(desired.OwnedBy, actual.OwnedBy) {
 		changes = append(changes, "owned by changed")
 	}
+
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
 }
@@ -570,20 +590,21 @@ func compareComposites(desired, actual schema.CompositeDef) []string {
 	}
 
 	// Check for added/removed attributes
-	for name := range desiredMap {
+	for _, name := range sortedCompositeAttrNames(desiredMap) {
 		if _, exists := actualMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("add attribute %s", name))
 		}
 	}
 
-	for name := range actualMap {
+	for _, name := range sortedCompositeAttrNames(actualMap) {
 		if _, exists := desiredMap[name]; !exists {
 			changes = append(changes, fmt.Sprintf("drop attribute %s", name))
 		}
 	}
 
 	// Check for type changes in common attributes
-	for name, desiredAttr := range desiredMap {
+	for _, name := range sortedCompositeAttrNames(desiredMap) {
+		desiredAttr := desiredMap[name]
 		if actualAttr, exists := actualMap[name]; exists {
 			if desiredAttr.Type != actualAttr.Type {
 				changes = append(changes, fmt.Sprintf("attribute %s type changed", name))
@@ -888,4 +909,49 @@ func triggerEventSliceEqual(a, b []schema.TriggerEvent) bool {
 
 func qualifiedNameEqual(a, b schema.QualifiedName) bool {
 	return a.Schema == b.Schema && a.Name == b.Name
+}
+
+func sortedColumnNames(m map[schema.ColumnName]schema.Column) []schema.ColumnName {
+	keys := make([]schema.ColumnName, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
+
+func sortedUniqueConstraintNames(m map[string]schema.UniqueConstraint) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedCheckConstraintNames(m map[string]schema.CheckConstraint) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedForeignKeyNames(m map[string]schema.ForeignKey) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedCompositeAttrNames(m map[string]schema.CompositeAttr) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

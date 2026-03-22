@@ -83,6 +83,8 @@ func (p *Parser) ParseSQL(sql string) (schema.SchemaObjectMap, error) {
 		objects = p.applyCommentInstructions(objects, comments)
 	}
 
+	objects = p.mergeGrantsAndOwners(objects, result)
+
 	// Build object map with hashing
 	return p.buildObjectMap(objects)
 }
@@ -137,16 +139,10 @@ func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, erro
 		return p.parseCreateExtension(node.CreateExtensionStmt)
 	case *pg_query.Node_CreateSchemaStmt:
 		return p.parseCreateSchema(node.CreateSchemaStmt)
-	case *pg_query.Node_GrantStmt:
-		return nil, &UnsupportedStatementError{
-			StatementType: fmt.Sprintf("%T", node),
-			Remediation:   "schemata does not currently model GRANT/REVOKE; remove it from the schema file or apply it separately",
-		}
-	case *pg_query.Node_AlterOwnerStmt:
-		return nil, &UnsupportedStatementError{
-			StatementType: fmt.Sprintf("%T", node),
-			Remediation:   "schemata does not currently model ownership changes; remove it from the schema file or apply it separately",
-		}
+	case *pg_query.Node_GrantStmt,
+		*pg_query.Node_AlterOwnerStmt:
+		// Handled in mergeGrantsAndOwners after object extraction.
+		return nil, nil
 	case *pg_query.Node_VariableSetStmt,
 		*pg_query.Node_VariableShowStmt,
 		*pg_query.Node_TransactionStmt,

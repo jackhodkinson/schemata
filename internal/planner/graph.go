@@ -60,7 +60,8 @@ func BuildGraph(objectMap schema.SchemaObjectMap) *DependencyGraph {
 	return graph
 }
 
-// addDependenciesForObject adds dependencies for a specific object
+// addDependenciesForObject adds dependencies for a specific object.
+// Table/view/function sequence privileges (Grants) are modeled on the object itself and do not add separate graph nodes.
 func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj schema.DatabaseObject, objectMap schema.SchemaObjectMap) {
 	switch v := obj.(type) {
 	case schema.Table:
@@ -301,19 +302,9 @@ func (g *DependencyGraph) DetectCycle() ([]schema.ObjectKey, error) {
 	return nil, nil
 }
 
-// compareKeys provides a deterministic ordering for ObjectKeys
+// compareKeys provides a deterministic ordering for ObjectKeys.
 func compareKeys(a, b schema.ObjectKey) bool {
-	// Order by: kind, schema, name, table (for constraints/indexes)
-	if a.Kind != b.Kind {
-		return a.Kind < b.Kind
-	}
-	if a.Schema != b.Schema {
-		return a.Schema < b.Schema
-	}
-	if a.Name != b.Name {
-		return a.Name < b.Name
-	}
-	return a.TableName < b.TableName
+	return schema.ObjectKeyLess(a, b)
 }
 
 // FilterGraphForKeys creates a subgraph containing only the specified keys

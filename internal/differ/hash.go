@@ -122,6 +122,8 @@ func normalizeTable(tbl schema.Table) schema.Table {
 		tbl.RelOptions = sorted
 	}
 
+	tbl.Grants = schema.CanonicalizeGrants(tbl.Grants)
+
 	return tbl
 }
 
@@ -154,20 +156,24 @@ func normalizeIndex(idx schema.Index) schema.Index {
 func normalizeView(view schema.View) schema.View {
 	query := strings.TrimSpace(view.Definition.Query)
 	if query == "" {
+		view.Grants = schema.CanonicalizeGrants(view.Grants)
 		return view
 	}
 
 	parsed, err := pg_query.Parse(query)
 	if err != nil {
+		view.Grants = schema.CanonicalizeGrants(view.Grants)
 		return view
 	}
 	deparsed, err := pg_query.Deparse(parsed)
 	if err != nil {
+		view.Grants = schema.CanonicalizeGrants(view.Grants)
 		return view
 	}
 	deparsed = strings.TrimSpace(deparsed)
 	deparsed = strings.TrimSuffix(deparsed, ";")
 	view.Definition.Query = deparsed
+	view.Grants = schema.CanonicalizeGrants(view.Grants)
 	return view
 }
 
@@ -205,6 +211,8 @@ func normalizeFunction(fn schema.Function) schema.Function {
 		return sortedPath[i] < sortedPath[j]
 	})
 	fn.SearchPath = sortedPath
+
+	fn.Grants = schema.CanonicalizeGrants(fn.Grants)
 
 	return fn
 }
@@ -344,7 +352,7 @@ func isDollarTagChar(ch byte) bool {
 }
 
 func normalizeSequence(seq schema.Sequence) schema.Sequence {
-	// Sequences don't need special normalization
+	seq.Grants = schema.CanonicalizeGrants(seq.Grants)
 	return seq
 }
 

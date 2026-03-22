@@ -300,6 +300,8 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 		SELECT
 			n.nspname as schema,
 			c.relname as name,
+			c.oid,
+			pg_get_userbyid(c.relowner) as owner,
 			s.seqtypid::regtype::text as type,
 			s.seqstart as start_value,
 			s.seqincrement as increment,
@@ -331,12 +333,16 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 	for rows.Next() {
 		var seq schema.Sequence
 		var ownedBySchema, ownedByTable, ownedByColumn *string
+		var oid uint32
+		var owner *string
 
-		if err := rows.Scan(&seq.Schema, &seq.Name, &seq.Type, &seq.Start, &seq.Increment,
+		if err := rows.Scan(&seq.Schema, &seq.Name, &oid, &owner, &seq.Type, &seq.Start, &seq.Increment,
 			&seq.MinValue, &seq.MaxValue, &seq.Cache, &seq.Cycle,
 			&ownedBySchema, &ownedByTable, &ownedByColumn); err != nil {
 			return nil, err
 		}
+
+		seq.Owner = owner
 
 		if ownedBySchema != nil && ownedByTable != nil && ownedByColumn != nil {
 			seq.OwnedBy = &schema.SequenceOwner{
@@ -345,6 +351,12 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 				Column: schema.ColumnName(*ownedByColumn),
 			}
 		}
+
+		grants, err := c.extractRelationACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for sequence %s.%s: %w", seq.Schema, seq.Name, err)
+		}
+		seq.Grants = grants
 
 		objects = append(objects, seq)
 	}
@@ -358,6 +370,7 @@ func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]sch
 		SELECT
 			n.nspname as schema,
 			c.relname as table_name,
+			c.oid,
 			pg_get_userbyid(c.relowner) as owner,
 			c.reloptions,
 			obj_description(c.oid, 'pg_class') as comment
@@ -378,14 +391,21 @@ func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]sch
 		var tbl schema.Table
 		var relOptions []string
 		var owner, comment *string
+		var oid uint32
 
-		if err := rows.Scan(&tbl.Schema, &tbl.Name, &owner, &relOptions, &comment); err != nil {
+		if err := rows.Scan(&tbl.Schema, &tbl.Name, &oid, &owner, &relOptions, &comment); err != nil {
 			return nil, err
 		}
 
 		tbl.Owner = owner
 		tbl.RelOptions = relOptions
 		tbl.Comment = comment
+
+		grants, err := c.extractRelationACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for table %s.%s: %w", tbl.Schema, tbl.Name, err)
+		}
+		tbl.Grants = grants
 
 		// Extract columns for this table
 		columns, err := c.extractColumns(ctx, tbl.Schema, tbl.Name)
@@ -955,6 +975,7 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 		SELECT
 			n.nspname as schema,
 			c.relname as name,
+			c.oid,
 			pg_get_userbyid(c.relowner) as owner,
 			c.relkind = 'm' as is_materialized,
 			pg_get_viewdef(c.oid, true) as definition,
@@ -977,8 +998,9 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 		var owner, comment *string
 		var isMaterialized bool
 		var definition string
+		var oid uint32
 
-		if err := rows.Scan(&view.Schema, &view.Name, &owner, &isMaterialized, &definition, &comment); err != nil {
+		if err := rows.Scan(&view.Schema, &view.Name, &oid, &owner, &isMaterialized, &definition, &comment); err != nil {
 			return nil, err
 		}
 
@@ -993,6 +1015,12 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 		view.Definition = schema.ViewDefinition{
 			Query: definition,
 		}
+
+		grants, err := c.extractRelationACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for view %s.%s: %w", view.Schema, view.Name, err)
+		}
+		view.Grants = grants
 
 		objects = append(objects, view)
 	}
@@ -1082,6 +1110,8 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 		SELECT
 			n.nspname as schema,
 			p.proname as name,
+			p.oid,
+			pg_get_userbyid(p.proowner) as owner,
 			pg_get_function_identity_arguments(p.oid) as args,
 			pg_get_function_result(p.oid) as returns,
 			l.lanname as language,
@@ -1113,10 +1143,14 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 		var args, returns, language, volatility, parallel, source string
 		var isStrict, securityDefiner bool
 		var comment *string
+		var oid uint32
+		var owner *string
 
-		if err := rows.Scan(&fn.Schema, &fn.Name, &args, &returns, &language, &volatility, &isStrict, &securityDefiner, &parallel, &source, &comment); err != nil {
+		if err := rows.Scan(&fn.Schema, &fn.Name, &oid, &owner, &args, &returns, &language, &volatility, &isStrict, &securityDefiner, &parallel, &source, &comment); err != nil {
 			return nil, err
 		}
+
+		fn.Owner = owner
 
 		parsedArgs, err := parseFunctionIdentityArguments(args)
 		if err != nil {
@@ -1159,6 +1193,12 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			return nil, fmt.Errorf("failed to parse function %s.%s return %q: %w", fn.Schema, fn.Name, returns, err)
 		}
 		fn.Returns = parsedReturn
+
+		grants, err := c.extractFunctionACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for function %s.%s: %w", fn.Schema, fn.Name, err)
+		}
+		fn.Grants = grants
 
 		objects = append(objects, fn)
 	}

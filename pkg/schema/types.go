@@ -129,6 +129,7 @@ func (CompositeDef) isDBType()                 {}
 type Sequence struct {
 	Schema    SchemaName
 	Name      string
+	Owner     *string
 	Type      string // "bigint", "integer", "smallint"
 	Start     *int64
 	Increment *int64
@@ -137,6 +138,7 @@ type Sequence struct {
 	Cache     *int64
 	Cycle     bool
 	OwnedBy   *SequenceOwner
+	Grants    []Grant
 }
 
 type SequenceOwner struct {
@@ -162,6 +164,7 @@ type Table struct {
 	ForeignKeys []ForeignKey
 	Partition   *PartitionSpec
 	Inherits    []QualifiedName
+	Grants      []Grant
 }
 
 func (Table) isDatabaseObject()         {}
@@ -381,6 +384,7 @@ type OutputColumn struct {
 type Function struct {
 	Schema          SchemaName
 	Name            string
+	Owner           *string
 	Args            []FunctionArg
 	Returns         FunctionReturn
 	Language        Language
@@ -391,6 +395,7 @@ type Function struct {
 	Body            string
 	Parallel        ParallelSafety
 	Comment         *string
+	Grants          []Grant
 }
 
 func (Function) isDatabaseObject()         {}

@@ -4,12 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
-	"github.com/jackhodkinson/schemata/internal/differ"
-	"github.com/jackhodkinson/schemata/internal/migration"
-	"github.com/jackhodkinson/schemata/internal/parser"
-	"github.com/jackhodkinson/schemata/internal/planner"
 	"github.com/spf13/cobra"
 )
 
@@ -43,6 +40,7 @@ func init() {
 
 func runDiff(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
+	service := app.NewService(allowCascade)
 
 	// Load configuration
 	cfg, err := config.Load(cfgFile)
@@ -89,7 +87,11 @@ func runDiff(cmd *cobra.Command, args []string) error {
 
 	// If comparing from migrations, apply them first
 	if diffFrom == "migrations" {
-		if err := applyMigrationsForDiff(ctx, cfg, pool); err != nil {
+		migrations, err := service.ScanMigrations(cfg.Migrations)
+		if err != nil {
+			return err
+		}
+		if err := service.ApplyMigrations(ctx, pool, migrations, false); err != nil {
 			return fmt.Errorf("failed to apply migrations to dev: %w", err)
 		}
 	}
@@ -100,10 +102,9 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no schema file configured")
 	}
 
-	p := parser.NewParser()
-	desiredSchema, err := p.ParseFile(schemaFile)
+	desiredSchema, err := service.ParseSchemaFile(schemaFile)
 	if err != nil {
-		return fmt.Errorf("failed to parse schema file '%s': %w", schemaFile, err)
+		return err
 	}
 
 	if verbose {
@@ -111,17 +112,9 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	}
 
 	// Query actual schema from database
-	catalog := db.NewCatalog(pool)
-	includeSchemas, excludeSchemas := cfg.Schema.GetSchemaFilters()
-	actualObjects, err := catalog.ExtractAllObjects(ctx, includeSchemas, excludeSchemas)
+	actualSchema, err := service.ExtractSchemaFromDB(ctx, pool, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to query database schema: %w", err)
-	}
-
-	// Build object map with hashing (reuse parser's buildObjectMap logic)
-	actualSchema, err := buildObjectMapFromObjects(actualObjects)
-	if err != nil {
-		return fmt.Errorf("failed to build object map: %w", err)
+		return err
 	}
 
 	if verbose {
@@ -129,10 +122,9 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	}
 
 	// Compute diff
-	d := differ.NewDiffer()
-	diff, err := d.Diff(desiredSchema, actualSchema)
+	diff, err := service.ComputeDiff(desiredSchema, actualSchema)
 	if err != nil {
-		return fmt.Errorf("failed to compute diff: %w", err)
+		return err
 	}
 
 	// Display results
@@ -176,45 +168,13 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	// Generate DDL preview
 	fmt.Println("DDL Preview:")
 	fmt.Println("---")
-	ddlGen := planner.NewDDLGenerator(planner.WithAllowCascade(allowCascade))
-	ddl, err := ddlGen.GenerateDDL(diff, desiredSchema)
+	ddl, err := service.GenerateDDL(diff, desiredSchema)
 	if err != nil {
-		return fmt.Errorf("failed to generate DDL: %w", err)
+		return err
 	}
 	fmt.Println(ddl)
 	fmt.Println("---")
 
 	// Return error to indicate differences found (Cobra will handle exit code)
 	return fmt.Errorf("schemas differ")
-}
-
-func applyMigrationsForDiff(ctx context.Context, cfg *config.Config, pool *db.Pool) error {
-	if cfg.Migrations == "" {
-		return fmt.Errorf("no migrations directory configured")
-	}
-
-	scanner := migration.NewScanner(cfg.Migrations)
-	migrations, err := scanner.Scan()
-	if err != nil {
-		return fmt.Errorf("failed to scan migrations: %w", err)
-	}
-
-	if len(migrations) == 0 {
-		if verbose {
-			fmt.Println("No migrations to apply")
-		}
-		return nil
-	}
-
-	applier := migration.NewApplier(pool, false)
-	opts := migration.ApplyOptions{
-		DryRun:          false,
-		ContinueOnError: false,
-	}
-
-	if verbose {
-		fmt.Printf("Applying %d migrations to dev database...\n", len(migrations))
-	}
-
-	return applier.Apply(ctx, migrations, opts)
 }

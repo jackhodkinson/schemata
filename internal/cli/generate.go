@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
-	"github.com/jackhodkinson/schemata/internal/differ"
 	"github.com/jackhodkinson/schemata/internal/migration"
-	"github.com/jackhodkinson/schemata/internal/parser"
-	"github.com/jackhodkinson/schemata/internal/planner"
 	"github.com/spf13/cobra"
 )
 
@@ -36,6 +34,7 @@ Examples:
 func runGenerate(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	migrationName := args[0]
+	service := app.NewService(allowCascade)
 
 	// Load configuration
 	cfg, err := config.Load(cfgFile)
@@ -63,20 +62,13 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 1: Apply all existing migrations to dev database
 	fmt.Println("Applying existing migrations to dev database...")
-	scanner := migration.NewScanner(cfg.Migrations)
-	migrations, err := scanner.Scan()
+	migrations, err := service.ScanMigrations(cfg.Migrations)
 	if err != nil {
-		return fmt.Errorf("failed to scan migrations: %w", err)
+		return err
 	}
 
 	if len(migrations) > 0 {
-		applier := migration.NewApplier(pool, false)
-		opts := migration.ApplyOptions{
-			DryRun:          false,
-			ContinueOnError: false,
-		}
-
-		if err := applier.Apply(ctx, migrations, opts); err != nil {
+		if err := service.ApplyMigrations(ctx, pool, migrations, false); err != nil {
 			return fmt.Errorf("failed to apply migrations to dev: %w", err)
 		}
 	} else {
@@ -87,10 +79,9 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 2: Parse schema.sql to get desired state
 	fmt.Printf("Parsing schema file: %s\n", schemaFile)
-	p := parser.NewParser()
-	desiredSchema, err := p.ParseFile(schemaFile)
+	desiredSchema, err := service.ParseSchemaFile(schemaFile)
 	if err != nil {
-		return fmt.Errorf("failed to parse schema file '%s': %w", schemaFile, err)
+		return err
 	}
 
 	if verbose {
@@ -99,17 +90,9 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 3: Query actual schema from dev database
 	fmt.Println("Querying dev database schema...")
-	catalog := db.NewCatalog(pool)
-	includeSchemas, excludeSchemas := cfg.Schema.GetSchemaFilters()
-	actualObjects, err := catalog.ExtractAllObjects(ctx, includeSchemas, excludeSchemas)
+	actualSchema, err := service.ExtractSchemaFromDB(ctx, pool, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to query database schema: %w", err)
-	}
-
-	// Build object map with hashing
-	actualSchema, err := buildObjectMapFromObjects(actualObjects)
-	if err != nil {
-		return fmt.Errorf("failed to build object map: %w", err)
+		return err
 	}
 
 	if verbose {
@@ -118,10 +101,9 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 4: Compute diff between desired and actual
 	fmt.Println("Computing schema differences...")
-	d := differ.NewDiffer()
-	diff, err := d.Diff(desiredSchema, actualSchema)
+	diff, err := service.ComputeDiff(desiredSchema, actualSchema)
 	if err != nil {
-		return fmt.Errorf("failed to compute diff: %w", err)
+		return err
 	}
 
 	// Check if there are any differences
@@ -145,10 +127,9 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 5: Generate DDL for the differences
 	fmt.Println("Generating DDL...")
-	ddlGen := planner.NewDDLGenerator(planner.WithAllowCascade(allowCascade))
-	ddl, err := ddlGen.GenerateDDL(diff, desiredSchema)
+	ddl, err := service.GenerateDDL(diff, desiredSchema)
 	if err != nil {
-		return fmt.Errorf("failed to generate DDL: %w", err)
+		return err
 	}
 
 	if ddl == "" {

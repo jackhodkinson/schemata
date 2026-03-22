@@ -101,6 +101,7 @@ const (
 
 	layerCmd       = "cmd"
 	layerCLI       = "cli"
+	layerApp       = "app"
 	layerConfig    = "config"
 	layerDB        = "db"
 	layerDiffer    = "differ"
@@ -116,6 +117,8 @@ func classifyLayer(importPath string) string {
 		return layerCmd
 	case strings.HasPrefix(importPath, modulePath+"/internal/cli"):
 		return layerCLI
+	case strings.HasPrefix(importPath, modulePath+"/internal/app"):
+		return layerApp
 	case strings.HasPrefix(importPath, modulePath+"/internal/config"):
 		return layerConfig
 	case strings.HasPrefix(importPath, modulePath+"/internal/db"):
@@ -143,6 +146,16 @@ func isAllowedLayerDependency(from, to string) bool {
 			layerCLI: true,
 		},
 		layerCLI: {
+			layerApp:       true,
+			layerConfig:    true,
+			layerDB:        true,
+			layerDiffer:    true,
+			layerMigration: true,
+			layerParser:    true,
+			layerPlanner:   true,
+			layerPkg:       true,
+		},
+		layerApp: {
 			layerConfig:    true,
 			layerDB:        true,
 			layerDiffer:    true,
