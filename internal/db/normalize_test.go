@@ -184,7 +184,7 @@ func TestNormalizeTypeName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(string(tt.input), func(t *testing.T) {
-			result := normalizeTypeName(tt.input)
+			result := schema.NormalizeTypeName(tt.input)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -192,11 +192,11 @@ func TestNormalizeTypeName(t *testing.T) {
 
 func TestReferencesSequence(t *testing.T) {
 	tests := []struct {
-		name         string
-		expr         schema.Expr
-		seqSchema    schema.SchemaName
-		seqName      string
-		shouldMatch  bool
+		name        string
+		expr        schema.Expr
+		seqSchema   schema.SchemaName
+		seqName     string
+		shouldMatch bool
 	}{
 		{
 			name:        "Unqualified sequence name",
