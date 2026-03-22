@@ -873,14 +873,14 @@ func parseIndexElem(elem *pg_query.IndexElem) schema.IndexKeyExpr {
 		keyExpr.Expr = schema.Expr(deparseExpr(elem.Expr))
 	}
 
-	if elem.Collation != nil && len(elem.Collation) > 0 {
+	if len(elem.Collation) > 0 {
 		collation := extractLastName(elem.Collation)
 		if collation != "" {
 			keyExpr.Collation = &collation
 		}
 	}
 
-	if elem.Opclass != nil && len(elem.Opclass) > 0 {
+	if len(elem.Opclass) > 0 {
 		opclass := extractLastName(elem.Opclass)
 		if opclass != "" {
 			keyExpr.OpClass = &opclass
@@ -1183,12 +1183,29 @@ func parseFunctionIdentityArguments(args string) ([]schema.FunctionArg, error) {
 		arg := schema.FunctionArg{Mode: schema.InMode}
 
 		upper := strings.ToUpper(part)
-		if strings.HasPrefix(upper, "VARIADIC ") {
+		switch {
+		case strings.HasPrefix(upper, "VARIADIC "):
 			arg.Mode = schema.VariadicMode
 			part = strings.TrimSpace(part[len("VARIADIC "):])
+		case strings.HasPrefix(upper, "INOUT "):
+			arg.Mode = schema.InOutMode
+			part = strings.TrimSpace(part[len("INOUT "):])
+		case strings.HasPrefix(upper, "OUT "):
+			arg.Mode = schema.OutMode
+			part = strings.TrimSpace(part[len("OUT "):])
+		case strings.HasPrefix(upper, "IN "):
+			arg.Mode = schema.InMode
+			part = strings.TrimSpace(part[len("IN "):])
 		}
 
-		arg.Type = schema.NormalizeTypeName(schema.TypeName(part))
+		if name, typ, ok := splitIdentifierAndType(part); ok {
+			argName := name
+			arg.Name = &argName
+			arg.Type = schema.NormalizeTypeName(schema.TypeName(typ))
+		} else {
+			// Fallback for identity arguments provided as type-only.
+			arg.Type = schema.NormalizeTypeName(schema.TypeName(part))
+		}
 		out = append(out, arg)
 	}
 

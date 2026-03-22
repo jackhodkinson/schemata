@@ -200,17 +200,9 @@ func normalizeFunction(fn schema.Function) schema.Function {
 		fn.Returns = ret
 	}
 
-	// Normalize function body
-	// 1. Trim leading/trailing whitespace
-	// 2. Normalize internal whitespace (multiple spaces/newlines to single space)
-	// 3. Convert to lowercase for case-insensitive comparison
-	body := strings.TrimSpace(fn.Body)
-
-	// Normalize whitespace: replace multiple whitespace chars with single space
-	body = regexp.MustCompile(`\s+`).ReplaceAllString(body, " ")
-
-	// Convert to lowercase for case-insensitive keyword comparison
-	fn.Body = strings.ToLower(body)
+	// Normalize function body while preserving semantics in literals and quoted identifiers.
+	// We lowercase and collapse whitespace only outside quoted sections.
+	fn.Body = normalizeFunctionBody(fn.Body)
 
 	// Sort search path
 	sortedPath := make([]schema.SchemaName, len(fn.SearchPath))
@@ -221,6 +213,140 @@ func normalizeFunction(fn schema.Function) schema.Function {
 	fn.SearchPath = sortedPath
 
 	return fn
+}
+
+func normalizeFunctionBody(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+
+	const (
+		stateNormal = iota
+		stateSingleQuote
+		stateDoubleQuote
+		stateDollarQuote
+	)
+
+	state := stateNormal
+	dollarTag := ""
+	pendingSpace := false
+
+	var out strings.Builder
+	out.Grow(len(body))
+
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+
+		switch state {
+		case stateNormal:
+			if isSQLWhitespace(ch) {
+				pendingSpace = true
+				continue
+			}
+
+			if pendingSpace && out.Len() > 0 {
+				out.WriteByte(' ')
+			}
+			pendingSpace = false
+
+			if ch == '\'' {
+				state = stateSingleQuote
+				out.WriteByte(ch)
+				continue
+			}
+			if ch == '"' {
+				state = stateDoubleQuote
+				out.WriteByte(ch)
+				continue
+			}
+			if tag, ok := detectDollarTag(body, i); ok {
+				state = stateDollarQuote
+				dollarTag = tag
+				out.WriteString(tag)
+				i += len(tag) - 1
+				continue
+			}
+
+			out.WriteByte(toLowerASCII(ch))
+
+		case stateSingleQuote:
+			out.WriteByte(ch)
+			if ch == '\'' {
+				// Handle escaped single quote ('')
+				if i+1 < len(body) && body[i+1] == '\'' {
+					out.WriteByte(body[i+1])
+					i++
+				} else {
+					state = stateNormal
+				}
+			}
+
+		case stateDoubleQuote:
+			out.WriteByte(ch)
+			if ch == '"' {
+				// Handle escaped double quote ("")
+				if i+1 < len(body) && body[i+1] == '"' {
+					out.WriteByte(body[i+1])
+					i++
+				} else {
+					state = stateNormal
+				}
+			}
+
+		case stateDollarQuote:
+			if strings.HasPrefix(body[i:], dollarTag) {
+				out.WriteString(dollarTag)
+				i += len(dollarTag) - 1
+				state = stateNormal
+				continue
+			}
+			out.WriteByte(ch)
+		}
+	}
+
+	return strings.TrimSpace(out.String())
+}
+
+func isSQLWhitespace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	default:
+		return false
+	}
+}
+
+func toLowerASCII(ch byte) byte {
+	if ch >= 'A' && ch <= 'Z' {
+		return ch + ('a' - 'A')
+	}
+	return ch
+}
+
+func detectDollarTag(s string, start int) (string, bool) {
+	if start >= len(s) || s[start] != '$' {
+		return "", false
+	}
+
+	j := start + 1
+	for j < len(s) {
+		if s[j] == '$' {
+			return s[start : j+1], true
+		}
+		if !isDollarTagChar(s[j]) {
+			return "", false
+		}
+		j++
+	}
+	return "", false
+}
+
+func isDollarTagChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') ||
+		(ch >= 'A' && ch <= 'Z') ||
+		(ch >= '0' && ch <= '9') ||
+		ch == '_'
 }
 
 func normalizeSequence(seq schema.Sequence) schema.Sequence {
@@ -363,11 +489,11 @@ func stripOuterParentheses(expr string) string {
 				depth--
 				if depth == 0 && i != len(expr)-1 {
 					valid = false
-					break
+					return expr
 				}
 				if depth < 0 {
 					valid = false
-					break
+					return expr
 				}
 			}
 		}

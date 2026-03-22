@@ -167,7 +167,41 @@ func (p *Parser) parseCreateFunction(stmt *pg_query.CreateFunctionStmt) (schema.
 		}
 	}
 
+	// Functions with OUT/TABLE arguments can omit an explicit RETURNS clause.
+	// Infer the effective return shape so parser and catalog extraction align.
+	if function.Returns == nil {
+		function.Returns = inferFunctionReturnFromArgs(function.Args)
+	}
+
 	return function, nil
+}
+
+func inferFunctionReturnFromArgs(args []schema.FunctionArg) schema.FunctionReturn {
+	outCols := make([]schema.TableColumn, 0)
+	for idx, arg := range args {
+		if arg.Mode != schema.OutMode && arg.Mode != schema.TableMode {
+			continue
+		}
+
+		colName := fmt.Sprintf("column_%d", idx+1)
+		if arg.Name != nil && *arg.Name != "" {
+			colName = *arg.Name
+		}
+
+		outCols = append(outCols, schema.TableColumn{
+			Name: colName,
+			Type: arg.Type,
+		})
+	}
+
+	switch len(outCols) {
+	case 0:
+		return nil
+	case 1:
+		return schema.ReturnsType{Type: outCols[0].Type}
+	default:
+		return schema.ReturnsTable{Columns: outCols}
+	}
 }
 
 // parseFunctionParameter parses a function parameter
