@@ -2,6 +2,32 @@
 
 A declarative postgres migration tool
 
+## Installation
+
+### Quick install (curl)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jackhodkinson/schemata/main/install.sh | sh
+```
+
+Install a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jackhodkinson/schemata/main/install.sh | VERSION=v0.1.0 sh
+```
+
+By default this installs to `~/.local/bin/schemata`. Override with `INSTALL_DIR=/usr/local/bin`.
+
+### Go install
+
+```bash
+go install github.com/jackhodkinson/schemata/cmd/schemata@latest
+```
+
+### Manual download
+
+Download prebuilt binaries and checksums from [GitHub Releases](https://github.com/jackhodkinson/schemata/releases).
+
 ## Capabilities
 
 - Define your schema in raw SQL

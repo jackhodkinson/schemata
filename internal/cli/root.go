@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/jackhodkinson/schemata/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -16,6 +17,7 @@ var rootCmd = &cobra.Command{
 	Long: `Schemata is a declarative Postgres schema migration tool.
 It allows you to define your schema in raw SQL and automatically
 generate migrations from changes to your schema.`,
+	Version: version.String(),
 }
 
 // Execute runs the root command

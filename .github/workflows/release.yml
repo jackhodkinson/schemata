@@ -1,0 +1,122 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: go test ./...
+      - name: Enforce package dependency direction
+        run: make architecture
+      - name: Run go vet
+        run: go vet ./...
+
+  build:
+    name: build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            apt_packages: gcc-aarch64-linux-gnu
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross compiler
+        if: ${{ matrix.apt_packages != '' }}
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build release binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist
+          out_dir="dist/schemata_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p "$out_dir"
+
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X github.com/jackhodkinson/schemata/internal/version.Version=${VERSION} -X github.com/jackhodkinson/schemata/internal/version.Commit=${COMMIT} -X github.com/jackhodkinson/schemata/internal/version.Date=${DATE}" \
+            -o "$out_dir/schemata" \
+            ./cmd/schemata
+
+          cp LICENSE "$out_dir/LICENSE"
+          cp README.md "$out_dir/README.md"
+
+          tar -C dist -czf "dist/schemata_${VERSION}_${GOOS}_${GOARCH}.tar.gz" "schemata_${VERSION}_${GOOS}_${GOARCH}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: schemata_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/schemata_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts and create checksums
+        run: |
+          mkdir -p release
+          mv dist/*/*.tar.gz release/
+          cd release
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/checksums.txt
+          generate_release_notes: true
