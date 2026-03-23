@@ -16,6 +16,17 @@ type DependencyGraph struct {
 	reverse map[schema.ObjectKey][]schema.ObjectKey
 }
 
+// Dependencies returns a copy of the direct dependencies for a key.
+func (g *DependencyGraph) Dependencies(key schema.ObjectKey) []schema.ObjectKey {
+	deps, ok := g.nodes[key]
+	if !ok || len(deps) == 0 {
+		return nil
+	}
+	out := make([]schema.ObjectKey, len(deps))
+	copy(out, deps)
+	return out
+}
+
 // NewDependencyGraph creates a new empty dependency graph
 func NewDependencyGraph() *DependencyGraph {
 	return &DependencyGraph{
@@ -82,34 +93,9 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 			}
 		}
 
-		// If table uses custom types, it depends on those types
+		// If table uses custom types or extension-provided types, it depends on those.
 		for _, col := range v.Columns {
-			colType := string(col.Type)
-
-			// Check for schema-qualified type (schema.typename)
-			if strings.Contains(colType, ".") {
-				parts := strings.Split(colType, ".")
-				if len(parts) == 2 {
-					typeKey := schema.ObjectKey{
-						Kind:   schema.TypeKind,
-						Schema: schema.SchemaName(parts[0]),
-						Name:   parts[1],
-					}
-					if _, exists := objectMap[typeKey]; exists {
-						graph.AddDependency(key, typeKey)
-					}
-				}
-			} else {
-				// Check for unqualified type name in the table's own schema
-				typeKey := schema.ObjectKey{
-					Kind:   schema.TypeKind,
-					Schema: key.Schema,
-					Name:   colType,
-				}
-				if _, exists := objectMap[typeKey]; exists {
-					graph.AddDependency(key, typeKey)
-				}
-			}
+			addTypeDependencies(graph, key, string(col.Type), objectMap)
 		}
 
 	case schema.View:
@@ -147,13 +133,15 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 			graph.AddDependency(key, tableKey)
 		}
 
-		funcKey := schema.ObjectKey{
-			Kind:   schema.FunctionKind,
-			Schema: schema.SchemaName(v.Function.Schema),
-			Name:   v.Function.Name,
-		}
-		if _, exists := objectMap[funcKey]; exists {
-			graph.AddDependency(key, funcKey)
+		// Function keys include signature, while trigger references only schema+name.
+		// Link trigger to all matching function signatures in the object map.
+		for candidate := range objectMap {
+			if candidate.Kind != schema.FunctionKind {
+				continue
+			}
+			if candidate.Schema == schema.SchemaName(v.Function.Schema) && candidate.Name == v.Function.Name {
+				graph.AddDependency(key, candidate)
+			}
 		}
 
 	case schema.Policy:
@@ -168,10 +156,20 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 		}
 
 	case schema.Function:
-		// Functions can depend on types used in arguments or return types
-		// This is complex and may require parsing the function signature
-		// For now, we'll keep functions simple and not add dependencies
-		// They can be created in any order and will fail at runtime if types don't exist
+		// Functions depend on types used in arguments and return signatures.
+		for _, arg := range v.Args {
+			addTypeDependencies(graph, key, string(arg.Type), objectMap)
+		}
+		switch ret := v.Returns.(type) {
+		case schema.ReturnsType:
+			addTypeDependencies(graph, key, string(ret.Type), objectMap)
+		case schema.ReturnsSetOf:
+			addTypeDependencies(graph, key, string(ret.Type), objectMap)
+		case schema.ReturnsTable:
+			for _, col := range ret.Columns {
+				addTypeDependencies(graph, key, string(col.Type), objectMap)
+			}
+		}
 
 	case schema.Sequence:
 		// Sequences typically don't have dependencies on other objects
@@ -180,6 +178,50 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 	default:
 		// Other object types (extensions, enums, domains, composites, schemas)
 		// typically don't have dependencies on other schema objects
+	}
+}
+
+func addTypeDependencies(graph *DependencyGraph, ownerKey schema.ObjectKey, typeName string, objectMap schema.SchemaObjectMap) {
+	if typeName == "" {
+		return
+	}
+
+	// Check for schema-qualified type (schema.typename)
+	if strings.Contains(typeName, ".") {
+		parts := strings.Split(typeName, ".")
+		if len(parts) == 2 {
+			typeKey := schema.ObjectKey{
+				Kind:   schema.TypeKind,
+				Schema: schema.SchemaName(parts[0]),
+				Name:   parts[1],
+			}
+			if _, exists := objectMap[typeKey]; exists {
+				graph.AddDependency(ownerKey, typeKey)
+			}
+		}
+		return
+	}
+
+	// Unqualified type: first check for custom type in the owning schema.
+	typeKey := schema.ObjectKey{
+		Kind:   schema.TypeKind,
+		Schema: ownerKey.Schema,
+		Name:   typeName,
+	}
+	if _, exists := objectMap[typeKey]; exists {
+		graph.AddDependency(ownerKey, typeKey)
+		return
+	}
+
+	// Extension-provided type heuristic: if extension name matches the type name,
+	// treat objects using that type as depending on that extension.
+	for key := range objectMap {
+		if key.Kind != schema.ExtensionKind {
+			continue
+		}
+		if strings.EqualFold(key.Name, typeName) {
+			graph.AddDependency(ownerKey, key)
+		}
 	}
 }
 

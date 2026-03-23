@@ -9,10 +9,14 @@ echo ""
 
 # Change to test-schemata directory
 cd "$(dirname "$0")/../../.."
+
+# Ensure the e2e test runs against a fresh local binary.
+make -C schemata build
+
 cd test-schemata
 
 echo "Step 1: Syncing dev database (clean + apply migrations)..."
-../schemata/bin/schemata sync
+../schemata/bin/schemata sync --allow-cascade
 echo "✓ Sync complete"
 echo ""
 

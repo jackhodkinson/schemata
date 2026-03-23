@@ -81,6 +81,12 @@ func groupObjectsBySchema(objects []schema.DatabaseObject) map[schema.SchemaName
 }
 
 func sortedSchemaNames(groups map[schema.SchemaName][]schema.DatabaseObject) []schema.SchemaName {
+	// Try dependency-aware schema ordering first; fall back to lexical if we
+	// cannot derive a DAG (e.g. cycles in cross-schema references).
+	if ordered, ok := sortSchemasByDependencies(groups); ok {
+		return ordered
+	}
+
 	names := make([]string, 0, len(groups))
 	for n := range groups {
 		names = append(names, string(n))
@@ -91,6 +97,104 @@ func sortedSchemaNames(groups map[schema.SchemaName][]schema.DatabaseObject) []s
 		out[i] = schema.SchemaName(n)
 	}
 	return out
+}
+
+func sortSchemasByDependencies(groups map[schema.SchemaName][]schema.DatabaseObject) ([]schema.SchemaName, bool) {
+	if len(groups) == 0 {
+		return nil, true
+	}
+
+	objectMap := make(schema.SchemaObjectMap)
+	for _, objs := range groups {
+		for _, obj := range objs {
+			key := objectmap.Key(obj)
+			objectMap[key] = schema.HashedObject{Payload: obj}
+		}
+	}
+
+	// No objects means no dependency signal; keep lexical behavior.
+	if len(objectMap) == 0 {
+		return nil, false
+	}
+
+	graph := planner.BuildGraph(objectMap)
+
+	// schemaDeps[A][B] means schema A depends on schema B and must be ordered after B.
+	schemaDeps := make(map[schema.SchemaName]map[schema.SchemaName]struct{}, len(groups))
+	for sn := range groups {
+		schemaDeps[sn] = make(map[schema.SchemaName]struct{})
+	}
+
+	for key := range objectMap {
+		fromSchema := key.Schema
+		if _, ok := schemaDeps[fromSchema]; !ok {
+			schemaDeps[fromSchema] = make(map[schema.SchemaName]struct{})
+		}
+		for _, dep := range graph.Dependencies(key) {
+			depSchema := dep.Schema
+			if depSchema == fromSchema {
+				continue
+			}
+			if _, ok := schemaDeps[depSchema]; !ok {
+				schemaDeps[depSchema] = make(map[schema.SchemaName]struct{})
+			}
+			schemaDeps[fromSchema][depSchema] = struct{}{}
+		}
+	}
+
+	ordered, ok := topoSortSchemas(schemaDeps)
+	if !ok {
+		return nil, false
+	}
+	return ordered, true
+}
+
+func topoSortSchemas(schemaDeps map[schema.SchemaName]map[schema.SchemaName]struct{}) ([]schema.SchemaName, bool) {
+	// inDegree[sn] is number of schemas this schema depends on.
+	inDegree := make(map[schema.SchemaName]int, len(schemaDeps))
+	reverse := make(map[schema.SchemaName][]schema.SchemaName, len(schemaDeps))
+
+	for sn := range schemaDeps {
+		inDegree[sn] = len(schemaDeps[sn])
+	}
+	for sn := range schemaDeps {
+		for dep := range schemaDeps[sn] {
+			reverse[dep] = append(reverse[dep], sn)
+		}
+	}
+	for dep := range reverse {
+		sort.Slice(reverse[dep], func(i, j int) bool {
+			return reverse[dep][i] < reverse[dep][j]
+		})
+	}
+
+	var queue []schema.SchemaName
+	for sn, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, sn)
+		}
+	}
+	sort.Slice(queue, func(i, j int) bool { return queue[i] < queue[j] })
+
+	var out []schema.SchemaName
+	for len(queue) > 0 {
+		sn := queue[0]
+		queue = queue[1:]
+		out = append(out, sn)
+
+		for _, dependent := range reverse[sn] {
+			inDegree[dependent]--
+			if inDegree[dependent] == 0 {
+				queue = append(queue, dependent)
+				sort.Slice(queue, func(i, j int) bool { return queue[i] < queue[j] })
+			}
+		}
+	}
+
+	if len(out) != len(schemaDeps) {
+		return nil, false
+	}
+	return out, true
 }
 
 // writeDumpSingleFile writes all DDL to one file (existing behavior).
