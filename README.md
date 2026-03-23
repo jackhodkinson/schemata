@@ -362,6 +362,23 @@ ALTER TABLE orders ADD COLUMN user_id INT REFERENCES users(id);
 
 When dependencies are declared, `schemata` topologically sorts migrations to respect them. Migrations without dependencies are ordered by version timestamp as usual. Circular dependencies are detected and reported as errors.
 
+### Alternative migration formats
+
+By default, schemata uses plain `.sql` files. To work with an existing migration directory in a different format, use the structured `migrations` config:
+
+```yaml
+migrations:
+  dir: ./sql/migrations
+  format: moo
+```
+
+Currently supported formats:
+
+- `sql` (default) — plain `.sql` files named `YYYYMMDDHHMMSS-name.sql`
+- `moo` — moo-postgresql format (`.txt`/`.yml` files with `Description`, `Created`, `Depends`, and `Apply` headers)
+
+The moo format is read-only — `schemata generate` and `schemata create` always produce native `.sql` files. The `Depends` field in moo files maps to the same dependency chain infrastructure used by `-- schemata:depends-on` directives.
+
 ## Generating migrations
 
 When you generate a migration using `schemata generate` it will make sure all your existing migrations are applied to the dev db, and then diff this with your local schema file. The diff will be used to generate a new migration file.
