@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [v0.3.0] - 2026-03-23
+
+### Added
+
+- Moo-postgresql migration format support. Configure with `migrations: {dir: ./path, format: moo}` to read `.txt`/`.yml` files with `Description`/`Created`/`Depends`/`Apply` headers. Read-only — `generate` and `create` still produce native `.sql` files.
+- Structured `migrations` config: supports both `migrations: ./path` (simple) and `migrations: {dir: ./path, format: moo}` (structured). Backward compatible.
+
 ## [v0.2.0] - 2026-03-23
 
 ### Added
@@ -33,5 +40,6 @@ Initial release.
 - Advisory-lock-based concurrency control for migration application.
 - Cross-platform release builds (linux/darwin, amd64/arm64).
 
+[v0.3.0]: https://github.com/jackhodkinson/schemata/compare/v0.2.0...v0.3.0
 [v0.2.0]: https://github.com/jackhodkinson/schemata/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/jackhodkinson/schemata/releases/tag/v0.1.0
