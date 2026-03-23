@@ -42,7 +42,7 @@ func init() {
 func runInit(cmd *cobra.Command, args []string) error {
 	// Build configuration
 	cfg := &config.Config{
-		Migrations: initMigrations,
+		Migrations: config.MigrationsConfig{FilePath: &initMigrations},
 	}
 
 	// Parse dev connection

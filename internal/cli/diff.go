@@ -88,7 +88,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 
 	// If comparing from migrations, apply them first
 	if diffFrom == "migrations" {
-		migrations, err := service.ScanMigrations(cfg.Migrations)
+		migrations, err := service.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
 		if err != nil {
 			return err
 		}

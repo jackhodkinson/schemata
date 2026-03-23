@@ -43,7 +43,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Ensure migrations directory exists
-	if cfg.Migrations == "" {
+	if cfg.Migrations.GetDir() == "" {
 		return fmt.Errorf("no migrations directory configured")
 	}
 
@@ -62,7 +62,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 1: Apply all existing migrations to dev database
 	fmt.Println("Applying existing migrations to dev database...")
-	migrations, err := service.ScanMigrations(cfg.Migrations)
+	migrations, err := service.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
 	if err != nil {
 		return err
 	}
@@ -138,7 +138,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 6: Create migration file
-	gen := migration.NewGenerator(cfg.Migrations)
+	gen := migration.NewGenerator(cfg.Migrations.GetDir())
 	mig, err := gen.Generate(migrationName, ddl)
 	if err != nil {
 		return fmt.Errorf("failed to create migration file: %w", err)

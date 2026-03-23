@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/spf13/cobra"
+	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
 	"github.com/jackhodkinson/schemata/internal/migration"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -83,10 +84,10 @@ func runApply(cmd *cobra.Command, args []string) error {
 	}
 
 	// Scan migrations
-	scanner := migration.NewScanner(cfg.Migrations)
-	migrations, err := scanner.Scan()
+	service := app.NewService(allowCascade)
+	migrations, err := service.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
 	if err != nil {
-		return fmt.Errorf("failed to scan migrations: %w", err)
+		return err
 	}
 
 	fmt.Printf("Found %d migrations\n", len(migrations))

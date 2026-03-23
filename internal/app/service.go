@@ -23,8 +23,16 @@ func NewService(allowCascade bool) *Service {
 	return &Service{allowCascade: allowCascade}
 }
 
-func (s *Service) ScanMigrations(migrationsDir string) ([]migration.Migration, error) {
-	scanner := migration.NewScanner(migrationsDir)
+func (s *Service) ScanMigrations(migrationsDir string, format string) ([]migration.Migration, error) {
+	var scanner interface {
+		Scan() ([]migration.Migration, error)
+	}
+	switch format {
+	case "moo":
+		scanner = migration.NewMooScanner(migrationsDir)
+	default:
+		scanner = migration.NewScanner(migrationsDir)
+	}
 	migrations, err := scanner.Scan()
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan migrations: %w", err)
@@ -97,8 +105,8 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 	}
 	defer devPool.Close()
 
-	if cfg.Migrations != "" {
-		migrations, err := s.ScanMigrations(cfg.Migrations)
+	if cfg.Migrations.GetDir() != "" {
+		migrations, err := s.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
 		if err != nil {
 			return err
 		}

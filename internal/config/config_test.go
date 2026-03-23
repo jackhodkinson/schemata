@@ -34,7 +34,8 @@ migrations: ./migrations
 				assert.Equal(t, "postgresql://localhost:5432/target", *cfg.Target.URL)
 
 				assert.Equal(t, "schema.sql", cfg.Schema.GetSchemaPath())
-				assert.Equal(t, "./migrations", cfg.Migrations)
+				assert.Equal(t, "./migrations", cfg.Migrations.GetDir())
+				assert.Equal(t, "sql", cfg.Migrations.GetFormat())
 			},
 		},
 		{
@@ -90,6 +91,22 @@ migrations: ./migrations
 				include, exclude := cfg.Schema.GetSchemaFilters()
 				assert.Equal(t, []string{"public", "app"}, include)
 				assert.Nil(t, exclude)
+			},
+		},
+		{
+			name: "structured migrations config with format",
+			yaml: `
+dev: postgresql://localhost:5432/dev
+target: postgresql://localhost:5432/target
+schema: schema.sql
+migrations:
+  dir: ./sql/migrations
+  format: moo
+`,
+			wantErr: false,
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "./sql/migrations", cfg.Migrations.GetDir())
+				assert.Equal(t, "moo", cfg.Migrations.GetFormat())
 			},
 		},
 		{

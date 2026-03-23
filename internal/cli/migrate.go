@@ -101,7 +101,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	defer targetPool.Close()
 
 	// Scan migrations
-	migrations, err := service.ScanMigrations(cfg.Migrations)
+	migrations, err := service.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
 	if err != nil {
 		return err
 	}

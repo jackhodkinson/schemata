@@ -31,7 +31,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create migration generator
-	generator := migration.NewGenerator(cfg.Migrations)
+	generator := migration.NewGenerator(cfg.Migrations.GetDir())
 
 	// Generate empty migration
 	mig, err := generator.CreateEmpty(name)

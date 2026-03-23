@@ -60,8 +60,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	// Scan migrations
-	fmt.Printf("Scanning migrations directory: %s\n", cfg.Migrations)
-	migrations, err := service.ScanMigrations(cfg.Migrations)
+	fmt.Printf("Scanning migrations directory: %s\n", cfg.Migrations.GetDir())
+	migrations, err := service.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
 	if err != nil {
 		return err
 	}

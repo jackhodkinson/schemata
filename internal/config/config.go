@@ -15,7 +15,75 @@ type Config struct {
 	Target     *DBConnection           `yaml:"target,omitempty"`
 	Targets    map[string]DBConnection `yaml:"targets,omitempty"`
 	Schema     SchemaConfig            `yaml:"schema"`
-	Migrations string                  `yaml:"migrations"`
+	Migrations MigrationsConfig        `yaml:"migrations"`
+}
+
+// MigrationsConfig can be either a simple directory path or detailed configuration
+type MigrationsConfig struct {
+	// Simple format (just a directory path string)
+	FilePath *string `yaml:"-"`
+
+	// Detailed format
+	Dir    string `yaml:"dir,omitempty"`
+	Format string `yaml:"format,omitempty"` // "sql" (default) or "moo"
+}
+
+// UnmarshalYAML implements custom unmarshaling for MigrationsConfig
+func (mc *MigrationsConfig) UnmarshalYAML(node *yaml.Node) error {
+	// Try to unmarshal as a string first
+	var dirPath string
+	if err := node.Decode(&dirPath); err == nil {
+		mc.FilePath = &dirPath
+		return nil
+	}
+
+	// Otherwise, unmarshal as structured config
+	type migrationsConfigAlias struct {
+		Dir    string `yaml:"dir"`
+		Format string `yaml:"format,omitempty"`
+	}
+
+	var details migrationsConfigAlias
+	if err := node.Decode(&details); err != nil {
+		return err
+	}
+
+	mc.Dir = details.Dir
+	mc.Format = details.Format
+	return nil
+}
+
+// MarshalYAML implements custom marshaling for MigrationsConfig
+func (mc MigrationsConfig) MarshalYAML() (interface{}, error) {
+	if mc.FilePath != nil {
+		return *mc.FilePath, nil
+	}
+
+	type migrationsConfigAlias struct {
+		Dir    string `yaml:"dir"`
+		Format string `yaml:"format,omitempty"`
+	}
+
+	return migrationsConfigAlias{
+		Dir:    mc.Dir,
+		Format: mc.Format,
+	}, nil
+}
+
+// GetDir returns the migrations directory path
+func (mc *MigrationsConfig) GetDir() string {
+	if mc.FilePath != nil {
+		return *mc.FilePath
+	}
+	return mc.Dir
+}
+
+// GetFormat returns the migration file format ("sql" by default)
+func (mc *MigrationsConfig) GetFormat() string {
+	if mc.Format != "" {
+		return mc.Format
+	}
+	return "sql"
 }
 
 // DBConnection can be either a URL string or connection details
@@ -218,7 +286,7 @@ func (c *Config) Validate() error {
 	}
 
 	// Migrations directory must be specified
-	if c.Migrations == "" {
+	if c.Migrations.GetDir() == "" {
 		return fmt.Errorf("migrations directory must be specified")
 	}
 
