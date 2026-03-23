@@ -77,6 +77,20 @@ Compare migrations (applied to dev) against the schema file:
 schemata diff --config schemata.yaml --from migrations
 ```
 
+## Schema directory mode and ordering
+
+If `schema` is configured as a directory path, `schemata` reads multiple `.sql` files as one desired schema.
+
+- This improves ownership and review for large schemas.
+- Split files can still have cross-schema dependencies (FK/view/trigger/type/extension).
+- `schemata dump` in directory mode emits files in dependency-aware order with deterministic tie-breaks.
+
+Important:
+
+- Dependency-aware ordering significantly reduces apply-order failures, but does not guarantee perfect handling for every possible SQL edge case.
+- Keep an ephemeral DB replay check in CI for workflows that execute split files directly.
+- For bootstrap workflows where strict ordering is critical, single-file schema mode remains the most conservative option.
+
 ## Exit behavior
 
 - Exit `0`: schemas are in sync.

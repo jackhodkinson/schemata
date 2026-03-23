@@ -45,6 +45,16 @@ Unknown kinds sort after known kinds, then lexically by kind string.
 - `internal/differ/differ.go` — `Diff.ToCreate`, `Diff.ToDrop`, `Diff.ToAlter` sorted before return
 - `internal/planner/graph.go` — topological queue tie-breaks use `ObjectKeyLess`
 
+## Dump Directory Ordering
+
+`schemata dump` in directory mode (`schema` path does not end with `.sql`) uses dependency-aware schema ordering, not plain lexical schema-name ordering.
+
+- `internal/cli/dump_output.go` projects object dependencies into schema dependencies.
+- Schema files are emitted in topological order with lexical tie-breaks for unrelated schemas.
+- This reduces cross-schema apply-order failures (FK/view/trigger/type cases), but does not claim perfect coverage for every possible SQL edge case.
+
+See `docs/engineering/DUMP_ORDERING_SPEC.md` for detailed behavior, limits, and newcomer guidance.
+
 ## Phase 2 — Generated DDL Internals (CREATE)
 
 Where semantics allow, `internal/planner/ddl.go` emits stable ordering:
@@ -100,3 +110,4 @@ Comparators emit changes in a stable order by sorting map keys before iteration;
 
 - `ALTER DEFAULT PRIVILEGES`, column-level ACL details beyond bundled grant rows.
 - Broader statement-chunk ordering beyond the create/alter/drop pipeline when new object classes are added.
+- Full semantic dependency extraction from arbitrary function bodies and all extension-managed object graphs.
