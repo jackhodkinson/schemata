@@ -350,6 +350,18 @@ When you run `schemata generate <migration-name>` or `schemata create <migration
 
 The `<migration-name>` variable must be close enough to file-name safe. We'll take it and make it kebab case for the file name and prepend a timestamp onto the file path so it becomes `${timestamp}-${fileSafe(migrationName)}`.
 
+### Migration dependencies
+
+Migrations can declare explicit dependencies on other migrations using comment directives. This is useful when timestamp ordering alone doesn't capture the required application order.
+
+```sql
+-- schemata:depends-on 20241015120530
+-- schemata:depends-on 20241016090000
+ALTER TABLE orders ADD COLUMN user_id INT REFERENCES users(id);
+```
+
+When dependencies are declared, `schemata` topologically sorts migrations to respect them. Migrations without dependencies are ordered by version timestamp as usual. Circular dependencies are detected and reported as errors.
+
 ## Generating migrations
 
 When you generate a migration using `schemata generate` it will make sure all your existing migrations are applied to the dev db, and then diff this with your local schema file. The diff will be used to generate a new migration file.
@@ -360,7 +372,22 @@ You can manually create a migration using `schemata create` which will place an 
 
 ## Applying migrations
 
-When you run `schemata migrate` it will apply all unnaplied migrations to your target.
+When you run `schemata migrate` it will apply all unapplied migrations to your target.
+
+To apply migrations incrementally:
+
+```bash
+# Apply only the next pending migration
+schemata migrate --step 1
+
+# Apply up to and including a specific version
+schemata migrate --to 20241015120530
+
+# Preview what would be applied
+schemata migrate --step 3 --dry-run
+```
+
+`--step` and `--to` are mutually exclusive. When neither is specified, all pending migrations are applied.
 
 ## Migration state tracking
 
