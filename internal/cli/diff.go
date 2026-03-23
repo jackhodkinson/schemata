@@ -7,6 +7,7 @@ import (
 	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
+	"github.com/jackhodkinson/schemata/internal/migration"
 	"github.com/spf13/cobra"
 )
 
@@ -91,7 +92,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := service.ApplyMigrations(ctx, pool, migrations, false); err != nil {
+		if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{}); err != nil {
 			return fmt.Errorf("failed to apply migrations to dev: %w", err)
 		}
 	}

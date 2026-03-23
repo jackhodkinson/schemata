@@ -7,27 +7,36 @@ import (
 	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
+	"github.com/jackhodkinson/schemata/internal/migration"
 	"github.com/spf13/cobra"
 )
 
 var (
 	migrateTarget string
 	migrateDryRun bool
+	migrateStep   int
+	migrateTo     string
 )
 
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Apply pending migrations to target database",
-	Long: `Apply all pending migrations to the target database.
+	Long: `Apply pending migrations to the target database.
 
 This command will:
 1. Scan the migrations directory
-2. Apply all pending migrations to the target database
+2. Apply pending migrations to the target database
+
+By default, all pending migrations are applied. Use --step or --to to limit:
+  --step N     Apply at most N pending migrations
+  --to VERSION Apply up to and including VERSION
 
 Examples:
   schemata migrate
   schemata migrate --target staging
   schemata migrate --dry-run
+  schemata migrate --step 1
+  schemata migrate --to 20231015120530
 `,
 	RunE: runMigrate,
 }
@@ -35,9 +44,18 @@ Examples:
 func init() {
 	migrateCmd.Flags().StringVar(&migrateTarget, "target", "", "Target database (required if multiple targets configured)")
 	migrateCmd.Flags().BoolVar(&migrateDryRun, "dry-run", false, "Show what would be applied without actually applying")
+	migrateCmd.Flags().IntVar(&migrateStep, "step", 0, "Apply at most N pending migrations")
+	migrateCmd.Flags().StringVar(&migrateTo, "to", "", "Apply pending migrations up to and including VERSION")
 }
 
 func runMigrate(cmd *cobra.Command, args []string) error {
+	if cmd.Flags().Changed("step") && migrateStep <= 0 {
+		return fmt.Errorf("--step must be a positive integer")
+	}
+	if migrateStep != 0 && migrateTo != "" {
+		return fmt.Errorf("--step and --to are mutually exclusive")
+	}
+
 	ctx := context.Background()
 	service := app.NewService(allowCascade)
 
@@ -98,7 +116,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		fmt.Println("\n=== DRY RUN MODE ===")
 	}
 
-	if err := service.ApplyMigrations(ctx, targetPool, migrations, migrateDryRun); err != nil {
+	opts := migration.ApplyOptions{
+		DryRun:    migrateDryRun,
+		Step:      migrateStep,
+		ToVersion: migrateTo,
+	}
+	if err := service.ApplyMigrations(ctx, targetPool, migrations, opts); err != nil {
 		return err
 	}
 

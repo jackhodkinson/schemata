@@ -68,7 +68,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(migrations) > 0 {
-		if err := service.ApplyMigrations(ctx, pool, migrations, false); err != nil {
+		if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{}); err != nil {
 			return fmt.Errorf("failed to apply migrations to dev: %w", err)
 		}
 	} else {

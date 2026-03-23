@@ -32,12 +32,8 @@ func (s *Service) ScanMigrations(migrationsDir string) ([]migration.Migration, e
 	return migrations, nil
 }
 
-func (s *Service) ApplyMigrations(ctx context.Context, pool *db.Pool, migrations []migration.Migration, dryRun bool) error {
-	applier := migration.NewApplier(pool, dryRun)
-	opts := migration.ApplyOptions{
-		DryRun:          dryRun,
-		ContinueOnError: false,
-	}
+func (s *Service) ApplyMigrations(ctx context.Context, pool *db.Pool, migrations []migration.Migration, opts migration.ApplyOptions) error {
+	applier := migration.NewApplier(pool, opts.DryRun)
 	if err := applier.Apply(ctx, migrations, opts); err != nil {
 		return fmt.Errorf("failed to apply migrations: %w", err)
 	}
@@ -107,7 +103,7 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 			return err
 		}
 		if len(migrations) > 0 {
-			if err := s.ApplyMigrations(ctx, devPool, migrations, false); err != nil {
+			if err := s.ApplyMigrations(ctx, devPool, migrations, migration.ApplyOptions{}); err != nil {
 				return fmt.Errorf("failed to apply migrations to dev: %w", err)
 			}
 		}

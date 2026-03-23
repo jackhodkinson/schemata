@@ -28,6 +28,38 @@ func NewApplier(pool *db.Pool, dryRun bool) *Applier {
 type ApplyOptions struct {
 	DryRun          bool
 	ContinueOnError bool
+	Step            int    // Apply at most N pending migrations. 0 means unlimited.
+	ToVersion       string // Apply up to and including this version. Empty means unlimited.
+}
+
+// FilterPendingMigrations applies Step and ToVersion filters to a pending
+// version list. allVersions is the complete set of known migration versions
+// (used to distinguish "already applied" from "not found" in error messages).
+func FilterPendingMigrations(pending, allVersions []string, opts ApplyOptions) ([]string, error) {
+	if opts.ToVersion != "" {
+		idx := -1
+		for i, v := range pending {
+			if v == opts.ToVersion {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			for _, v := range allVersions {
+				if v == opts.ToVersion {
+					return nil, fmt.Errorf("version %s has already been applied", opts.ToVersion)
+				}
+			}
+			return nil, fmt.Errorf("version %s not found in migrations", opts.ToVersion)
+		}
+		pending = pending[:idx+1]
+	}
+
+	if opts.Step > 0 && opts.Step < len(pending) {
+		pending = pending[:opts.Step]
+	}
+
+	return pending, nil
 }
 
 // Apply applies all pending migrations
@@ -78,6 +110,29 @@ func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyO
 	sorted, err := topoSortMigrations(pendingMigrations)
 	if err != nil {
 		return fmt.Errorf("failed to resolve migration ordering: %w", err)
+	}
+
+	// Apply step/to-version filters to the sorted list.
+	sortedVersions := make([]string, len(sorted))
+	for i, m := range sorted {
+		sortedVersions[i] = m.Version
+	}
+	filteredVersions, err := FilterPendingMigrations(sortedVersions, versions, opts)
+	if err != nil {
+		return err
+	}
+	if len(filteredVersions) < len(sorted) {
+		filteredSet := make(map[string]bool, len(filteredVersions))
+		for _, v := range filteredVersions {
+			filteredSet[v] = true
+		}
+		filtered := make([]Migration, 0, len(filteredVersions))
+		for i := range sorted {
+			if filteredSet[sorted[i].Version] {
+				filtered = append(filtered, sorted[i])
+			}
+		}
+		sorted = filtered
 	}
 
 	// Apply migrations in resolved order

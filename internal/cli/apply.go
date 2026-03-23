@@ -14,6 +14,8 @@ var (
 	applyTarget string
 	applyDev    bool
 	applyDryRun bool
+	applyStep   int
+	applyTo     string
 )
 
 var applyCmd = &cobra.Command{
@@ -40,9 +42,18 @@ func init() {
 	applyCmd.Flags().StringVar(&applyTarget, "target", "", "Target name to apply migrations to")
 	applyCmd.Flags().BoolVar(&applyDev, "dev", false, "Apply migrations to dev database")
 	applyCmd.Flags().BoolVar(&applyDryRun, "dry-run", false, "Show what would be applied without executing")
+	applyCmd.Flags().IntVar(&applyStep, "step", 0, "Apply at most N pending migrations")
+	applyCmd.Flags().StringVar(&applyTo, "to", "", "Apply pending migrations up to and including VERSION")
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
+	if cmd.Flags().Changed("step") && applyStep <= 0 {
+		return fmt.Errorf("--step must be a positive integer")
+	}
+	if applyStep != 0 && applyTo != "" {
+		return fmt.Errorf("--step and --to are mutually exclusive")
+	}
+
 	// Must specify either --target or --dev
 	if applyTarget == "" && !applyDev {
 		return fmt.Errorf("must specify either --target or --dev")
@@ -93,6 +104,8 @@ func runApply(cmd *cobra.Command, args []string) error {
 	opts := migration.ApplyOptions{
 		DryRun:          applyDryRun,
 		ContinueOnError: false,
+		Step:            applyStep,
+		ToVersion:       applyTo,
 	}
 
 	if err := applier.Apply(ctx, migrations, opts); err != nil {

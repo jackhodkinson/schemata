@@ -7,6 +7,7 @@ import (
 	"github.com/jackhodkinson/schemata/internal/app"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
+	"github.com/jackhodkinson/schemata/internal/migration"
 	"github.com/spf13/cobra"
 )
 
@@ -74,7 +75,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Apply all migrations
 	fmt.Println("Applying migrations...")
-	if err := service.ApplyMigrations(ctx, pool, migrations, false); err != nil {
+	if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{}); err != nil {
 		return err
 	}
 
