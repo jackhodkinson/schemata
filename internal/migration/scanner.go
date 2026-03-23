@@ -11,10 +11,11 @@ import (
 
 // Migration represents a single migration file
 type Migration struct {
-	Version  string // Timestamp prefix (YYYYMMDDHHMMSS)
-	Name     string // Human-readable name
-	FilePath string // Full path to the migration file
-	SQL      string // SQL content (loaded on demand)
+	Version   string   // Timestamp prefix (YYYYMMDDHHMMSS)
+	Name      string   // Human-readable name
+	FilePath  string   // Full path to the migration file
+	SQL       string   // SQL content (loaded on demand)
+	DependsOn []string // Versions this migration depends on (parsed from directives)
 }
 
 // Scanner scans a directory for migration files
@@ -82,6 +83,7 @@ func (m *Migration) LoadSQL() error {
 	}
 
 	m.SQL = string(content)
+	m.DependsOn = parseDirectives(m.SQL)
 	return nil
 }
 

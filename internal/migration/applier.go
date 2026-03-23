@@ -55,38 +55,44 @@ func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyO
 		return nil
 	}
 
-	// Apply pending migrations in order
-	for _, version := range pending {
-		// Find migration
-		var migration *Migration
-		for i := range migrations {
-			if migrations[i].Version == version {
-				migration = &migrations[i]
-				break
-			}
-		}
+	// Build filtered list of pending migrations and load their SQL
+	// (needed upfront to parse dependency directives before sorting).
+	pendingSet := make(map[string]bool, len(pending))
+	for _, v := range pending {
+		pendingSet[v] = true
+	}
 
-		if migration == nil {
-			return fmt.Errorf("migration %s not found in list", version)
+	var pendingMigrations []Migration
+	for i := range migrations {
+		if !pendingSet[migrations[i].Version] {
+			continue
 		}
-
-		// Load SQL if not already loaded
-		if err := migration.LoadSQL(); err != nil {
-			return fmt.Errorf("failed to load migration %s: %w", version, err)
+		if err := migrations[i].LoadSQL(); err != nil {
+			return fmt.Errorf("failed to load migration %s: %w", migrations[i].Version, err)
 		}
+		pendingMigrations = append(pendingMigrations, migrations[i])
+	}
 
-		// Apply migration
-		applied, err := a.applyMigration(ctx, *migration, opts)
+	// Sort respecting dependency chains. Falls back to version-string
+	// ordering when no dependencies are declared.
+	sorted, err := topoSortMigrations(pendingMigrations)
+	if err != nil {
+		return fmt.Errorf("failed to resolve migration ordering: %w", err)
+	}
+
+	// Apply migrations in resolved order
+	for i := range sorted {
+		applied, err := a.applyMigration(ctx, sorted[i], opts)
 		if err != nil {
 			if opts.ContinueOnError {
-				fmt.Printf("Error applying migration %s: %v\n", version, err)
+				fmt.Printf("Error applying migration %s: %v\n", sorted[i].Version, err)
 				continue
 			}
-			return fmt.Errorf("failed to apply migration %s: %w", version, err)
+			return fmt.Errorf("failed to apply migration %s: %w", sorted[i].Version, err)
 		}
 
 		if applied {
-			fmt.Printf("Applied migration %s: %s\n", migration.Version, migration.Name)
+			fmt.Printf("Applied migration %s: %s\n", sorted[i].Version, sorted[i].Name)
 		}
 	}
 
