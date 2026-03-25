@@ -147,6 +147,16 @@ schemata diff
 # schemata generate 'my baseline migration'
 ```
 
+If your existing migrations reference extensions they never create (common when extensions were installed by a DBA or cloud provider), fix this before running migrations:
+
+```bash
+schemata init --migrations ./db/migrations/
+schemata dump
+schemata fix extensions
+# Now migrations can replay from scratch on any fresh database
+schemata diff --from migrations
+```
+
 Or if you are starting with both a migrations and a local schema file you won't need to dump:
 
 ```bash
@@ -315,6 +325,62 @@ targets:
     database: myapp_local
     # No SSL for local development
 ```
+
+### Extensions
+
+Extensions are part of your schema — declare them in `schema.sql` alongside your tables, types, and functions:
+
+```sql
+-- schema.sql
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE users (
+    id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+    email citext NOT NULL
+);
+```
+
+Schemata treats extensions the same as any other schema object:
+
+- **`schemata diff`** reports extensions present on the target but missing from `schema.sql` (and vice versa).
+- **`schemata generate`** produces migrations that create or drop extensions, just like tables.
+- **`schemata dump`** includes installed extensions in the schema output.
+
+No special configuration is needed. Extensions flow through the same declarative pipeline as everything else.
+
+#### Adopting schemata with existing migrations
+
+If you have an existing migrations directory where extensions were installed outside of migrations (by a DBA, cloud provider, or manual setup), those migrations may fail when replayed on a fresh database because they reference types or operators that don't exist yet.
+
+`schemata fix extensions` detects and resolves this:
+
+```bash
+$ schemata diff --from migrations
+
+Error: migration replay failed at 2026-02-26-epoch:
+  type "citext" does not exist
+
+$ schemata fix extensions
+
+Found extensions on target not created by any migration:
+  - citext
+  - pg_trgm
+
+Created migration: 20260224000000-add-extensions.sql
+  (ordered before earliest migration via depends-on)
+```
+
+This command:
+
+1. Connects to the target database and queries installed extensions.
+2. Scans existing migrations for `CREATE EXTENSION` statements.
+3. Identifies extensions that are installed but never created by a migration.
+4. Generates a new migration with `CREATE EXTENSION IF NOT EXISTS` for each, ordered to run before all existing migrations via `depends-on` directives.
+
+After running `fix extensions`, the migration directory is self-contained — it can build the complete database from scratch without any external setup.
+
+This is a one-time onboarding step. Going forward, add new extensions to `schema.sql` and use `schemata generate` as usual.
 
 ### Schema filtering
 

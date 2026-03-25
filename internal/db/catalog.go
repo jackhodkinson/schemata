@@ -169,6 +169,12 @@ func (c *Catalog) buildSchemaFilter(include, exclude []string) string {
 	return "nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')"
 }
 
+// ExtractExtensions queries installed extensions from the database, excluding
+// system schemas (pg_catalog, information_schema, pg_toast) by default.
+func (c *Catalog) ExtractExtensions(ctx context.Context) ([]schema.DatabaseObject, error) {
+	return c.extractExtensions(ctx, c.buildSchemaFilter(nil, nil))
+}
+
 func (c *Catalog) extractExtensions(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
 	query := fmt.Sprintf(`
 		SELECT

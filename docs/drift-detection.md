@@ -175,6 +175,7 @@ jobs:
 - Wrong `--config` path from CI working directory.
 - `--from migrations` without a valid dev database connection.
 - Running `--from migrations` against a shared dev database can produce noisy or unsafe CI behavior.
+- Migration replay fails with `type "citext" does not exist` or similar — your existing migrations assume extensions that they never create. Run `schemata fix extensions` to generate a bootstrap migration.
 
 ## Local repro command
 

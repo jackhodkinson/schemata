@@ -19,6 +19,11 @@ func NewGenerator(directory string) *Generator {
 
 // Generate creates a new migration file with the given SQL content
 func (g *Generator) Generate(name, sql string) (*Migration, error) {
+	return g.GenerateWithVersion(generateVersion(), name, sql)
+}
+
+// GenerateWithVersion creates a new migration file with an explicit version string.
+func (g *Generator) GenerateWithVersion(version, name, sql string) (*Migration, error) {
 	// Validate migration name
 	if err := ValidateMigrationName(name); err != nil {
 		return nil, err
@@ -28,9 +33,6 @@ func (g *Generator) Generate(name, sql string) (*Migration, error) {
 	if err := os.MkdirAll(g.directory, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create migrations directory: %w", err)
 	}
-
-	// Generate version (timestamp)
-	version := generateVersion()
 
 	// Convert name to kebab-case
 	kebabName := ToKebabCase(name)

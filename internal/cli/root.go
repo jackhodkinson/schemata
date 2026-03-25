@@ -39,4 +39,5 @@ func init() {
 	rootCmd.AddCommand(diffCmd)
 	rootCmd.AddCommand(applyCmd)
 	rootCmd.AddCommand(syncCmd)
+	rootCmd.AddCommand(fixCmd)
 }
