@@ -18,6 +18,138 @@ This document defines the path from the current state of `schemata` to a “swis
 
 ---
 
+## Prioritized Remaining Work
+
+The milestone sections below describe the intended capabilities. The following
+list is the current priority order for reaching production readiness; release
+version numbers alone should not be treated as evidence that a milestone is
+complete.
+
+### P0 — Correctness and Safety Blockers
+
+1. **Establish an extensible architecture and code-quality baseline**
+   - Define typed contracts for capture, normalization, identity, comparison,
+     planning, rendering, and apply rather than relying on stringly-typed change
+     descriptions and growing type switches.
+   - Centralize identifier/literal quoting, capability registration, structured
+     unsupported errors, and the supported-object matrix.
+   - Keep package boundaries, dependency direction, tests, and developer
+     tooling fast enough that new object types can be added without duplicating
+     the full pipeline.
+
+2. **Make normalization semantically safe**
+   - Preserve quoted literals, identifier semantics, casts, column order,
+     `search_path` order, and other meaning-bearing details.
+   - Add explicit “must compare equal” and “must compare different” fixtures.
+
+3. **Finish fail-closed parsing, extraction, and dump behavior**
+   - Never substitute placeholder expressions or silently ignore unsupported
+     schema-affecting statements, attributes, comments, grants, or owners.
+   - Make `dump` fail instead of writing a partial schema after an object error.
+
+4. **Make generated DDL correct or refuse it**
+   - Fix function signatures and replacement behavior, enum evolution,
+     identifier/literal quoting, index syntax, and dependency-aware create/drop
+     ordering.
+   - Use both desired and actual object maps when planning changes.
+   - Complete end-to-end support for every advertised object, or explicitly
+     reject and document objects that remain unsupported.
+
+5. **Harden migration history and execution**
+   - Record and verify migration checksums and metadata.
+   - Reject duplicate versions and missing dependency references.
+   - Add per-migration transaction controls for operations such as
+     `CREATE INDEX CONCURRENTLY`.
+   - Report the failing file, statement index, and bounded SQL snippet.
+
+6. **Add production safety controls**
+   - Require explicit approval for destructive operations, table rewrites, and
+     cascading changes.
+   - Validate configuration after environment expansion and refuse empty or
+     implicit target connections.
+   - Add target identity checks, cancellation, statement/lock timeouts, and
+     stable reviewable plan output.
+
+7. **Resolve known security and release blockers**
+   - Upgrade vulnerable dependencies and build with a supported, patched Go
+     toolchain.
+   - Add vulnerability scanning to CI and establish a dependency/toolchain
+     update policy.
+
+### P0.5 — High-Value Fuzzing and Property Tests
+
+Add these while fixing the P0 contracts, rather than waiting until the end:
+
+1. **Normalization properties**
+   - Idempotence, safe equivalence transformations, and non-equivalence
+     mutations for literals, casts, quoting, types, collations, and search paths.
+
+2. **Parser fail-closed properties**
+   - Arbitrary and mutated SQL must never panic, hang, emit placeholders, or
+     silently lose schema-affecting information.
+
+3. **Regression corpus**
+   - Seed fuzzing from real `pg_dump` output, archived bugs, and production-like
+     schemas; minimize every failure and commit it as a deterministic test.
+
+### P1 — Cross-Version and Operational Confidence
+
+1. **Postgres differential round trips**
+   - Generate schemas, apply them to PG 15–18, extract them, and prove the diff
+     is empty.
+   - Generate schema evolutions, apply the planned DDL, and prove the resulting
+     catalog matches the desired schema.
+
+2. **Planner, DDL, migration graph, and configuration fuzzing**
+   - Cover dependency cycles, overloaded functions, duplicate/missing
+     migrations, quoted/Unicode identifiers, YAML/env expansion, and connection
+     string boundaries.
+
+3. **Replayable dump validation**
+   - Restore every generated dump into an empty database and verify it with an
+     empty diff in CI.
+
+4. **Failure and concurrency testing**
+   - Exercise cancellation, connection loss, concurrent runners, lock
+     contention, commit ambiguity, server restart/failover, and partially failed
+     non-transactional migrations.
+
+5. **Production CI matrix**
+   - Run unit, race, static analysis, vulnerability, and integration checks
+     against every supported Postgres version.
+
+### P2 — System-Critical Operational Hardening
+
+1. **Operational documentation and recovery**
+   - Document least-privilege roles, backups, forward-fix/rollback procedures,
+     interrupted deployments, disaster recovery, and incident response.
+
+2. **Observability and auditability**
+   - Add structured/machine-readable output, migration timing and status,
+     actionable lock diagnostics, and durable execution metadata.
+
+3. **Performance and resource limits**
+   - Test large catalogs and long migration histories, bound parser/catalog
+     resource use, and simulate deploys under concurrent application traffic.
+
+4. **Release supply chain**
+   - Produce reproducible artifacts with SBOMs, provenance, and signatures, and
+     verify them in the installation path.
+
+5. **Long-running fuzz campaigns**
+   - Run short deterministic fuzz smoke tests on pull requests, longer pure
+     component fuzzing nightly, and scheduled stateful PG 15–18 campaigns.
+
+### Production Exit Gate
+
+Production readiness requires all P0 items, the P0.5 safety properties, and the
+P1 cross-version/apply guarantees to be complete. For system-critical use, the
+relevant P2 operational controls and runbooks must also be in place. “Fuzzing
+ran for N hours” is not itself an exit criterion: discovered cases must become
+deterministic regressions, and the defined safety properties must hold.
+
+---
+
 ## Milestone v0.1 — Safe for Early Adopters (“never wrong silently”)
 
 ### Goals
@@ -158,4 +290,3 @@ If implemented, policies should be:
 - Clearly behind a feature flag or advertised as fully supported.
 - Extracted/diffed with complete role handling (no placeholders).
 - Tested across PG 15–18 in the same roundtrip model.
-
