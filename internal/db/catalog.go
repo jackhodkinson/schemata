@@ -1029,24 +1029,25 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 
 // extractFunctionBody extracts the function body from pg_get_functiondef() output
 // Uses pg_query to parse the CREATE FUNCTION statement and extract the body from the AST
-func extractFunctionBody(fullDef string) string {
+func extractFunctionBody(fullDef string) (string, error) {
 	// Parse the CREATE FUNCTION statement using pg_query
 	result, err := pg_query.Parse(fullDef)
 	if err != nil {
-		// If parsing fails, return empty string
-		// This shouldn't happen with valid pg_get_functiondef() output
-		return ""
+		return "", fmt.Errorf("failed to parse pg_get_functiondef output: %w", err)
 	}
 
 	// Extract the CreateFunctionStmt from the parsed result
 	if len(result.Stmts) == 0 {
-		return ""
+		return "", fmt.Errorf("pg_get_functiondef output contained no statements")
 	}
 
 	stmt := result.Stmts[0].Stmt
+	if stmt == nil {
+		return "", fmt.Errorf("pg_get_functiondef output contained an empty statement")
+	}
 	createFuncNode, ok := stmt.Node.(*pg_query.Node_CreateFunctionStmt)
 	if !ok {
-		return ""
+		return "", fmt.Errorf("pg_get_functiondef output was %T, not CREATE FUNCTION", stmt.Node)
 	}
 
 	createFunc := createFuncNode.CreateFunctionStmt
@@ -1065,15 +1066,16 @@ func extractFunctionBody(fullDef string) string {
 			// Function body can be a single string or a list of strings
 			// This matches the parser logic in internal/parser/objects.go:238-246
 			if body := extractStringValue(defElem.DefElem.Arg); body != "" {
-				return strings.TrimSpace(body)
+				return strings.TrimSpace(body), nil
 			} else if bodyParts := extractListValues(defElem.DefElem.Arg); len(bodyParts) > 0 {
 				// PL/pgSQL functions often have body as a list of strings
-				return strings.TrimSpace(strings.Join(bodyParts, "\n"))
+				return strings.TrimSpace(strings.Join(bodyParts, "\n")), nil
 			}
+			return "", fmt.Errorf("CREATE FUNCTION AS option did not contain a body")
 		}
 	}
 
-	return ""
+	return "", fmt.Errorf("CREATE FUNCTION definition did not contain an AS body")
 }
 
 // extractStringValue extracts a string from a pg_query Node (helper for AST traversal)
@@ -1169,7 +1171,10 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 		// Extract function body from pg_get_functiondef output
 		// pg_get_functiondef returns: CREATE OR REPLACE FUNCTION ... AS $tag$ body $tag$
 		// We need to extract just the body part
-		fn.Body = extractFunctionBody(source)
+		fn.Body, err = extractFunctionBody(source)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract function %s.%s body: %w", fn.Schema, fn.Name, err)
+		}
 		fn.Comment = comment
 
 		// Parse volatility

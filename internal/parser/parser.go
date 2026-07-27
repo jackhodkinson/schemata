@@ -141,7 +141,12 @@ func (p *Parser) parseSQLObjects(sql string) ([]schema.DatabaseObject, error) {
 		}
 
 		if commentStmt := rawStmt.Stmt.GetCommentStmt(); commentStmt != nil {
-			if instr := p.parseCommentInstruction(commentStmt); instr != nil {
+			instr, err := p.parseCommentInstruction(commentStmt)
+			if err != nil {
+				snippet := extractStatementSnippet(sql, int(rawStmt.StmtLocation), int(rawStmt.StmtLen))
+				return nil, fmt.Errorf("failed to parse COMMENT statement: %w\n\nStatement snippet:\n%s", err, snippet)
+			}
+			if instr != nil {
 				comments = append(comments, *instr)
 			}
 			continue
@@ -162,7 +167,10 @@ func (p *Parser) parseSQLObjects(sql string) ([]schema.DatabaseObject, error) {
 	}
 
 	if len(comments) > 0 {
-		objects = p.applyCommentInstructions(objects, comments)
+		objects, err = p.applyCommentInstructions(objects, comments)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	objects = p.mergeGrantsAndOwners(objects, result)
@@ -224,12 +232,20 @@ func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, erro
 		*pg_query.Node_AlterOwnerStmt:
 		// Handled in mergeGrantsAndOwners after object extraction.
 		return nil, nil
-	case *pg_query.Node_VariableSetStmt,
-		*pg_query.Node_VariableShowStmt,
-		*pg_query.Node_TransactionStmt,
-		*pg_query.Node_SelectStmt:
-		// These statements are commonly present in dumps/fixtures and do not define schema objects directly.
+	case *pg_query.Node_VariableShowStmt,
+		*pg_query.Node_TransactionStmt:
+		// These statements inspect/session-wrap work but do not define schema objects.
 		return nil, nil
+	case *pg_query.Node_VariableSetStmt:
+		return nil, &UnsupportedStatementError{
+			StatementType: "SET",
+			Remediation:   "session settings such as search_path can change the meaning of subsequent DDL; schema files must use explicit qualified names",
+		}
+	case *pg_query.Node_SelectStmt:
+		return nil, &UnsupportedStatementError{
+			StatementType: "SELECT",
+			Remediation:   "top-level SELECT may have side effects (for example SELECT INTO or set_config); remove it from the declarative schema",
+		}
 	default:
 		// Fail closed: unknown statements may affect schema correctness (e.g., ALTER, DO, DROP).
 		return nil, &UnsupportedStatementError{
@@ -255,9 +271,9 @@ func (p *Parser) extractQualifiedName(rangeVar *pg_query.RangeVar) (schema.Schem
 
 // Helper to deparse an expression node back to SQL
 // This is critical for constraints, defaults, and index expressions
-func (p *Parser) deparseExpr(node *pg_query.Node) string {
+func (p *Parser) deparseExpr(node *pg_query.Node) (string, error) {
 	if node == nil {
-		return ""
+		return "", fmt.Errorf("cannot deparse a nil expression")
 	}
 
 	// For simple cases, use pg_query_go's deparsing
@@ -278,9 +294,7 @@ func (p *Parser) deparseExpr(node *pg_query.Node) string {
 		}}},
 	})
 	if err != nil {
-		// If deparsing fails, return a placeholder
-		// This is better than crashing
-		return "(expression)"
+		return "", fmt.Errorf("failed to deparse expression AST: %w", err)
 	}
 
 	// Extract just the expression from "SELECT <expr>"
@@ -288,7 +302,10 @@ func (p *Parser) deparseExpr(node *pg_query.Node) string {
 	result = strings.TrimPrefix(result, "SELECT ")
 	result = strings.TrimSuffix(result, ";")
 
-	return result
+	if result == "" {
+		return "", fmt.Errorf("expression AST deparsed to empty SQL")
+	}
+	return result, nil
 }
 
 type commentInstruction struct {
@@ -298,9 +315,9 @@ type commentInstruction struct {
 	comment *string
 }
 
-func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) *commentInstruction {
+func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) (*commentInstruction, error) {
 	if stmt == nil {
-		return nil
+		return nil, fmt.Errorf("nil COMMENT statement")
 	}
 
 	var commentPtr *string
@@ -313,7 +330,7 @@ func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) *commentIns
 	case pg_query.ObjectType_OBJECT_TABLE, pg_query.ObjectType_OBJECT_MATVIEW:
 		names := extractStringList(stmt.Object)
 		if len(names) == 0 {
-			return nil
+			return nil, fmt.Errorf("COMMENT ON TABLE is missing an object name")
 		}
 		schemaName := schema.SchemaName("public")
 		tableName := names[len(names)-1]
@@ -324,11 +341,11 @@ func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) *commentIns
 			schema:  schemaName,
 			table:   schema.TableName(tableName),
 			comment: commentPtr,
-		}
+		}, nil
 	case pg_query.ObjectType_OBJECT_COLUMN:
 		names := extractStringList(stmt.Object)
 		if len(names) < 2 {
-			return nil
+			return nil, fmt.Errorf("COMMENT ON COLUMN is missing a table or column name")
 		}
 		schemaName := schema.SchemaName("public")
 		tableName := names[len(names)-2]
@@ -341,15 +358,15 @@ func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) *commentIns
 			table:   schema.TableName(tableName),
 			column:  &columnName,
 			comment: commentPtr,
-		}
+		}, nil
 	default:
-		return nil
+		return nil, fmt.Errorf("unsupported COMMENT target type %s; remove it or manage it in a manual migration", stmt.Objtype)
 	}
 }
 
-func (p *Parser) applyCommentInstructions(objects []schema.DatabaseObject, comments []commentInstruction) []schema.DatabaseObject {
+func (p *Parser) applyCommentInstructions(objects []schema.DatabaseObject, comments []commentInstruction) ([]schema.DatabaseObject, error) {
 	if len(comments) == 0 {
-		return objects
+		return objects, nil
 	}
 
 	type tableKey struct {
@@ -368,28 +385,33 @@ func (p *Parser) applyCommentInstructions(objects []schema.DatabaseObject, comme
 		key := tableKey{schema: instr.schema, name: instr.table}
 		idx, ok := index[key]
 		if !ok {
-			continue
+			return nil, fmt.Errorf("COMMENT target table %s.%s was not defined in the schema input", instr.schema, instr.table)
 		}
 		tbl, ok := objects[idx].(schema.Table)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("COMMENT target %s.%s is not a table", instr.schema, instr.table)
 		}
 
 		if instr.column == nil {
 			tbl.Comment = instr.comment
 		} else {
+			found := false
 			for i := range tbl.Columns {
 				if tbl.Columns[i].Name == *instr.column {
 					tbl.Columns[i].Comment = instr.comment
+					found = true
 					break
 				}
+			}
+			if !found {
+				return nil, fmt.Errorf("COMMENT target column %s.%s.%s was not defined in the schema input", instr.schema, instr.table, *instr.column)
 			}
 		}
 
 		objects[idx] = tbl
 	}
 
-	return objects
+	return objects, nil
 }
 
 func extractStringList(node *pg_query.Node) []string {

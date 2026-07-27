@@ -86,7 +86,11 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 	}
 
 	if len(stmt.Options) > 0 {
-		table.RelOptions = p.parseRelOptions(stmt.Options)
+		var err error
+		table.RelOptions, err = p.parseRelOptions(stmt.Options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse table %s options: %w", table.Name, err)
+		}
 	}
 
 	// Auto-generate names for unnamed constraints to match PostgreSQL's auto-naming
@@ -177,7 +181,11 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 
 	// Parse column type
 	if col.TypeName != nil {
-		column.Type = p.parseTypeName(col.TypeName)
+		var err error
+		column.Type, err = p.parseTypeName(col.TypeName)
+		if err != nil {
+			return schema.Column{}, false, false, nil, nil, fmt.Errorf("failed to parse type for column %s: %w", col.Colname, err)
+		}
 	}
 
 	if col.CollClause != nil {
@@ -198,7 +206,10 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 		}
 
 		if c, ok := constraint.Node.(*pg_query.Node_Constraint); ok {
-			isPK, isUQ, fk, ck := p.parseColumnConstraint(c.Constraint, &column)
+			isPK, isUQ, fk, ck, err := p.parseColumnConstraint(c.Constraint, &column)
+			if err != nil {
+				return schema.Column{}, false, false, nil, nil, err
+			}
 			if isPK {
 				isPrimaryKey = true
 			}
@@ -218,9 +229,9 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 }
 
 // parseTypeName converts a TypeName node to our TypeName
-func (p *Parser) parseTypeName(typeName *pg_query.TypeName) schema.TypeName {
+func (p *Parser) parseTypeName(typeName *pg_query.TypeName) (schema.TypeName, error) {
 	if typeName == nil {
-		return ""
+		return "", nil
 	}
 
 	// Build type name from names list
@@ -240,7 +251,11 @@ func (p *Parser) parseTypeName(typeName *pg_query.TypeName) schema.TypeName {
 
 	// Handle type modifiers (e.g., varchar(255), numeric(10,2))
 	if len(typeName.Typmods) > 0 {
-		typeStr += "(" + p.formatTypeModifiers(typeName.Typmods) + ")"
+		modifiers, err := p.formatTypeModifiers(typeName.Typmods)
+		if err != nil {
+			return "", err
+		}
+		typeStr += "(" + modifiers + ")"
 	}
 
 	// Handle array types
@@ -248,13 +263,13 @@ func (p *Parser) parseTypeName(typeName *pg_query.TypeName) schema.TypeName {
 		typeStr += "[]"
 	}
 
-	return schema.TypeName(typeStr)
+	return schema.TypeName(typeStr), nil
 }
 
 // formatTypeModifiers formats type modifiers for display
-func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) string {
+func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) (string, error) {
 	if len(mods) == 0 {
-		return ""
+		return "", nil
 	}
 
 	// Use deparse to get the proper representation
@@ -263,9 +278,13 @@ func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) string {
 		if i > 0 {
 			result += ", "
 		}
-		result += p.deparseExpr(mod)
+		value, err := p.deparseExpr(mod)
+		if err != nil {
+			return "", fmt.Errorf("failed to deparse type modifier %d: %w", i+1, err)
+		}
+		result += value
 	}
-	return result
+	return result, nil
 }
 
 // parseColumnConstraint parses column-level constraints
@@ -274,20 +293,20 @@ func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) string {
 // - isUnique: true if this is a UNIQUE constraint (needs table-level handling)
 // - foreignKey: non-nil if this is a REFERENCES constraint (needs to be added to table.ForeignKeys)
 // - checkConstraint: non-nil if this is a CHECK constraint (needs to be added to table.Checks)
-func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) (bool, bool, *schema.ForeignKey, *schema.CheckConstraint) {
+func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) (bool, bool, *schema.ForeignKey, *schema.CheckConstraint, error) {
 	if constraint == nil {
-		return false, false, nil, nil
+		return false, false, nil, nil, nil
 	}
 
 	switch constraint.Contype {
 	case pg_query.ConstrType_CONSTR_PRIMARY:
 		// PRIMARY KEY on column - caller needs to handle this at table level
 		column.NotNull = true // Primary keys are implicitly NOT NULL
-		return true, false, nil, nil
+		return true, false, nil, nil, nil
 
 	case pg_query.ConstrType_CONSTR_UNIQUE:
 		// UNIQUE constraint on column - caller needs to handle this at table level
-		return false, true, nil, nil
+		return false, true, nil, nil, nil
 
 	case pg_query.ConstrType_CONSTR_NOTNULL:
 		column.NotNull = true
@@ -295,7 +314,10 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 	case pg_query.ConstrType_CONSTR_CHECK:
 		// Column-level CHECK constraint
 		if constraint.RawExpr != nil {
-			exprStr := p.deparseExpr(constraint.RawExpr)
+			exprStr, err := p.deparseExpr(constraint.RawExpr)
+			if err != nil {
+				return false, false, nil, nil, fmt.Errorf("failed to deparse CHECK expression: %w", err)
+			}
 			check := &schema.CheckConstraint{
 				Name:              constraint.Conname,
 				Expr:              schema.Expr(exprStr),
@@ -304,12 +326,15 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 				InitiallyDeferred: constraint.Initdeferred,
 				NotValid:          constraint.SkipValidation,
 			}
-			return false, false, nil, check
+			return false, false, nil, check, nil
 		}
 
 	case pg_query.ConstrType_CONSTR_DEFAULT:
 		if constraint.RawExpr != nil {
-			exprStr := p.deparseExpr(constraint.RawExpr)
+			exprStr, err := p.deparseExpr(constraint.RawExpr)
+			if err != nil {
+				return false, false, nil, nil, fmt.Errorf("failed to deparse DEFAULT expression: %w", err)
+			}
 			expr := schema.Expr(exprStr)
 			column.Default = &expr
 		}
@@ -321,7 +346,10 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 	case pg_query.ConstrType_CONSTR_GENERATED:
 		// GENERATED column
 		if constraint.RawExpr != nil {
-			exprStr := p.deparseExpr(constraint.RawExpr)
+			exprStr, err := p.deparseExpr(constraint.RawExpr)
+			if err != nil {
+				return false, false, nil, nil, fmt.Errorf("failed to deparse generated expression: %w", err)
+			}
 			stored := true
 			if constraint.GeneratedWhen != "" {
 				stored = !(constraint.GeneratedWhen == "v" || constraint.GeneratedWhen == "V")
@@ -370,10 +398,10 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 			NotValid:          constraint.SkipValidation,
 		}
 
-		return false, false, fk, nil
+		return false, false, fk, nil, nil
 	}
 
-	return false, false, nil, nil
+	return false, false, nil, nil, nil
 }
 
 // parseTableConstraint parses table-level constraints
@@ -410,7 +438,10 @@ func (p *Parser) parseTableConstraint(constraint *pg_query.Constraint, table *sc
 	case pg_query.ConstrType_CONSTR_CHECK:
 		// Check constraint
 		if constraint.RawExpr != nil {
-			exprStr := p.deparseExpr(constraint.RawExpr)
+			exprStr, err := p.deparseExpr(constraint.RawExpr)
+			if err != nil {
+				return fmt.Errorf("failed to deparse CHECK expression: %w", err)
+			}
 			table.Checks = append(table.Checks, schema.CheckConstraint{
 				Name:              constraintName,
 				Expr:              schema.Expr(exprStr),
@@ -561,7 +592,7 @@ func (p *Parser) normalizeIdentityOption(defElem *pg_query.DefElem) *schema.Sequ
 	return nil
 }
 
-func (p *Parser) parseRelOptions(nodes []*pg_query.Node) []string {
+func (p *Parser) parseRelOptions(nodes []*pg_query.Node) ([]string, error) {
 	var options []string
 
 	for _, node := range nodes {
@@ -571,7 +602,10 @@ func (p *Parser) parseRelOptions(nodes []*pg_query.Node) []string {
 		}
 
 		if defElem.Arg != nil {
-			value := p.relOptionValue(defElem)
+			value, err := p.relOptionValue(defElem)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse option %s: %w", defElem.Defname, err)
+			}
 			options = append(options, fmt.Sprintf("%s=%s", defElem.Defname, value))
 		} else {
 			options = append(options, defElem.Defname)
@@ -579,26 +613,26 @@ func (p *Parser) parseRelOptions(nodes []*pg_query.Node) []string {
 	}
 
 	sort.Strings(options)
-	return options
+	return options, nil
 }
 
-func (p *Parser) relOptionValue(defElem *pg_query.DefElem) string {
+func (p *Parser) relOptionValue(defElem *pg_query.DefElem) (string, error) {
 	if defElem == nil || defElem.Arg == nil {
-		return ""
+		return "", nil
 	}
 
 	switch value := defElem.Arg.Node.(type) {
 	case *pg_query.Node_Integer:
-		return strconv.FormatInt(int64(value.Integer.Ival), 10)
+		return strconv.FormatInt(int64(value.Integer.Ival), 10), nil
 	case *pg_query.Node_Float:
-		return value.Float.Fval
+		return value.Float.Fval, nil
 	case *pg_query.Node_String_:
-		return fmt.Sprintf("'%s'", strings.ReplaceAll(value.String_.Sval, "'", "''"))
+		return fmt.Sprintf("'%s'", strings.ReplaceAll(value.String_.Sval, "'", "''")), nil
 	case *pg_query.Node_Boolean:
 		if value.Boolean.Boolval {
-			return "true"
+			return "true", nil
 		}
-		return "false"
+		return "false", nil
 	default:
 		return p.deparseExpr(defElem.Arg)
 	}

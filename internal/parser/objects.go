@@ -27,11 +27,13 @@ func (p *Parser) parseCreateView(stmt *pg_query.ViewStmt) (schema.DatabaseObject
 		result, err := pg_query.Deparse(&pg_query.ParseResult{
 			Stmts: []*pg_query.RawStmt{{Stmt: stmt.Query}},
 		})
-		if err == nil {
-			queryStr = strings.TrimSpace(result)
-			queryStr = strings.TrimSuffix(queryStr, ";")
-		} else {
-			queryStr = "(view query)"
+		if err != nil {
+			return nil, fmt.Errorf("failed to deparse view %s.%s query: %w", schemaName, viewName, err)
+		}
+		queryStr = strings.TrimSpace(result)
+		queryStr = strings.TrimSuffix(queryStr, ";")
+		if queryStr == "" {
+			return nil, fmt.Errorf("view %s.%s query deparsed to empty SQL", schemaName, viewName)
 		}
 	}
 
@@ -145,15 +147,22 @@ func (p *Parser) parseCreateFunction(stmt *pg_query.CreateFunctionStmt) (schema.
 			continue
 		}
 		if funcParam, ok := param.Node.(*pg_query.Node_FunctionParameter); ok {
-			arg := p.parseFunctionParameter(funcParam.FunctionParameter)
+			arg, err := p.parseFunctionParameter(funcParam.FunctionParameter)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse function %s argument: %w", funcName, err)
+			}
 			function.Args = append(function.Args, arg)
 		}
 	}
 
 	// Parse return type
 	if stmt.ReturnType != nil {
+		returnType, err := p.parseTypeName(stmt.ReturnType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse function %s return type: %w", funcName, err)
+		}
 		function.Returns = schema.ReturnsType{
-			Type: p.parseTypeName(stmt.ReturnType),
+			Type: returnType,
 		}
 	}
 
@@ -205,7 +214,7 @@ func inferFunctionReturnFromArgs(args []schema.FunctionArg) schema.FunctionRetur
 }
 
 // parseFunctionParameter parses a function parameter
-func (p *Parser) parseFunctionParameter(param *pg_query.FunctionParameter) schema.FunctionArg {
+func (p *Parser) parseFunctionParameter(param *pg_query.FunctionParameter) (schema.FunctionArg, error) {
 	arg := schema.FunctionArg{
 		Mode: schema.InMode,
 	}
@@ -218,7 +227,11 @@ func (p *Parser) parseFunctionParameter(param *pg_query.FunctionParameter) schem
 
 	// Parameter type
 	if param.ArgType != nil {
-		arg.Type = p.parseTypeName(param.ArgType)
+		var err error
+		arg.Type, err = p.parseTypeName(param.ArgType)
+		if err != nil {
+			return schema.FunctionArg{}, err
+		}
 	}
 
 	// Parameter mode
@@ -235,12 +248,15 @@ func (p *Parser) parseFunctionParameter(param *pg_query.FunctionParameter) schem
 
 	// Default value
 	if param.Defexpr != nil {
-		exprStr := p.deparseExpr(param.Defexpr)
+		exprStr, err := p.deparseExpr(param.Defexpr)
+		if err != nil {
+			return schema.FunctionArg{}, err
+		}
 		expr := schema.Expr(exprStr)
 		arg.Default = &expr
 	}
 
-	return arg
+	return arg, nil
 }
 
 // parseFunctionOption parses function options (LANGUAGE, VOLATILITY, etc.)
@@ -390,14 +406,20 @@ func (p *Parser) parseCreatePolicy(stmt *pg_query.CreatePolicyStmt) (schema.Data
 
 	// Parse USING clause
 	if stmt.Qual != nil {
-		usingStr := p.deparseExpr(stmt.Qual)
+		usingStr, err := p.deparseExpr(stmt.Qual)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse policy %s USING expression: %w", policy.Name, err)
+		}
 		using := schema.Expr(usingStr)
 		policy.Using = &using
 	}
 
 	// Parse WITH CHECK clause
 	if stmt.WithCheck != nil {
-		withCheckStr := p.deparseExpr(stmt.WithCheck)
+		withCheckStr, err := p.deparseExpr(stmt.WithCheck)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse policy %s WITH CHECK expression: %w", policy.Name, err)
+		}
 		withCheck := schema.Expr(withCheckStr)
 		policy.WithCheck = &withCheck
 	}

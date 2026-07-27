@@ -59,6 +59,34 @@ func TestParseSQLRejectsDuplicateDefinitions(t *testing.T) {
 	assert.Contains(t, err.Error(), "duplicate schema object")
 }
 
+func TestParserRejectsMeaningChangingSessionAndSelectStatements(t *testing.T) {
+	for name, sql := range map[string]string{
+		"search path": `SET search_path = tenant, public; CREATE TABLE users (id integer);`,
+		"select into": `SELECT 1 AS id INTO created_by_select;`,
+		"set config":  `SELECT pg_catalog.set_config('search_path', '', false);`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewParser().ParseSQL(sql)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "Statement snippet")
+		})
+	}
+}
+
+func TestParserRejectsUnsupportedOrUnmatchedComments(t *testing.T) {
+	for name, sql := range map[string]string{
+		"unsupported target": `CREATE TABLE users (id integer); COMMENT ON SCHEMA public IS 'x';`,
+		"missing table":      `COMMENT ON TABLE missing IS 'x';`,
+		"missing column":     `CREATE TABLE users (id integer); COMMENT ON COLUMN users.missing IS 'x';`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewParser().ParseSQL(sql)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "COMMENT")
+		})
+	}
+}
+
 func TestParsePreservesQualifiedTypeIdentity(t *testing.T) {
 	objectMap, err := NewParser().ParseSQL(`
 		CREATE TABLE public.typed_values (

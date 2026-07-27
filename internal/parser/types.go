@@ -3,8 +3,8 @@ package parser
 import (
 	"fmt"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // parseCreateEnum parses a CREATE TYPE ... AS ENUM statement
@@ -70,7 +70,11 @@ func (p *Parser) parseCreateDomain(stmt *pg_query.CreateDomainStmt) (schema.Data
 
 	// Parse base type
 	if stmt.TypeName != nil {
-		domain.BaseType = p.parseTypeName(stmt.TypeName)
+		var err error
+		domain.BaseType, err = p.parseTypeName(stmt.TypeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse domain %s base type: %w", domainName, err)
+		}
 	}
 
 	// Parse constraints
@@ -79,7 +83,9 @@ func (p *Parser) parseCreateDomain(stmt *pg_query.CreateDomainStmt) (schema.Data
 			continue
 		}
 		if c, ok := constraint.Node.(*pg_query.Node_Constraint); ok {
-			p.parseDomainConstraint(c.Constraint, &domain)
+			if err := p.parseDomainConstraint(c.Constraint, &domain); err != nil {
+				return nil, fmt.Errorf("failed to parse domain %s constraint: %w", domainName, err)
+			}
 		}
 	}
 
@@ -87,9 +93,9 @@ func (p *Parser) parseCreateDomain(stmt *pg_query.CreateDomainStmt) (schema.Data
 }
 
 // parseDomainConstraint parses domain constraints
-func (p *Parser) parseDomainConstraint(constraint *pg_query.Constraint, domain *schema.DomainDef) {
+func (p *Parser) parseDomainConstraint(constraint *pg_query.Constraint, domain *schema.DomainDef) error {
 	if constraint == nil {
-		return
+		return nil
 	}
 
 	switch constraint.Contype {
@@ -98,18 +104,25 @@ func (p *Parser) parseDomainConstraint(constraint *pg_query.Constraint, domain *
 
 	case pg_query.ConstrType_CONSTR_DEFAULT:
 		if constraint.RawExpr != nil {
-			exprStr := p.deparseExpr(constraint.RawExpr)
+			exprStr, err := p.deparseExpr(constraint.RawExpr)
+			if err != nil {
+				return fmt.Errorf("failed to deparse DEFAULT expression: %w", err)
+			}
 			expr := schema.Expr(exprStr)
 			domain.Default = &expr
 		}
 
 	case pg_query.ConstrType_CONSTR_CHECK:
 		if constraint.RawExpr != nil {
-			exprStr := p.deparseExpr(constraint.RawExpr)
+			exprStr, err := p.deparseExpr(constraint.RawExpr)
+			if err != nil {
+				return fmt.Errorf("failed to deparse CHECK expression: %w", err)
+			}
 			expr := schema.Expr(exprStr)
 			domain.Check = &expr
 		}
 	}
+	return nil
 }
 
 // parseCreateComposite parses a CREATE TYPE ... AS composite statement
@@ -132,9 +145,13 @@ func (p *Parser) parseCreateComposite(stmt *pg_query.CompositeTypeStmt) (schema.
 			continue
 		}
 		if colDef, ok := col.Node.(*pg_query.Node_ColumnDef); ok {
+			attrType, err := p.parseTypeName(colDef.ColumnDef.TypeName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse composite %s attribute %s type: %w", typeName, colDef.ColumnDef.Colname, err)
+			}
 			attr := schema.CompositeAttr{
 				Name: colDef.ColumnDef.Colname,
-				Type: p.parseTypeName(colDef.ColumnDef.TypeName),
+				Type: attrType,
 			}
 			composite.Attributes = append(composite.Attributes, attr)
 		}

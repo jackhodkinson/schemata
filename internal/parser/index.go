@@ -3,8 +3,8 @@ package parser
 import (
 	"fmt"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/jackhodkinson/schemata/pkg/schema"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
 
 // parseCreateIndex parses a CREATE INDEX statement
@@ -32,7 +32,10 @@ func (p *Parser) parseCreateIndex(stmt *pg_query.IndexStmt) (schema.DatabaseObje
 		}
 
 		if indexElem, ok := param.Node.(*pg_query.Node_IndexElem); ok {
-			keyExpr := p.parseIndexElement(indexElem.IndexElem)
+			keyExpr, err := p.parseIndexElement(indexElem.IndexElem)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse index %s key: %w", index.Name, err)
+			}
 			index.KeyExprs = append(index.KeyExprs, keyExpr)
 		}
 	}
@@ -51,7 +54,10 @@ func (p *Parser) parseCreateIndex(stmt *pg_query.IndexStmt) (schema.DatabaseObje
 
 	// Parse WHERE clause (partial index)
 	if stmt.WhereClause != nil {
-		predicateStr := p.deparseExpr(stmt.WhereClause)
+		predicateStr, err := p.deparseExpr(stmt.WhereClause)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse index %s predicate: %w", index.Name, err)
+		}
 		predicate := schema.Expr(predicateStr)
 		index.Predicate = &predicate
 	}
@@ -60,14 +66,17 @@ func (p *Parser) parseCreateIndex(stmt *pg_query.IndexStmt) (schema.DatabaseObje
 }
 
 // parseIndexElement parses an index element (column or expression)
-func (p *Parser) parseIndexElement(elem *pg_query.IndexElem) schema.IndexKeyExpr {
+func (p *Parser) parseIndexElement(elem *pg_query.IndexElem) (schema.IndexKeyExpr, error) {
 	keyExpr := schema.IndexKeyExpr{}
 
 	// Column name or expression
 	if elem.Name != "" {
 		keyExpr.Expr = schema.Expr(elem.Name)
 	} else if elem.Expr != nil {
-		exprStr := p.deparseExpr(elem.Expr)
+		exprStr, err := p.deparseExpr(elem.Expr)
+		if err != nil {
+			return schema.IndexKeyExpr{}, err
+		}
 		keyExpr.Expr = schema.Expr(exprStr)
 	}
 
@@ -105,7 +114,7 @@ func (p *Parser) parseIndexElement(elem *pg_query.IndexElem) schema.IndexKeyExpr
 		}
 	}
 
-	return keyExpr
+	return keyExpr, nil
 }
 
 // extractCollationName extracts collation name from node list

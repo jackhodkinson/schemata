@@ -57,9 +57,26 @@ $body$`,
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := extractFunctionBody(tt.input)
+			result, err := extractFunctionBody(tt.input)
+			if err != nil {
+				t.Fatalf("extractFunctionBody() error: %v", err)
+			}
 			if result != tt.expected {
 				t.Errorf("extractFunctionBody() =\n%q\n\nwant:\n%q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractFunctionBodyFailsClosed(t *testing.T) {
+	for _, input := range []string{
+		"not valid SQL",
+		"SELECT 1",
+		"CREATE FUNCTION public.f() RETURNS void LANGUAGE sql",
+	} {
+		t.Run(input, func(t *testing.T) {
+			if _, err := extractFunctionBody(input); err == nil {
+				t.Fatal("extractFunctionBody() unexpectedly succeeded")
 			}
 		})
 	}
