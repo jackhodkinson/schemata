@@ -50,6 +50,15 @@ func TestParseSimpleTable(t *testing.T) {
 	}
 }
 
+func TestParseSQLRejectsDuplicateDefinitions(t *testing.T) {
+	_, err := NewParser().ParseSQL(`
+		CREATE TABLE public.users (id integer);
+		CREATE TABLE public.users (id integer, email text);
+	`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate schema object")
+}
+
 func TestParsePreservesQualifiedTypeIdentity(t *testing.T) {
 	objectMap, err := NewParser().ParseSQL(`
 		CREATE TABLE public.typed_values (

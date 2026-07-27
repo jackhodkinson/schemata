@@ -1,6 +1,7 @@
 package objectmap
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
@@ -23,6 +24,22 @@ func TestKey_FunctionIncludesSignature(t *testing.T) {
 	require.Equal(t, schema.SchemaName("public"), key.Schema)
 	require.Equal(t, "do_thing", key.Name)
 	require.Equal(t, "(integer,text)", key.Signature)
+}
+
+func TestBuildRejectsDuplicateCanonicalIdentity(t *testing.T) {
+	objects := []schema.DatabaseObject{
+		schema.Table{Schema: "public", Name: "users"},
+		schema.Table{Schema: "public", Name: "users"},
+	}
+
+	_, err := Build(objects)
+	require.Error(t, err)
+
+	var duplicate *DuplicateObjectError
+	require.True(t, errors.As(err, &duplicate))
+	require.Equal(t, schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"}, duplicate.Key)
+	require.Equal(t, 0, duplicate.FirstIndex)
+	require.Equal(t, 1, duplicate.SecondIndex)
 }
 
 func TestBuild_UsesCanonicalIdentityAndHashing(t *testing.T) {
