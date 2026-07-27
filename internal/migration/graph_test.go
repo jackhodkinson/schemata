@@ -134,3 +134,57 @@ func TestTopoSortMigrations_SingleMigration(t *testing.T) {
 	require.Len(t, sorted, 1)
 	assert.Equal(t, "20231015000000", sorted[0].Version)
 }
+
+func TestValidateInventoryRejectsInvalidIdentitiesAndDependencies(t *testing.T) {
+	tests := []struct {
+		name       string
+		migrations []Migration
+		want       string
+	}{
+		{
+			name: "duplicate version",
+			migrations: []Migration{
+				{Version: "001", SQL: "SELECT 1"},
+				{Version: "001", SQL: "SELECT 2"},
+			},
+			want: "duplicate migration version",
+		},
+		{
+			name: "missing dependency",
+			migrations: []Migration{
+				{Version: "002", SQL: "-- schemata:depends-on 001\nSELECT 1"},
+			},
+			want: "depends on missing migration 001",
+		},
+		{
+			name: "self dependency",
+			migrations: []Migration{
+				{Version: "001", SQL: "-- schemata:depends-on 001\nSELECT 1"},
+			},
+			want: "depends on itself",
+		},
+		{
+			name: "duplicate dependency",
+			migrations: []Migration{
+				{Version: "001", SQL: "SELECT 1"},
+				{Version: "002", SQL: "-- schemata:depends-on 001\n-- schemata:depends-on 001\nSELECT 2"},
+			},
+			want: "declares duplicate dependency",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateInventory(tt.migrations)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestValidateInventoryAcceptsCompleteGraph(t *testing.T) {
+	require.NoError(t, ValidateInventory([]Migration{
+		{Version: "001", SQL: "SELECT 1"},
+		{Version: "002", SQL: "-- schemata:depends-on 001\nSELECT 2"},
+	}))
+}

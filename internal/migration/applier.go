@@ -64,6 +64,10 @@ func FilterPendingMigrations(pending, allVersions []string, opts ApplyOptions) (
 
 // Apply applies all pending migrations
 func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyOptions) error {
+	if err := ValidateInventory(migrations); err != nil {
+		return fmt.Errorf("invalid migration inventory: %w", err)
+	}
+
 	// Ensure migration tracking schema exists
 	if !opts.DryRun {
 		if err := a.tracker.EnsureSchema(ctx); err != nil {

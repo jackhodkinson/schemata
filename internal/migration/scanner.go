@@ -67,6 +67,12 @@ func (s *Scanner) Scan() ([]Migration, error) {
 	sort.Slice(migrations, func(i, j int) bool {
 		return migrations[i].Version < migrations[j].Version
 	})
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i-1].Version == migrations[i].Version {
+			return nil, fmt.Errorf("duplicate migration version %s in %q and %q",
+				migrations[i].Version, migrations[i-1].FilePath, migrations[i].FilePath)
+		}
+	}
 
 	return migrations, nil
 }
@@ -74,6 +80,7 @@ func (s *Scanner) Scan() ([]Migration, error) {
 // LoadSQL loads the SQL content of a migration
 func (m *Migration) LoadSQL() error {
 	if m.SQL != "" {
+		m.DependsOn = parseDirectives(m.SQL)
 		return nil // Already loaded
 	}
 

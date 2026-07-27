@@ -6,6 +6,43 @@ import (
 	"strings"
 )
 
+// ValidateInventory loads and validates the complete local migration graph
+// before database history is consulted. This prevents already-applied files
+// from hiding malformed dependencies or duplicate identities.
+func ValidateInventory(migrations []Migration) error {
+	byVersion := make(map[string]int, len(migrations))
+	for i := range migrations {
+		if first, exists := byVersion[migrations[i].Version]; exists {
+			return fmt.Errorf("duplicate migration version %s at positions %d and %d",
+				migrations[i].Version, first+1, i+1)
+		}
+		byVersion[migrations[i].Version] = i
+		if err := migrations[i].LoadSQL(); err != nil {
+			return fmt.Errorf("failed to load migration %s (%s): %w",
+				migrations[i].Version, migrations[i].FilePath, err)
+		}
+	}
+
+	for i := range migrations {
+		seenDeps := make(map[string]bool, len(migrations[i].DependsOn))
+		for _, dep := range migrations[i].DependsOn {
+			if dep == migrations[i].Version {
+				return fmt.Errorf("migration %s depends on itself", migrations[i].Version)
+			}
+			if seenDeps[dep] {
+				return fmt.Errorf("migration %s declares duplicate dependency %s", migrations[i].Version, dep)
+			}
+			seenDeps[dep] = true
+			if _, exists := byVersion[dep]; !exists {
+				return fmt.Errorf("migration %s depends on missing migration %s", migrations[i].Version, dep)
+			}
+		}
+	}
+
+	_, err := topoSortMigrations(migrations)
+	return err
+}
+
 // topoSortMigrations returns migrations ordered by their dependency chains
 // using Kahn's algorithm. When no dependencies exist, the output is identical
 // to sorting by Version ascending (backward compatible).
