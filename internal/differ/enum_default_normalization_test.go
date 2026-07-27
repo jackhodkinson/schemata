@@ -6,14 +6,9 @@ import (
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
 
-// TestEnumDefaultValueNormalization tests that ENUM default values with and without
-// explicit type casting are treated as equivalent.
-//
-// This is the root cause test for the ENUM default value detection bug where:
-// - PostgreSQL catalog returns: 'user'::user_role
-// - Parser from schema.sql produces: 'user'
-//
-// Both should be treated as equivalent after normalization.
+// TestEnumDefaultValueNormalization verifies that expression-only
+// normalization preserves casts. A cast is removed only when a containing typed
+// field proves it redundant.
 func TestEnumDefaultValueNormalization(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -25,7 +20,7 @@ func TestEnumDefaultValueNormalization(t *testing.T) {
 			name:     "enum default with and without type cast",
 			expr1:    "'user'::user_role",
 			expr2:    "'user'",
-			expected: true,
+			expected: false,
 		},
 		{
 			name:     "enum default with different values",
@@ -49,7 +44,7 @@ func TestEnumDefaultValueNormalization(t *testing.T) {
 			name:     "different enum types but same value",
 			expr1:    "'active'::status_type",
 			expr2:    "'active'::user_status",
-			expected: true, // We normalize away the type cast, so values should match
+			expected: false,
 		},
 		{
 			name:     "numeric defaults should not be affected",

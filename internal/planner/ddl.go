@@ -255,10 +255,11 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("CREATE TABLE %s.%s (", tbl.Schema, tbl.Name))
 
-	// Columns (sorted by name for deterministic DDL; semantic column order in FKs/PK is unchanged)
+	// Column order is semantic in PostgreSQL (including SELECT * and physical
+	// tuple layout), so preserve the declaration order.
 	var colDefs []string
 	var columnComments []string
-	for _, col := range sortedColumns(tbl.Columns) {
+	for _, col := range tbl.Columns {
 		base := fmt.Sprintf("  %s %s", col.Name, col.Type)
 		colParts := []string{base}
 
@@ -426,22 +427,21 @@ func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
 	stmt := fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s)",
 		uniqueStr, idx.Name, idx.Schema, idx.Table, idx.Method, strings.Join(keyExprs, ", "))
 
-	// Add WHERE clause for partial index
+	if len(idx.Include) > 0 {
+		includeCols := make([]string, len(idx.Include))
+		for i, col := range idx.Include {
+			includeCols[i] = string(col)
+		}
+		stmt += fmt.Sprintf(" INCLUDE (%s)", strings.Join(includeCols, ", "))
+	}
+
+	// PostgreSQL grammar requires INCLUDE before WHERE.
 	if idx.Predicate != nil {
 		predicate := strings.TrimSpace(string(*idx.Predicate))
 		if shouldWrapPredicate(predicate) && !(strings.HasPrefix(predicate, "(") && strings.HasSuffix(predicate, ")")) {
 			predicate = fmt.Sprintf("(%s)", predicate)
 		}
 		stmt += fmt.Sprintf(" WHERE %s", predicate)
-	}
-
-	if len(idx.Include) > 0 {
-		inc := sortedIncludeColumns(idx.Include)
-		includeCols := make([]string, len(inc))
-		for i, col := range inc {
-			includeCols[i] = string(col)
-		}
-		stmt += fmt.Sprintf(" INCLUDE (%s)", strings.Join(includeCols, ", "))
 	}
 
 	stmt += ";"
@@ -750,19 +750,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 		} else if strings.HasPrefix(change, "drop column ") {
 			colName := strings.TrimPrefix(change, "drop column ")
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP COLUMN %s;", tbl.Schema, tbl.Name, colName))
-			} else if strings.HasPrefix(change, "alter column ") {
-				// Parse "alter column <name>: <details>"
-				parts := strings.SplitN(strings.TrimPrefix(change, "alter column "), ": ", 2)
-				if len(parts) == 2 {
-					colName := parts[0]
-					changeDetail := parts[1]
-					colStatements, err := g.generateColumnAlter(tbl, oldTable, colName, changeDetail)
-					if err != nil {
-						return nil, err
-					}
-					statements = append(statements, colStatements...)
+		} else if strings.HasPrefix(change, "alter column ") {
+			// Parse "alter column <name>: <details>"
+			parts := strings.SplitN(strings.TrimPrefix(change, "alter column "), ": ", 2)
+			if len(parts) == 2 {
+				colName := parts[0]
+				changeDetail := parts[1]
+				colStatements, err := g.generateColumnAlter(tbl, oldTable, colName, changeDetail)
+				if err != nil {
+					return nil, err
 				}
-			} else if strings.HasPrefix(change, "add primary key") {
+				statements = append(statements, colStatements...)
+			}
+		} else if strings.HasPrefix(change, "add primary key") {
 			if tbl.PrimaryKey != nil {
 				pkCols := make([]string, len(tbl.PrimaryKey.Cols))
 				for i, col := range tbl.PrimaryKey.Cols {
@@ -777,22 +777,22 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				pkStmt += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
 				statements = append(statements, pkStmt+";")
 			}
-			} else if strings.HasPrefix(change, "drop primary key") {
-				if oldPKName != "" {
-					statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-						tbl.Schema, tbl.Name, oldPKName))
-				} else {
-					return nil, &UnsupportedChangeError{
-						Key: schema.ObjectKey{
-							Kind:      schema.TableKind,
-							Schema:    tbl.Schema,
-							Name:      string(tbl.Name),
-							TableName: "",
-						},
-						Change:      change,
-						Remediation: "The old primary key constraint name is not available. Manually drop the primary key using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " DROP CONSTRAINT <constraint_name>;",
-					}
+		} else if strings.HasPrefix(change, "drop primary key") {
+			if oldPKName != "" {
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
+					tbl.Schema, tbl.Name, oldPKName))
+			} else {
+				return nil, &UnsupportedChangeError{
+					Key: schema.ObjectKey{
+						Kind:      schema.TableKind,
+						Schema:    tbl.Schema,
+						Name:      string(tbl.Name),
+						TableName: "",
+					},
+					Change:      change,
+					Remediation: "The old primary key constraint name is not available. Manually drop the primary key using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " DROP CONSTRAINT <constraint_name>;",
 				}
+			}
 		} else if strings.HasPrefix(change, "primary key columns changed") || strings.Contains(change, "primary key") && strings.Contains(change, "changed") {
 			// Drop old primary key and add new one
 			if oldPKName != "" {
@@ -916,21 +916,21 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 						} else {
 							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
 						}
-						} else {
-							return nil, &UnsupportedChangeError{
-								Key: schema.ObjectKey{
-									Kind:      schema.TableKind,
-									Schema:    tbl.Schema,
-									Name:      string(tbl.Name),
-									TableName: "",
-								},
-								Change:      fmt.Sprintf("check constraint %s validation changed", constraintName),
-								Remediation: "The check constraint details are not available in the old schema. Manually validate the constraint using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " VALIDATE CONSTRAINT " + constraintName + ";",
-							}
+					} else {
+						return nil, &UnsupportedChangeError{
+							Key: schema.ObjectKey{
+								Kind:      schema.TableKind,
+								Schema:    tbl.Schema,
+								Name:      string(tbl.Name),
+								TableName: "",
+							},
+							Change:      fmt.Sprintf("check constraint %s validation changed", constraintName),
+							Remediation: "The check constraint details are not available in the old schema. Manually validate the constraint using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " VALIDATE CONSTRAINT " + constraintName + ";",
 						}
 					}
 				}
-			} else if strings.Contains(change, "check constraint") && strings.Contains(change, "changed") {
+			}
+		} else if strings.Contains(change, "check constraint") && strings.Contains(change, "changed") {
 			// Modified check constraint: drop and recreate
 			parts := strings.Fields(change)
 			if len(parts) >= 3 {
@@ -964,20 +964,20 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 						} else {
 							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
 						}
-						} else {
-							return nil, &UnsupportedChangeError{
-								Key: schema.ObjectKey{
-									Kind:      schema.TableKind,
-									Schema:    tbl.Schema,
-									Name:      string(tbl.Name),
-									TableName: "",
-								},
-								Change:      fmt.Sprintf("foreign key %s validation changed", constraintName),
-								Remediation: "The foreign key constraint details are not available in the old schema. Manually validate the constraint using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " VALIDATE CONSTRAINT " + constraintName + ";",
-							}
+					} else {
+						return nil, &UnsupportedChangeError{
+							Key: schema.ObjectKey{
+								Kind:      schema.TableKind,
+								Schema:    tbl.Schema,
+								Name:      string(tbl.Name),
+								TableName: "",
+							},
+							Change:      fmt.Sprintf("foreign key %s validation changed", constraintName),
+							Remediation: "The foreign key constraint details are not available in the old schema. Manually validate the constraint using: ALTER TABLE " + string(tbl.Schema) + "." + string(tbl.Name) + " VALIDATE CONSTRAINT " + constraintName + ";",
 						}
 					}
 				}
+			}
 		} else if strings.Contains(change, "foreign key") && strings.Contains(change, "changed") {
 			// Modified foreign key: drop and recreate
 			parts := strings.Fields(change)
@@ -994,23 +994,23 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 					}
 				}
 			}
-			} else {
-				// Fallback for other changes
-				return nil, &UnsupportedChangeError{
-					Key: schema.ObjectKey{
-						Kind:      schema.TableKind,
-						Schema:    tbl.Schema,
-						Name:      string(tbl.Name),
-						TableName: "",
-					},
-					Change:      change,
-					Remediation: "This table change type is not yet supported by schemata. Review the diff output and apply the change manually.",
-				}
+		} else {
+			// Fallback for other changes
+			return nil, &UnsupportedChangeError{
+				Key: schema.ObjectKey{
+					Kind:      schema.TableKind,
+					Schema:    tbl.Schema,
+					Name:      string(tbl.Name),
+					TableName: "",
+				},
+				Change:      change,
+				Remediation: "This table change type is not yet supported by schemata. Review the diff output and apply the change manually.",
 			}
 		}
-
-		return statements, nil
 	}
+
+	return statements, nil
+}
 
 func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Table, colName, changeDetail string) ([]string, error) {
 	var statements []string

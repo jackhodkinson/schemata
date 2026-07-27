@@ -7,20 +7,6 @@ import (
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
 
-// sortedColumns returns a copy of columns sorted by name for deterministic DDL.
-func sortedColumns(cols []schema.Column) []schema.Column {
-	if len(cols) <= 1 {
-		out := make([]schema.Column, len(cols))
-		copy(out, cols)
-		return out
-	}
-	out := append([]schema.Column(nil), cols...)
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].Name < out[j].Name
-	})
-	return out
-}
-
 func sortedUniques(u []schema.UniqueConstraint) []schema.UniqueConstraint {
 	if len(u) <= 1 {
 		out := make([]schema.UniqueConstraint, len(u))
@@ -94,19 +80,6 @@ func sortedTriggerEvents(ev []schema.TriggerEvent) []schema.TriggerEvent {
 		return out
 	}
 	out := append([]schema.TriggerEvent(nil), ev...)
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i] < out[j]
-	})
-	return out
-}
-
-func sortedIncludeColumns(cols []schema.ColumnName) []schema.ColumnName {
-	if len(cols) <= 1 {
-		out := make([]schema.ColumnName, len(cols))
-		copy(out, cols)
-		return out
-	}
-	out := append([]schema.ColumnName(nil), cols...)
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i] < out[j]
 	})

@@ -233,8 +233,9 @@ func (p *Parser) parseTypeName(typeName *pg_query.TypeName) schema.TypeName {
 
 	typeStr := ""
 	if len(parts) > 0 {
-		// Last part is the type name, earlier parts are schema
-		typeStr = parts[len(parts)-1]
+		// Preserve qualification: user-defined types with the same name in
+		// different schemas are not interchangeable.
+		typeStr = strings.Join(parts, ".")
 	}
 
 	// Handle type modifiers (e.g., varchar(255), numeric(10,2))

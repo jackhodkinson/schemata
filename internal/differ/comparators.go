@@ -28,6 +28,10 @@ func compareTables(desired, actual schema.Table) []string {
 		actualCols[col.Name] = col
 	}
 
+	if sameColumnSet(desiredCols, actualCols) && !columnOrderEqual(desired.Columns, actual.Columns) {
+		changes = append(changes, "column order changed")
+	}
+
 	// Find added columns
 	for _, name := range sortedColumnNames(desiredCols) {
 		if _, exists := actualCols[name]; !exists {
@@ -82,6 +86,30 @@ func compareTables(desired, actual schema.Table) []string {
 	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
+}
+
+func sameColumnSet(a, b map[schema.ColumnName]schema.Column) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name := range a {
+		if _, ok := b[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func columnOrderEqual(a, b []schema.Column) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 // compareColumns compares two column objects

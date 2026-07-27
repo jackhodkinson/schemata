@@ -29,9 +29,9 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 		return typeName
 	}
 
-	// Strip schema qualification for stable comparisons (parser typically does not preserve it).
-	// This intentionally keeps only the final identifier component for dotted names like
-	// "pg_catalog.int4" or public.my_domain.
+	// pg_catalog qualification is redundant for built-in aliases. Qualification
+	// on user-defined types is semantic and must be preserved: a.value_type and
+	// b.value_type are different types and can identify different overloads.
 	if strings.Contains(typeStr, ".") && !strings.Contains(typeStr, " ") {
 		arraySuffix := ""
 		for strings.HasSuffix(typeStr, "[]") {
@@ -39,7 +39,12 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 			typeStr = strings.TrimSuffix(typeStr, "[]")
 		}
 		if idx := strings.LastIndex(typeStr, "."); idx != -1 {
-			typeStr = typeStr[idx+1:]
+			qualifier := typeStr[:idx]
+			if strings.EqualFold(strings.Trim(qualifier, `"`), "pg_catalog") {
+				typeStr = typeStr[idx+1:]
+			} else {
+				return TypeName(typeStr + arraySuffix)
+			}
 		}
 		typeStr += arraySuffix
 	}
@@ -100,4 +105,3 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 
 	return TypeName(typeStr)
 }
-

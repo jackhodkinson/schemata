@@ -180,6 +180,10 @@ func TestNormalizeTypeName(t *testing.T) {
 		{"character", "char"},
 		{"text", "text"}, // Should stay as-is
 		{"uuid", "uuid"}, // Should stay as-is
+		{"pg_catalog.int4", "integer"},
+		{"public.value_type", "public.value_type"},
+		{"tenant.value_type[]", "tenant.value_type[]"},
+		{`"Tenant"."ValueType"`, `"Tenant"."ValueType"`},
 	}
 
 	for _, tt := range tests {

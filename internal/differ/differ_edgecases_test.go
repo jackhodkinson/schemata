@@ -573,8 +573,8 @@ func TestDifferTableReloptionsChange(t *testing.T) {
 	assert.Contains(t, diff.ToAlter[0].Changes, "reloptions changed")
 }
 
-// Test column order normalization (column order is normalized for equivalence)
-func TestDifferColumnOrderNormalized(t *testing.T) {
+// PostgreSQL column order is semantic (SELECT *, row types, and tuple layout).
+func TestDifferColumnOrderChangeIsDetected(t *testing.T) {
 	key := schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"}
 
 	table1 := schema.Table{
@@ -597,15 +597,13 @@ func TestDifferColumnOrderNormalized(t *testing.T) {
 		},
 	}
 
-	// Compute actual hashes - they should be the same after normalization
 	hash1, err := NormalizeAndHash(table1)
 	require.NoError(t, err)
 
 	hash2, err := NormalizeAndHash(table2)
 	require.NoError(t, err)
 
-	// After normalization, tables with same columns in different order should have same hash
-	assert.Equal(t, hash1, hash2, "Normalized hashes should be equal for same columns in different order")
+	assert.NotEqual(t, hash1, hash2, "different column order must not normalize as equivalent")
 
 	// Same columns, different order
 	desired := schema.SchemaObjectMap{
@@ -626,6 +624,5 @@ func TestDifferColumnOrderNormalized(t *testing.T) {
 	diff, err := differ.Diff(desired, actual)
 	require.NoError(t, err)
 
-	// Should detect no changes since hashes are the same
-	assert.True(t, diff.IsEmpty(), "Tables with same columns in different order should be equivalent")
+	assert.False(t, diff.IsEmpty(), "different column order must produce a diff")
 }

@@ -34,12 +34,12 @@ func TestGenerateCreateTable(t *testing.T) {
 	assert.Contains(t, stmt, "email TEXT NOT NULL")
 	assert.Contains(t, stmt, "name TEXT")
 	assert.Contains(t, stmt, "PRIMARY KEY (id)")
-	// Column definitions are emitted in sorted name order (email, id, name).
+	// Column definitions preserve declaration order.
 	emailAt := strings.Index(stmt, "email TEXT")
 	idAt := strings.Index(stmt, "id INTEGER")
 	nameAt := strings.Index(stmt, "name TEXT")
-	assert.Less(t, emailAt, idAt)
-	assert.Less(t, idAt, nameAt)
+	assert.Less(t, idAt, emailAt)
+	assert.Less(t, emailAt, nameAt)
 }
 
 func TestGenerateCreateTableWithConstraints(t *testing.T) {
@@ -266,6 +266,24 @@ func TestGenerateCreatePartialIndex(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, stmt, "WHERE (deleted_at IS NULL)")
+}
+
+func TestGenerateCreateIndexPreservesIncludeOrderAndGrammar(t *testing.T) {
+	gen := NewDDLGenerator()
+	predicate := schema.Expr("deleted_at IS NULL")
+	index := schema.Index{
+		Schema:    "public",
+		Table:     "users",
+		Name:      "idx_active_users_covering",
+		Method:    schema.BTree,
+		KeyExprs:  []schema.IndexKeyExpr{{Expr: "email"}},
+		Include:   []schema.ColumnName{"display_name", "id"},
+		Predicate: &predicate,
+	}
+
+	stmt, err := gen.GenerateCreateStatement(index)
+	require.NoError(t, err)
+	assert.Contains(t, stmt, "INCLUDE (display_name, id) WHERE (deleted_at IS NULL)")
 }
 
 func TestGenerateCreateView(t *testing.T) {

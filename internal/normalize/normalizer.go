@@ -2,7 +2,6 @@ package normalize
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -49,18 +48,15 @@ func Expr(expr schema.Expr) schema.Expr {
 		exprStr = canonical
 	}
 
-	typeCastRegex := regexp.MustCompile(`::[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)*(?:\[\])*`)
-	exprStr = typeCastRegex.ReplaceAllString(exprStr, "")
 	exprStr = stripOuterParentheses(exprStr)
 
-	exprLower := strings.ToLower(exprStr)
-	if exprLower == "current_timestamp" || exprLower == "current_timestamp()" {
+	if strings.EqualFold(exprStr, "current_timestamp") || strings.EqualFold(exprStr, "current_timestamp()") {
 		return "current_timestamp"
 	}
-	if exprLower == "now()" {
+	if strings.EqualFold(exprStr, "now()") {
 		return "current_timestamp"
 	}
-	return schema.Expr(exprLower)
+	return schema.Expr(exprStr)
 }
 
 // FunctionBody normalizes function bodies while preserving quoted literals/identifiers.
@@ -161,7 +157,7 @@ func table(tbl schema.Table) schema.Table {
 	for i := range normalizedCols {
 		normalizedCols[i].Type = schema.NormalizeTypeName(normalizedCols[i].Type)
 		if normalizedCols[i].Default != nil {
-			normalized := Expr(*normalizedCols[i].Default)
+			normalized := exprForType(*normalizedCols[i].Default, normalizedCols[i].Type)
 			normalizedCols[i].Default = &normalized
 		}
 		if normalizedCols[i].Generated != nil {
@@ -169,9 +165,6 @@ func table(tbl schema.Table) schema.Table {
 		}
 	}
 
-	sort.Slice(normalizedCols, func(i, j int) bool {
-		return normalizedCols[i].Name < normalizedCols[j].Name
-	})
 	tbl.Columns = normalizedCols
 
 	for i := range tbl.Uniques {
@@ -212,11 +205,6 @@ func index(idx schema.Index) schema.Index {
 		idx.Predicate = &normalized
 	}
 
-	sortedInclude := make([]schema.ColumnName, len(idx.Include))
-	copy(sortedInclude, idx.Include)
-	sort.Slice(sortedInclude, func(i, j int) bool { return sortedInclude[i] < sortedInclude[j] })
-	idx.Include = sortedInclude
-
 	return idx
 }
 
@@ -248,7 +236,7 @@ func function(fn schema.Function) schema.Function {
 	for i := range fn.Args {
 		fn.Args[i].Type = schema.NormalizeTypeName(fn.Args[i].Type)
 		if fn.Args[i].Default != nil {
-			normalized := Expr(*fn.Args[i].Default)
+			normalized := exprForType(*fn.Args[i].Default, fn.Args[i].Type)
 			fn.Args[i].Default = &normalized
 		}
 	}
@@ -269,11 +257,6 @@ func function(fn schema.Function) schema.Function {
 
 	fn.Body = FunctionBody(fn.Body)
 
-	sortedPath := make([]schema.SchemaName, len(fn.SearchPath))
-	copy(sortedPath, fn.SearchPath)
-	sort.Slice(sortedPath, func(i, j int) bool { return sortedPath[i] < sortedPath[j] })
-	fn.SearchPath = sortedPath
-
 	fn.Grants = schema.CanonicalizeGrants(fn.Grants)
 	return fn
 }
@@ -290,7 +273,7 @@ func enum(enum schema.EnumDef) schema.EnumDef {
 func domain(domain schema.DomainDef) schema.DomainDef {
 	domain.BaseType = schema.NormalizeTypeName(domain.BaseType)
 	if domain.Default != nil {
-		normalized := Expr(*domain.Default)
+		normalized := exprForType(*domain.Default, domain.BaseType)
 		domain.Default = &normalized
 	}
 	if domain.Check != nil {
@@ -301,11 +284,94 @@ func domain(domain schema.DomainDef) schema.DomainDef {
 }
 
 func composite(comp schema.CompositeDef) schema.CompositeDef {
-	sortedAttrs := make([]schema.CompositeAttr, len(comp.Attributes))
-	copy(sortedAttrs, comp.Attributes)
-	sort.Slice(sortedAttrs, func(i, j int) bool { return sortedAttrs[i].Name < sortedAttrs[j].Name })
-	comp.Attributes = sortedAttrs
 	return comp
+}
+
+// exprForType removes only a trailing cast that is provably redundant in the
+// typed field being normalized. Expr itself deliberately preserves casts
+// because casts can change values, operators, collations, and function
+// resolution.
+func exprForType(expr schema.Expr, valueType schema.TypeName) schema.Expr {
+	normalized := Expr(expr)
+	base, castType, ok := splitTrailingCast(string(normalized))
+	if !ok || schema.NormalizeTypeName(schema.TypeName(castType)) != schema.NormalizeTypeName(valueType) {
+		return normalized
+	}
+	return schema.Expr(stripOuterParentheses(strings.TrimSpace(base)))
+}
+
+func splitTrailingCast(expr string) (base string, castType string, ok bool) {
+	const (
+		castStateNormal = iota
+		castStateSingleQuote
+		castStateDoubleQuote
+		castStateDollarQuote
+	)
+
+	state := castStateNormal
+	depth := 0
+	dollarTag := ""
+	lastCast := -1
+
+	for i := 0; i < len(expr); i++ {
+		switch state {
+		case castStateNormal:
+			switch expr[i] {
+			case '\'':
+				state = castStateSingleQuote
+			case '"':
+				state = castStateDoubleQuote
+			case '(':
+				depth++
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+			case '$':
+				if tag, found := detectDollarTag(expr, i); found {
+					state = castStateDollarQuote
+					dollarTag = tag
+					i += len(tag) - 1
+				}
+			case ':':
+				if depth == 0 && i+1 < len(expr) && expr[i+1] == ':' {
+					lastCast = i
+					i++
+				}
+			}
+		case castStateSingleQuote:
+			if expr[i] == '\'' {
+				if i+1 < len(expr) && expr[i+1] == '\'' {
+					i++
+				} else {
+					state = castStateNormal
+				}
+			}
+		case castStateDoubleQuote:
+			if expr[i] == '"' {
+				if i+1 < len(expr) && expr[i+1] == '"' {
+					i++
+				} else {
+					state = castStateNormal
+				}
+			}
+		case castStateDollarQuote:
+			if strings.HasPrefix(expr[i:], dollarTag) {
+				i += len(dollarTag) - 1
+				state = castStateNormal
+			}
+		}
+	}
+
+	if lastCast < 0 {
+		return "", "", false
+	}
+	base = strings.TrimSpace(expr[:lastCast])
+	castType = strings.TrimSpace(expr[lastCast+2:])
+	if base == "" || castType == "" {
+		return "", "", false
+	}
+	return base, castType, true
 }
 
 func trigger(trig schema.Trigger) schema.Trigger {

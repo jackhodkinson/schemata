@@ -50,6 +50,23 @@ func TestParseSimpleTable(t *testing.T) {
 	}
 }
 
+func TestParsePreservesQualifiedTypeIdentity(t *testing.T) {
+	objectMap, err := NewParser().ParseSQL(`
+		CREATE TABLE public.typed_values (
+			a first.value_type,
+			b second.value_type
+		);
+	`)
+	require.NoError(t, err)
+
+	key := schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "typed_values"}
+	table, ok := objectMap[key].Payload.(schema.Table)
+	require.True(t, ok)
+	require.Len(t, table.Columns, 2)
+	assert.Equal(t, schema.TypeName("first.value_type"), table.Columns[0].Type)
+	assert.Equal(t, schema.TypeName("second.value_type"), table.Columns[1].Type)
+}
+
 func TestParseTableWithCollationAndComments(t *testing.T) {
 	sql := `
 		CREATE TABLE users (
