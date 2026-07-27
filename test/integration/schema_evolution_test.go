@@ -234,9 +234,9 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 		CREATE TABLE users (
 			id SERIAL PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			username TEXT UNIQUE,
-			is_active BOOLEAN DEFAULT true,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			is_active BOOLEAN DEFAULT true
 		);
 
 		CREATE TABLE posts (
@@ -244,8 +244,8 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 			user_id INTEGER NOT NULL REFERENCES users(id),
 			title TEXT NOT NULL,
 			body TEXT,
-			is_published BOOLEAN DEFAULT false,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+			is_published BOOLEAN DEFAULT false
 		);
 
 		CREATE INDEX idx_posts_user_id ON posts(user_id);
@@ -267,18 +267,18 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 		CREATE TABLE users (
 			id SERIAL PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			username TEXT UNIQUE,
-			is_active BOOLEAN DEFAULT true,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			is_active BOOLEAN DEFAULT true
 		);
 
 		CREATE TABLE posts (
 			id SERIAL PRIMARY KEY,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			title VARCHAR(500) NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			is_published BOOLEAN DEFAULT false,
-			published_at TIMESTAMP WITH TIME ZONE,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			published_at TIMESTAMP WITH TIME ZONE
 		);
 
 		CREATE INDEX idx_posts_user_id ON posts(user_id);
@@ -300,9 +300,9 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 		CREATE TABLE users (
 			id SERIAL PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			username TEXT UNIQUE,
 			is_active BOOLEAN DEFAULT true,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 		);
 
@@ -310,9 +310,9 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			title VARCHAR(500) NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			is_published BOOLEAN DEFAULT false,
 			published_at TIMESTAMP WITH TIME ZONE,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 		);
 
@@ -355,9 +355,9 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 		CREATE TABLE users (
 			id SERIAL PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			username TEXT UNIQUE,
 			is_active BOOLEAN DEFAULT true,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 		);
 
@@ -365,11 +365,11 @@ func TestSchemaEvolution_MultiStep(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			title VARCHAR(500) NOT NULL,
-			status post_status DEFAULT 'draft',
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			is_published BOOLEAN DEFAULT false,
 			published_at TIMESTAMP WITH TIME ZONE,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+			status post_status DEFAULT 'draft'
 		);
 
 		CREATE INDEX idx_posts_user_id ON posts(user_id);
@@ -882,8 +882,8 @@ func TestFileBasedMigrationWorkflow(t *testing.T) {
 		CREATE TABLE accounts (
 			id SERIAL PRIMARY KEY,
 			name TEXT NOT NULL,
-			email TEXT UNIQUE,
-			active BOOLEAN DEFAULT true
+			active BOOLEAN DEFAULT true,
+			email TEXT UNIQUE
 		);
 	`
 	desiredV2 := parseSQL(t, v2SQL)
@@ -1250,4 +1250,3 @@ func TestDropAndRecreateEverything(t *testing.T) {
 	}
 	assert.True(t, verifyDiff.IsEmpty(), "round-trip after full replacement should be clean")
 }
-

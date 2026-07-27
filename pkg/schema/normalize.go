@@ -29,6 +29,12 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 		return typeName
 	}
 
+	if strings.HasPrefix(strings.ToLower(typeStr), "pg_catalog.") {
+		typeStr = typeStr[len("pg_catalog."):]
+	} else if strings.HasPrefix(strings.ToLower(typeStr), `"pg_catalog".`) {
+		typeStr = typeStr[len(`"pg_catalog".`):]
+	}
+
 	// pg_catalog qualification is redundant for built-in aliases. Qualification
 	// on user-defined types is semantic and must be preserved: a.value_type and
 	// b.value_type are different types and can identify different overloads.

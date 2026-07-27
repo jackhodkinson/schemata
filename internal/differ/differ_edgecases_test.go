@@ -626,3 +626,19 @@ func TestDifferColumnOrderChangeIsDetected(t *testing.T) {
 
 	assert.False(t, diff.IsEmpty(), "different column order must produce a diff")
 }
+
+func TestExpressionsEquivalentOnlyStripsCatalogSideCasts(t *testing.T) {
+	require.True(t, expressionsEquivalent(
+		`status = 'pending'`,
+		`status = 'pending'::invite_status`,
+	))
+	require.False(t, expressionsEquivalent(
+		`status = 'pending'::first_status`,
+		`status = 'pending'::second_status`,
+	))
+	actualGenerated := schema.Expr(`(((COALESCE(first_name, ''::character varying))::text || ' '::text) || (COALESCE(last_name, ''::character varying))::text)`)
+	require.True(t, expressionsEquivalent(
+		`COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')`,
+		actualGenerated,
+	))
+}

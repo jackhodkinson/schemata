@@ -39,3 +39,9 @@ func TestSortAlterChanges_DeterministicAcrossRuns(t *testing.T) {
 		last = cp
 	}
 }
+
+func TestSortAlterChanges_PreservesAddColumnOrder(t *testing.T) {
+	changes := []string{"add column z", "add column a"}
+	SortAlterChanges(changes)
+	assert.Equal(t, []string{"add column z", "add column a"}, changes)
+}

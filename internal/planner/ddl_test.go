@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/jackhodkinson/schemata/internal/differ"
+	"github.com/jackhodkinson/schemata/internal/objectmap"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -645,6 +646,28 @@ func TestGenerateDDLOrdering(t *testing.T) {
 
 	// CREATE should come before DROP
 	assert.Greater(t, dropIdx, createIdx, "DROP should come after CREATE")
+}
+
+func TestGenerateDDLPreservesAddedColumnOrder(t *testing.T) {
+	oldTable := schema.Table{
+		Schema: "public", Name: "accounts",
+		Columns: []schema.Column{{Name: "id", Type: "integer"}, {Name: "name", Type: "text"}},
+	}
+	newTable := oldTable
+	newTable.Columns = append(append([]schema.Column(nil), oldTable.Columns...),
+		schema.Column{Name: "email", Type: "text"},
+		schema.Column{Name: "active", Type: "boolean"},
+	)
+	desired, err := objectmap.Build([]schema.DatabaseObject{newTable})
+	require.NoError(t, err)
+	actual, err := objectmap.Build([]schema.DatabaseObject{oldTable})
+	require.NoError(t, err)
+	diff, err := differ.NewDiffer().Diff(desired, actual)
+	require.NoError(t, err)
+
+	ddl, err := NewDDLGenerator().GenerateDDL(diff, desired, actual)
+	require.NoError(t, err)
+	assert.Less(t, strings.Index(ddl, "ADD COLUMN email"), strings.Index(ddl, "ADD COLUMN active"))
 }
 
 func TestGenerateDDLDropDoesNotDropRetainedDependency(t *testing.T) {

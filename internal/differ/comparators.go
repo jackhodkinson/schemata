@@ -2,8 +2,11 @@ package differ
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 
+	normalizer "github.com/jackhodkinson/schemata/internal/normalize"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
 
@@ -28,27 +31,27 @@ func compareTables(desired, actual schema.Table) []string {
 		actualCols[col.Name] = col
 	}
 
-	if sameColumnSet(desiredCols, actualCols) && !columnOrderEqual(desired.Columns, actual.Columns) {
+	if !columnOrderAchievableByAddDrop(desired.Columns, actual.Columns) {
 		changes = append(changes, "column order changed")
 	}
 
 	// Find added columns
-	for _, name := range sortedColumnNames(desiredCols) {
-		if _, exists := actualCols[name]; !exists {
-			changes = append(changes, fmt.Sprintf("add column %s", name))
+	for _, col := range desired.Columns {
+		if _, exists := actualCols[col.Name]; !exists {
+			changes = append(changes, fmt.Sprintf("add column %s", col.Name))
 		}
 	}
 
 	// Find dropped columns
-	for _, name := range sortedColumnNames(actualCols) {
-		if _, exists := desiredCols[name]; !exists {
-			changes = append(changes, fmt.Sprintf("drop column %s", name))
+	for _, col := range actual.Columns {
+		if _, exists := desiredCols[col.Name]; !exists {
+			changes = append(changes, fmt.Sprintf("drop column %s", col.Name))
 		}
 	}
 
 	// Find altered columns
-	for _, name := range sortedColumnNames(desiredCols) {
-		desiredCol := desiredCols[name]
+	for _, desiredCol := range desired.Columns {
+		name := desiredCol.Name
 		if actualCol, exists := actualCols[name]; exists {
 			colChanges := compareColumns(desiredCol, actualCol)
 			for _, change := range colChanges {
@@ -88,24 +91,32 @@ func compareTables(desired, actual schema.Table) []string {
 	return changes
 }
 
-func sameColumnSet(a, b map[schema.ColumnName]schema.Column) bool {
-	if len(a) != len(b) {
-		return false
+func columnOrderAchievableByAddDrop(desired, actual []schema.Column) bool {
+	desiredSet := make(map[schema.ColumnName]bool, len(desired))
+	actualSet := make(map[schema.ColumnName]bool, len(actual))
+	for _, col := range desired {
+		desiredSet[col.Name] = true
 	}
-	for name := range a {
-		if _, ok := b[name]; !ok {
-			return false
+	for _, col := range actual {
+		actualSet[col.Name] = true
+	}
+
+	result := make([]schema.ColumnName, 0, len(desired))
+	for _, col := range actual {
+		if desiredSet[col.Name] {
+			result = append(result, col.Name)
 		}
 	}
-	return true
-}
-
-func columnOrderEqual(a, b []schema.Column) bool {
-	if len(a) != len(b) {
+	for _, col := range desired {
+		if !actualSet[col.Name] {
+			result = append(result, col.Name)
+		}
+	}
+	if len(result) != len(desired) {
 		return false
 	}
-	for i := range a {
-		if a[i].Name != b[i].Name {
+	for i := range desired {
+		if desired[i].Name != result[i] {
 			return false
 		}
 	}
@@ -724,7 +735,63 @@ func exprPtrEqual(a, b *schema.Expr) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return *a == *b
+	return expressionsEquivalent(*a, *b)
+}
+
+var catalogCastPattern = regexp.MustCompile(`::[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)*(?:\([^)]*\))?(?:\[\])*`)
+
+// expressionsEquivalent is intentionally asymmetric: desired is the
+// declarative expression and actual is catalog-rendered SQL. PostgreSQL adds
+// explicit casts while resolving untyped literals. We may remove those casts
+// from actual to recover the desired spelling, but never remove casts from
+// desired—an explicitly requested cast remains semantic.
+func expressionsEquivalent(desired, actual schema.Expr) bool {
+	if desired == actual {
+		return true
+	}
+	withoutCatalogCasts := schema.Expr(catalogCastPattern.ReplaceAllString(string(actual), ""))
+	desiredCanonical := stripLeftAssociativeConcatParens(string(normalizer.Expr(desired)))
+	actualCanonical := stripLeftAssociativeConcatParens(string(normalizer.Expr(withoutCatalogCasts)))
+	return desiredCanonical == actualCanonical
+}
+
+func stripLeftAssociativeConcatParens(expr string) string {
+	for strings.HasPrefix(expr, "(") {
+		depth := 0
+		inString := false
+		closeAt := -1
+		for i := 0; i < len(expr); i++ {
+			switch expr[i] {
+			case '\'':
+				if inString && i+1 < len(expr) && expr[i+1] == '\'' {
+					i++
+					continue
+				}
+				inString = !inString
+			case '(':
+				if !inString {
+					depth++
+				}
+			case ')':
+				if !inString {
+					depth--
+					if depth == 0 {
+						closeAt = i
+						i = len(expr)
+					}
+				}
+			}
+		}
+		if closeAt < 0 || !strings.HasPrefix(expr[closeAt+1:], " || ") {
+			break
+		}
+		inside := expr[1:closeAt]
+		if !strings.Contains(inside, " || ") {
+			break
+		}
+		expr = inside + expr[closeAt+1:]
+	}
+	return expr
 }
 
 func int64PtrEqual(a, b *int64) bool {
@@ -768,7 +835,7 @@ func generatedSpecEqual(a, b *schema.GeneratedSpec) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.Expr == b.Expr && a.Stored == b.Stored
+	return expressionsEquivalent(a.Expr, b.Expr) && a.Stored == b.Stored
 }
 
 func identitySpecEqual(a, b *schema.IdentitySpec) bool {
@@ -842,7 +909,7 @@ func foreignKeyRefEqual(a, b schema.ForeignKeyRef) bool {
 }
 
 func indexKeyExprEqual(a, b schema.IndexKeyExpr) bool {
-	return a.Expr == b.Expr &&
+	return expressionsEquivalent(a.Expr, b.Expr) &&
 		stringPtrEqual(a.Collation, b.Collation) &&
 		stringPtrEqual(a.OpClass, b.OpClass) &&
 		indexOrderingPtrEqual(a.Ordering, b.Ordering) &&

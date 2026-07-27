@@ -16,7 +16,9 @@ func SortAlterChanges(changes []string) {
 		if ai != aj {
 			return ai < aj
 		}
-		return changes[i] < changes[j]
+		// Comparators already emit changes deterministically. Preserve their
+		// within-rank order because ADD COLUMN order is semantic.
+		return false
 	})
 }
 
