@@ -171,6 +171,26 @@ func (g *DDLGenerator) generateAlterSequenceOwnerAndGrants(seq schema.Sequence, 
 
 func (g *DDLGenerator) generateAlterFunction(fn schema.Function, alter differ.AlterOperation) ([]string, error) {
 	var stmts []string
+	needReplace := false
+	for _, ch := range alter.Changes {
+		if ch == "return type changed" || ch == "arguments changed" {
+			return nil, &UnsupportedChangeError{
+				Key:         alter.Key,
+				Change:      ch,
+				Remediation: "PostgreSQL cannot apply this change with CREATE OR REPLACE FUNCTION; use an explicit drop/create migration after reviewing dependents",
+			}
+		}
+		if ch != "owner changed" &&
+			ch != "comment changed" &&
+			!strings.HasPrefix(ch, "add grant\t") &&
+			!strings.HasPrefix(ch, "revoke grant\t") {
+			needReplace = true
+		}
+	}
+	if needReplace {
+		stmts = append(stmts, g.renderFunction(fn, true))
+	}
+
 	for _, ch := range alter.Changes {
 		if ch == "owner changed" && fn.Owner != nil {
 			stmts = append(stmts, fmt.Sprintf("ALTER FUNCTION %s OWNER TO %s;", functionSignatureForACL(fn), formatRoleIdent(*fn.Owner)))
@@ -185,15 +205,14 @@ func (g *DDLGenerator) generateAlterFunction(fn schema.Function, alter differ.Al
 			}
 		}
 	}
-	needReplace := false
 	for _, ch := range alter.Changes {
-		if ch != "owner changed" && !strings.HasPrefix(ch, "add grant\t") && !strings.HasPrefix(ch, "revoke grant\t") {
-			needReplace = true
-			break
+		if ch == "comment changed" {
+			if fn.Comment == nil {
+				stmts = append(stmts, fmt.Sprintf("COMMENT ON FUNCTION %s IS NULL;", functionSignatureForACL(fn)))
+			} else {
+				stmts = append(stmts, fmt.Sprintf("COMMENT ON FUNCTION %s IS %s;", functionSignatureForACL(fn), quoteLiteral(*fn.Comment)))
+			}
 		}
-	}
-	if needReplace {
-		stmts = append(stmts, g.generateCreateFunction(fn))
 	}
 	return stmts, nil
 }

@@ -346,7 +346,7 @@ func TestGenerateCreateFunction(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, stmt, "CREATE FUNCTION public.add")
-	assert.Contains(t, stmt, "a INTEGER, b INTEGER")
+	assert.Contains(t, stmt, `"a" INTEGER, "b" INTEGER`)
 	assert.Contains(t, stmt, "RETURNS INTEGER")
 	assert.Contains(t, stmt, "LANGUAGE plpgsql")
 	assert.Contains(t, stmt, "VOLATILITY IMMUTABLE")
@@ -390,6 +390,36 @@ func TestGenerateCreateEnum(t *testing.T) {
 	assert.Contains(t, stmt, "'active'")
 	assert.Contains(t, stmt, "'inactive'")
 	assert.Contains(t, stmt, "'pending'")
+}
+
+func TestGenerateCreateEnumQuotesLabels(t *testing.T) {
+	stmt, err := NewDDLGenerator().GenerateCreateStatement(schema.EnumDef{
+		Schema: "public",
+		Name:   "answer",
+		Values: []string{"it's valid"},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, stmt, "'it''s valid'")
+}
+
+func TestGenerateAlterEnumAppendsValuesAndRefusesUnsafeChanges(t *testing.T) {
+	gen := NewDDLGenerator()
+	key := schema.ObjectKey{Kind: schema.TypeKind, Schema: "public", Name: "status"}
+	oldEnum := schema.EnumDef{Schema: "public", Name: "status", Values: []string{"active"}}
+	newEnum := schema.EnumDef{Schema: "public", Name: "status", Values: []string{"active", "it's pending"}}
+
+	ddl, err := gen.GenerateDDL(&differ.Diff{ToAlter: []differ.AlterOperation{{
+		Key: key, Changes: []string{"enum values added at end"}, OldObject: oldEnum, NewObject: newEnum,
+	}}}, schema.SchemaObjectMap{})
+	require.NoError(t, err)
+	assert.Equal(t, "ALTER TYPE public.status ADD VALUE 'it''s pending';", ddl)
+
+	_, err = gen.GenerateDDL(&differ.Diff{ToAlter: []differ.AlterOperation{{
+		Key: key, Changes: []string{"enum values changed (unsafe)"}, OldObject: oldEnum,
+		NewObject: schema.EnumDef{Schema: "public", Name: "status", Values: []string{"renamed"}},
+	}}}, schema.SchemaObjectMap{})
+	var unsupported *UnsupportedChangeError
+	require.ErrorAs(t, err, &unsupported)
 }
 
 func TestGenerateCreateDomain(t *testing.T) {
@@ -471,6 +501,46 @@ func TestGenerateDropIndex(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, stmt, "DROP INDEX IF EXISTS public.idx_users_email")
+}
+
+func TestGenerateDropFunctionUsesIdentitySignature(t *testing.T) {
+	stmt, err := NewDDLGenerator().generateDrop(schema.ObjectKey{
+		Kind:      schema.FunctionKind,
+		Schema:    "public",
+		Name:      "calculate",
+		Signature: "(integer,text)",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "DROP FUNCTION IF EXISTS public.calculate(integer,text);", stmt)
+
+	_, err = NewDDLGenerator().generateDrop(schema.ObjectKey{
+		Kind: schema.FunctionKind, Schema: "public", Name: "calculate",
+	})
+	var unsupported *UnsupportedChangeError
+	require.ErrorAs(t, err, &unsupported)
+}
+
+func TestGenerateAlterFunctionUsesCreateOrReplaceAndRefusesReturnChange(t *testing.T) {
+	gen := NewDDLGenerator()
+	fn := schema.Function{
+		Schema: "public", Name: "calculate", Language: schema.SQL,
+		Args:    []schema.FunctionArg{{Type: "integer"}},
+		Returns: schema.ReturnsType{Type: "integer"},
+		Body:    "SELECT $1 + 1",
+	}
+	key := schema.ObjectKey{Kind: schema.FunctionKind, Schema: "public", Name: "calculate", Signature: "(integer)"}
+
+	ddl, err := gen.GenerateDDL(&differ.Diff{ToAlter: []differ.AlterOperation{{
+		Key: key, Changes: []string{"body changed"}, OldObject: fn, NewObject: fn,
+	}}}, schema.SchemaObjectMap{})
+	require.NoError(t, err)
+	assert.Contains(t, ddl, "CREATE OR REPLACE FUNCTION public.calculate")
+
+	_, err = gen.GenerateDDL(&differ.Diff{ToAlter: []differ.AlterOperation{{
+		Key: key, Changes: []string{"return type changed"}, OldObject: fn, NewObject: fn,
+	}}}, schema.SchemaObjectMap{})
+	var unsupported *UnsupportedChangeError
+	require.ErrorAs(t, err, &unsupported)
 }
 
 func TestGenerateDropView(t *testing.T) {

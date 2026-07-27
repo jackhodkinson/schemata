@@ -471,14 +471,30 @@ func (g *DDLGenerator) generateCreateView(view schema.View) string {
 }
 
 func (g *DDLGenerator) generateCreateFunction(fn schema.Function) string {
+	return g.renderFunction(fn, false)
+}
+
+func (g *DDLGenerator) renderFunction(fn schema.Function, replace bool) string {
 	// Build arguments
 	args := make([]string, len(fn.Args))
 	for i, arg := range fn.Args {
-		argStr := string(arg.Type)
-		if arg.Name != nil {
-			argStr = fmt.Sprintf("%s %s", *arg.Name, arg.Type)
+		var argParts []string
+		switch arg.Mode {
+		case schema.OutMode:
+			argParts = append(argParts, "OUT")
+		case schema.InOutMode:
+			argParts = append(argParts, "INOUT")
+		case schema.VariadicMode:
+			argParts = append(argParts, "VARIADIC")
 		}
-		args[i] = argStr
+		if arg.Name != nil {
+			argParts = append(argParts, quoteIdentifier(*arg.Name))
+		}
+		argParts = append(argParts, string(arg.Type))
+		if arg.Default != nil {
+			argParts = append(argParts, "DEFAULT", string(*arg.Default))
+		}
+		args[i] = strings.Join(argParts, " ")
 	}
 
 	// Build returns clause
@@ -500,14 +516,17 @@ func (g *DDLGenerator) generateCreateFunction(fn schema.Function) string {
 		returnsClause = fmt.Sprintf("RETURNS SETOF %s", ret.Type)
 	}
 
-	// Build the function definition
-	// Note: VOLATILITY and other options must come AFTER the function body
-	stmt := fmt.Sprintf(`CREATE FUNCTION %s.%s(%s)
+	createClause := "CREATE FUNCTION"
+	if replace {
+		createClause = "CREATE OR REPLACE FUNCTION"
+	}
+	dollarTag := functionDollarTag(fn.Body)
+	stmt := fmt.Sprintf(`%s %s.%s(%s)
 %s
 LANGUAGE %s
-AS $$
+AS %s
 %s
-$$`, fn.Schema, fn.Name, strings.Join(args, ", "), returnsClause, fn.Language, fn.Body)
+%s`, createClause, fn.Schema, fn.Name, strings.Join(args, ", "), returnsClause, fn.Language, dollarTag, fn.Body, dollarTag)
 
 	// Add function options after the body (if not defaults)
 	// Default for plpgsql is VOLATILE, so we can omit it in most cases
@@ -515,9 +534,37 @@ $$`, fn.Schema, fn.Name, strings.Join(args, ", "), returnsClause, fn.Language, f
 	if fn.Volatility != schema.Volatile {
 		stmt += fmt.Sprintf("\nVOLATILITY %s", fn.Volatility)
 	}
+	if fn.Strict {
+		stmt += "\nSTRICT"
+	}
+	if fn.SecurityDefiner {
+		stmt += "\nSECURITY DEFINER"
+	}
+	if fn.Parallel != "" && fn.Parallel != schema.ParallelUnsafe {
+		stmt += fmt.Sprintf("\nPARALLEL %s", fn.Parallel)
+	}
+	if len(fn.SearchPath) > 0 {
+		path := make([]string, len(fn.SearchPath))
+		for i := range fn.SearchPath {
+			path[i] = quoteIdentifier(string(fn.SearchPath[i]))
+		}
+		stmt += fmt.Sprintf("\nSET search_path TO %s", strings.Join(path, ", "))
+	}
 
 	stmt += ";"
 	return stmt
+}
+
+func functionDollarTag(body string) string {
+	for i := 0; ; i++ {
+		tag := "$schemata$"
+		if i > 0 {
+			tag = fmt.Sprintf("$schemata_%d$", i)
+		}
+		if !strings.Contains(body, tag) {
+			return tag
+		}
+	}
 }
 
 func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
@@ -549,7 +596,7 @@ func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
 func (g *DDLGenerator) generateCreateEnum(enum schema.EnumDef) string {
 	values := make([]string, len(enum.Values))
 	for i, v := range enum.Values {
-		values[i] = fmt.Sprintf("'%s'", v)
+		values[i] = quoteLiteral(v)
 	}
 
 	return fmt.Sprintf("CREATE TYPE %s.%s AS ENUM (%s);",
@@ -667,6 +714,8 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 			return nil, err
 		}
 		return []string{dropStmt, createStmt}, nil
+	case schema.EnumDef:
+		return g.generateAlterEnum(obj, alter)
 	default:
 		// For other objects, drop and recreate
 		dropStmt, err := g.generateDrop(alter.Key)
@@ -679,6 +728,54 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 		}
 		return []string{dropStmt, createStmt}, nil
 	}
+}
+
+func (g *DDLGenerator) generateAlterEnum(enum schema.EnumDef, alter differ.AlterOperation) ([]string, error) {
+	oldEnum, ok := alter.OldObject.(schema.EnumDef)
+	if !ok {
+		return nil, &UnsupportedChangeError{
+			Key:         alter.Key,
+			Change:      strings.Join(alter.Changes, ", "),
+			Remediation: "the previous enum definition is unavailable; write an explicit migration",
+		}
+	}
+	if len(enum.Values) < len(oldEnum.Values) {
+		return nil, &UnsupportedChangeError{
+			Key:         alter.Key,
+			Change:      "enum values removed",
+			Remediation: "PostgreSQL cannot safely remove enum values in place; use an explicit data migration and replacement type",
+		}
+	}
+	for i := range oldEnum.Values {
+		if enum.Values[i] != oldEnum.Values[i] {
+			return nil, &UnsupportedChangeError{
+				Key:         alter.Key,
+				Change:      "enum values reordered or renamed",
+				Remediation: "use an explicit migration that accounts for existing rows and dependent objects",
+			}
+		}
+	}
+
+	statements := make([]string, 0, len(enum.Values)-len(oldEnum.Values)+1)
+	for _, value := range enum.Values[len(oldEnum.Values):] {
+		statements = append(statements, fmt.Sprintf("ALTER TYPE %s.%s ADD VALUE %s;",
+			enum.Schema, enum.Name, quoteLiteral(value)))
+	}
+	if !plannerStringPtrEqual(enum.Comment, oldEnum.Comment) {
+		if enum.Comment == nil {
+			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s.%s IS NULL;", enum.Schema, enum.Name))
+		} else {
+			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s.%s IS %s;", enum.Schema, enum.Name, quoteLiteral(*enum.Comment)))
+		}
+	}
+	return statements, nil
+}
+
+func plannerStringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Table, alter differ.AlterOperation) ([]string, error) {
@@ -1361,7 +1458,14 @@ func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
 	case schema.ViewKind:
 		return fmt.Sprintf("DROP VIEW IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.FunctionKind:
-		return fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
+		if key.Signature == "" {
+			return "", &UnsupportedChangeError{
+				Key:         key,
+				Change:      "drop function without an identity signature",
+				Remediation: "specify the function argument types explicitly",
+			}
+		}
+		return fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s%s%s;", key.Schema, key.Name, key.Signature, g.cascadeClause()), nil
 	case schema.SequenceKind:
 		return fmt.Sprintf("DROP SEQUENCE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
 	case schema.TypeKind:
