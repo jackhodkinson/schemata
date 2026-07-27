@@ -26,6 +26,8 @@ jobs:
         run: make architecture
       - name: Run go vet
         run: go vet ./...
+      - name: Scan reachable code for known vulnerabilities
+        run: make vulncheck
 
   build:
     name: build ${{ matrix.goos }}-${{ matrix.goarch }}

@@ -59,6 +59,19 @@ jobs:
       - name: Run dead code checks
         run: make deadcode
 
+  vulnerability-scan:
+    runs-on: ubuntu-latest
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Scan reachable code for known vulnerabilities
+        run: make vulncheck
+
   integration-compile-macos:
     runs-on: macos-latest
     env:

@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile architecture deadcode clean docker-up docker-down
+.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile architecture deadcode vulncheck clean docker-up docker-down
 
 BIN_DIR := bin
 
@@ -105,3 +105,7 @@ deadcode:
 	go run honnef.co/go/tools/cmd/staticcheck@latest -checks=U1000 ./...
 	@echo "Running reachability dead code analysis across packages (integration tags enabled)..."
 	go run golang.org/x/tools/cmd/deadcode@latest -test -tags=integration ./...
+
+# Scan reachable code for known Go vulnerabilities using a pinned scanner.
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
