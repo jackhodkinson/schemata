@@ -30,8 +30,10 @@ func (s *Service) ScanMigrations(migrationsDir string, format string) ([]migrati
 	switch format {
 	case "moo":
 		scanner = migration.NewMooScanner(migrationsDir)
-	default:
+	case "", "sql":
 		scanner = migration.NewScanner(migrationsDir)
+	default:
+		return nil, fmt.Errorf("unsupported migrations format %q", format)
 	}
 	migrations, err := scanner.Scan()
 	if err != nil {

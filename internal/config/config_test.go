@@ -257,6 +257,48 @@ func TestConnectionStringBuilder(t *testing.T) {
 	}
 }
 
+func TestExpandEnvVarRequiresMissingVariablesUnlessDefaulted(t *testing.T) {
+	t.Setenv("SCHEMATA_PRESENT", "postgresql://db/app")
+
+	got, err := expandEnvVar("${SCHEMATA_PRESENT}")
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://db/app", got)
+
+	_, err = expandEnvVar("${SCHEMATA_MISSING}")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SCHEMATA_MISSING")
+
+	got, err = expandEnvVar("${SCHEMATA_MISSING:-postgresql://fallback/app}")
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://fallback/app", got)
+}
+
+func TestConfigRejectsImplicitOrInvalidConnections(t *testing.T) {
+	base := Config{
+		Schema:     SchemaConfig{File: "schema.sql"},
+		Migrations: MigrationsConfig{Dir: "migrations"},
+	}
+
+	cfg := base
+	cfg.Target = &DBConnection{}
+	require.ErrorContains(t, cfg.Validate(), "host must be explicitly configured")
+
+	cfg = base
+	cfg.Target = &DBConnection{URL: strPtr("")}
+	require.ErrorContains(t, cfg.Validate(), "URL must not be empty")
+
+	cfg = base
+	cfg.Target = &DBConnection{
+		Host: strPtr("db"), Username: strPtr("app"), Database: strPtr("app"), Port: intPtr(70000),
+	}
+	require.ErrorContains(t, cfg.Validate(), "port must be between")
+
+	cfg = base
+	cfg.Target = &DBConnection{URL: strPtr("postgresql://db/app")}
+	cfg.Migrations.Format = "unknown"
+	require.ErrorContains(t, cfg.Validate(), "unsupported migrations format")
+}
+
 func TestDetectEnvVar(t *testing.T) {
 	os.Setenv("TEST_VAR", "test_value")
 	defer os.Unsetenv("TEST_VAR")

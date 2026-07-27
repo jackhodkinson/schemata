@@ -242,14 +242,15 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Validate configuration
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-
 	// Expand environment variables
 	if err := cfg.ExpandEnvVars(); err != nil {
 		return nil, fmt.Errorf("failed to expand environment variables: %w", err)
+	}
+
+	// Validate only after expansion so an unset variable cannot turn a valid
+	// looking target into an empty or implicit connection.
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	return &cfg, nil
@@ -279,6 +280,28 @@ func (c *Config) Validate() error {
 	if c.Target == nil && c.Targets == nil {
 		return fmt.Errorf("must have either 'target' or 'targets' in config")
 	}
+	if c.Targets != nil && len(c.Targets) == 0 {
+		return fmt.Errorf("'targets' must contain at least one target")
+	}
+
+	if c.Dev != nil {
+		if err := c.Dev.Validate(); err != nil {
+			return fmt.Errorf("invalid dev connection: %w", err)
+		}
+	}
+	if c.Target != nil {
+		if err := c.Target.Validate(); err != nil {
+			return fmt.Errorf("invalid target connection: %w", err)
+		}
+	}
+	for name, conn := range c.Targets {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("target name must not be empty")
+		}
+		if err := conn.Validate(); err != nil {
+			return fmt.Errorf("invalid target %q connection: %w", name, err)
+		}
+	}
 
 	// Schema path must be specified
 	if c.Schema.GetSchemaPath() == "" {
@@ -289,7 +312,49 @@ func (c *Config) Validate() error {
 	if c.Migrations.GetDir() == "" {
 		return fmt.Errorf("migrations directory must be specified")
 	}
+	switch c.Migrations.GetFormat() {
+	case "sql", "moo":
+	default:
+		return fmt.Errorf("unsupported migrations format %q (supported: sql, moo)", c.Migrations.GetFormat())
+	}
 
+	return nil
+}
+
+// Validate rejects implicit connection defaults for configured databases.
+func (db *DBConnection) Validate() error {
+	if db == nil {
+		return fmt.Errorf("connection is nil")
+	}
+	if db.URL != nil {
+		if strings.TrimSpace(*db.URL) == "" {
+			return fmt.Errorf("connection URL must not be empty")
+		}
+		return nil
+	}
+	required := []struct {
+		name  string
+		value *string
+	}{
+		{"host", db.Host},
+		{"username", db.Username},
+		{"database", db.Database},
+	}
+	for _, field := range required {
+		if field.value == nil || strings.TrimSpace(*field.value) == "" {
+			return fmt.Errorf("%s must be explicitly configured", field.name)
+		}
+	}
+	if db.Port != nil && (*db.Port < 1 || *db.Port > 65535) {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	if db.SSL != nil {
+		switch db.SSL.Mode {
+		case SSLDisable, SSLAllow, SSLPrefer, SSLRequire, SSLVerifyCA, SSLVerifyFull:
+		default:
+			return fmt.Errorf("unsupported ssl mode %q", db.SSL.Mode)
+		}
+	}
 	return nil
 }
 
@@ -411,24 +476,23 @@ var envVarRegex = regexp.MustCompile(`\$\{([^}:]+)(?::-([^}]*))?\}`)
 // expandEnvVar expands environment variable references in a string
 // Supports ${VAR} and ${VAR:-default} syntax
 func expandEnvVar(s string) (string, error) {
-	return envVarRegex.ReplaceAllStringFunc(s, func(match string) string {
-		matches := envVarRegex.FindStringSubmatch(match)
-		if len(matches) < 2 {
-			return match
+	var result strings.Builder
+	last := 0
+	for _, indexes := range envVarRegex.FindAllStringSubmatchIndex(s, -1) {
+		result.WriteString(s[last:indexes[0]])
+		varName := s[indexes[2]:indexes[3]]
+		value, exists := os.LookupEnv(varName)
+		if exists && value != "" {
+			result.WriteString(value)
+		} else if indexes[4] >= 0 {
+			result.WriteString(s[indexes[4]:indexes[5]])
+		} else {
+			return "", fmt.Errorf("environment variable %s is not set or is empty", varName)
 		}
-
-		varName := matches[1]
-		defaultValue := ""
-		if len(matches) > 2 {
-			defaultValue = matches[2]
-		}
-
-		if value := os.Getenv(varName); value != "" {
-			return value
-		}
-
-		return defaultValue
-	}), nil
+		last = indexes[1]
+	}
+	result.WriteString(s[last:])
+	return result.String(), nil
 }
 
 // ToConnectionString converts a DBConnection to a PostgreSQL connection string
