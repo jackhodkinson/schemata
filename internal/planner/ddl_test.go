@@ -577,6 +577,53 @@ func TestGenerateDDLOrdering(t *testing.T) {
 	assert.Greater(t, dropIdx, createIdx, "DROP should come after CREATE")
 }
 
+func TestGenerateDDLDropDoesNotDropRetainedDependency(t *testing.T) {
+	gen := NewDDLGenerator()
+	tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"}
+	viewKey := schema.ObjectKey{Kind: schema.ViewKind, Schema: "public", Name: "active_users"}
+	actual := schema.SchemaObjectMap{
+		tableKey: {Payload: schema.Table{Schema: "public", Name: "users"}},
+		viewKey: {
+			Payload: schema.View{
+				Schema: "public",
+				Name:   "active_users",
+				Definition: schema.ViewDefinition{Dependencies: []schema.ObjectReference{
+					{Kind: schema.TableKind, Schema: "public", Name: "users"},
+				}},
+			},
+		},
+	}
+	diff := &differ.Diff{ToDrop: []schema.ObjectKey{viewKey}}
+
+	ddl, err := gen.GenerateDDL(diff, schema.SchemaObjectMap{}, actual)
+	require.NoError(t, err)
+	assert.Contains(t, ddl, "DROP VIEW IF EXISTS public.active_users")
+	assert.NotContains(t, ddl, "DROP TABLE")
+}
+
+func TestGenerateDDLDropOrdersDependentsBeforeDependencies(t *testing.T) {
+	gen := NewDDLGenerator()
+	tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "users"}
+	viewKey := schema.ObjectKey{Kind: schema.ViewKind, Schema: "public", Name: "active_users"}
+	actual := schema.SchemaObjectMap{
+		tableKey: {Payload: schema.Table{Schema: "public", Name: "users"}},
+		viewKey: {
+			Payload: schema.View{
+				Schema: "public",
+				Name:   "active_users",
+				Definition: schema.ViewDefinition{Dependencies: []schema.ObjectReference{
+					{Kind: schema.TableKind, Schema: "public", Name: "users"},
+				}},
+			},
+		},
+	}
+	diff := &differ.Diff{ToDrop: []schema.ObjectKey{tableKey, viewKey}}
+
+	ddl, err := gen.GenerateDDL(diff, schema.SchemaObjectMap{}, actual)
+	require.NoError(t, err)
+	assert.Less(t, strings.Index(ddl, "DROP VIEW"), strings.Index(ddl, "DROP TABLE"))
+}
+
 func TestGenerateAlterTableAddGeneratedColumn(t *testing.T) {
 	gen := NewDDLGenerator()
 

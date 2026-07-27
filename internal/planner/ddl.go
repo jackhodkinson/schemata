@@ -194,7 +194,14 @@ func (g *DDLGenerator) generateDropStatements(keys []schema.ObjectKey, objectMap
 
 	// Generate DROP statements in reverse dependency order
 	var statements []string
+	dropSet := make(map[schema.ObjectKey]bool, len(keys))
+	for _, key := range keys {
+		dropSet[key] = true
+	}
 	for _, key := range sortedKeys {
+		if !dropSet[key] {
+			continue // retained dependency included only to calculate ordering
+		}
 		stmt, err := g.generateDrop(key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate DROP for %v: %w", key, err)

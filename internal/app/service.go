@@ -85,9 +85,9 @@ func (s *Service) ComputeDiff(desired, actual schema.SchemaObjectMap) (*differ.D
 	return diff, nil
 }
 
-func (s *Service) GenerateDDL(diff *differ.Diff, desired schema.SchemaObjectMap) (string, error) {
+func (s *Service) GenerateDDL(diff *differ.Diff, desired, actual schema.SchemaObjectMap) (string, error) {
 	ddlGen := planner.NewDDLGenerator(planner.WithAllowCascade(s.allowCascade))
-	ddl, err := ddlGen.GenerateDDL(diff, desired)
+	ddl, err := ddlGen.GenerateDDL(diff, desired, actual)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate DDL: %w", err)
 	}

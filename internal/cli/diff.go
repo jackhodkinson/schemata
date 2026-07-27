@@ -169,7 +169,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	// Generate DDL preview
 	fmt.Println("DDL Preview:")
 	fmt.Println("---")
-	ddl, err := service.GenerateDDL(diff, desiredSchema)
+	ddl, err := service.GenerateDDL(diff, desiredSchema, actualSchema)
 	if err != nil {
 		return err
 	}

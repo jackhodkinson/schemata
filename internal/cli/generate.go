@@ -127,7 +127,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Step 5: Generate DDL for the differences
 	fmt.Println("Generating DDL...")
-	ddl, err := service.GenerateDDL(diff, desiredSchema)
+	ddl, err := service.GenerateDDL(diff, desiredSchema, actualSchema)
 	if err != nil {
 		return err
 	}
