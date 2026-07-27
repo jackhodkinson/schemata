@@ -99,6 +99,36 @@ func TestWriteDumpSingleFile(t *testing.T) {
 	assert.False(t, st.IsDir())
 }
 
+func TestWriteDumpSingleFileFailsClosedAndPreservesExistingOutput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "all.sql")
+	require.NoError(t, os.WriteFile(path, []byte("existing dump\n"), 0644))
+
+	objs := []schema.DatabaseObject{
+		schema.Table{Schema: "public", Name: "ok"},
+		schema.CompositeDef{Schema: "public", Name: "unsupported"},
+	}
+	_, err := writeDumpSingleFile(path, objs, planner.NewDDLGenerator())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to render")
+
+	got, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	assert.Equal(t, "existing dump\n", string(got))
+}
+
+func TestWriteDumpPerSchemaFailsBeforeCreatingOutput(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "dump")
+	objs := []schema.DatabaseObject{
+		schema.Table{Schema: "public", Name: "ok"},
+		schema.CompositeDef{Schema: "sales", Name: "unsupported"},
+	}
+
+	_, err := writeDumpPerSchemaDir(dir, objs, planner.NewDDLGenerator())
+	require.Error(t, err)
+	_, statErr := os.Stat(dir)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
 // TestWriteDumpPerSchemaDirCrossSchemaForeignKey documents per-schema dump behavior when a
 // table references another schema: the FK constraint is emitted with the child table (in the
 // child schema file) and uses a schema-qualified REFERENCES target. The referenced table DDL

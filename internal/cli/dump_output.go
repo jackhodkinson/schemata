@@ -199,20 +199,11 @@ func topoSortSchemas(schemaDeps map[schema.SchemaName]map[schema.SchemaName]stru
 
 // writeDumpSingleFile writes all DDL to one file (existing behavior).
 func writeDumpSingleFile(schemaPath string, objects []schema.DatabaseObject, ddlGen *planner.DDLGenerator) (int, error) {
-	var ddlStatements []string
-	for _, obj := range objects {
-		stmt, err := ddlGen.GenerateCreateStatement(obj)
-		if err != nil {
-			fmt.Printf("Warning: failed to generate DDL for object: %v\n", err)
-			continue
-		}
-		ddlStatements = append(ddlStatements, stmt)
+	ddl, err := renderDumpObjects(objects, ddlGen)
+	if err != nil {
+		return 0, err
 	}
-	ddl := ""
-	for _, stmt := range ddlStatements {
-		ddl += stmt + "\n\n"
-	}
-	if err := os.WriteFile(schemaPath, []byte(ddl), 0644); err != nil {
+	if err := writeFileAtomically(schemaPath, []byte(ddl), 0644); err != nil {
 		return 0, fmt.Errorf("failed to write schema file: %w", err)
 	}
 	return 1, nil
@@ -221,46 +212,88 @@ func writeDumpSingleFile(schemaPath string, objects []schema.DatabaseObject, ddl
 // writeDumpPerSchemaDir writes one <schema>.sql file per schema bucket under dirPath.
 // Creates dirPath if missing. Returns the number of files written.
 func writeDumpPerSchemaDir(dirPath string, objects []schema.DatabaseObject, ddlGen *planner.DDLGenerator) (filesWritten int, err error) {
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		return 0, fmt.Errorf("failed to create schema directory: %w", err)
-	}
-
 	groups := groupObjectsBySchema(objects)
 	names := sortedSchemaNames(groups)
-
 	seenOut := make(map[string]schema.SchemaName)
+	rendered := make(map[string][]byte, len(names))
 
 	for _, sn := range names {
 		objs := groups[sn]
 		if len(objs) == 0 {
 			continue
 		}
-		var ddlStatements []string
-		for _, obj := range objs {
-			stmt, err := ddlGen.GenerateCreateStatement(obj)
-			if err != nil {
-				fmt.Printf("Warning: failed to generate DDL for object: %v\n", err)
-				continue
-			}
-			ddlStatements = append(ddlStatements, stmt)
-		}
-		if len(ddlStatements) == 0 {
-			continue
-		}
-		ddl := ""
-		for _, stmt := range ddlStatements {
-			ddl += stmt + "\n\n"
-		}
 		base := safeSchemaSQLFileName(sn) + ".sql"
 		outPath := filepath.Join(dirPath, base)
 		if prior, dup := seenOut[outPath]; dup && prior != sn {
-			return filesWritten, fmt.Errorf("duplicate output file %q for schemas %q and %q; use distinct schema names or a single-file dump", base, prior, sn)
+			return 0, fmt.Errorf("duplicate output file %q for schemas %q and %q; use distinct schema names or a single-file dump", base, prior, sn)
 		}
 		seenOut[outPath] = sn
-		if err := os.WriteFile(outPath, []byte(ddl), 0644); err != nil {
+		ddl, err := renderDumpObjects(objs, ddlGen)
+		if err != nil {
+			return 0, err
+		}
+		rendered[outPath] = []byte(ddl)
+	}
+
+	// Do not create or modify output paths until every object has rendered
+	// successfully. This prevents a failed object from producing a partial dump.
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return 0, fmt.Errorf("failed to create schema directory: %w", err)
+	}
+	for _, sn := range names {
+		outPath := filepath.Join(dirPath, safeSchemaSQLFileName(sn)+".sql")
+		ddl, ok := rendered[outPath]
+		if !ok {
+			continue
+		}
+		if err := writeFileAtomically(outPath, ddl, 0644); err != nil {
 			return filesWritten, fmt.Errorf("failed to write schema file %q: %w", outPath, err)
 		}
 		filesWritten++
 	}
 	return filesWritten, nil
+}
+
+func renderDumpObjects(objects []schema.DatabaseObject, ddlGen *planner.DDLGenerator) (string, error) {
+	var ddl strings.Builder
+	for _, obj := range objects {
+		stmt, err := ddlGen.GenerateCreateStatement(obj)
+		if err != nil {
+			return "", fmt.Errorf("failed to render %v for dump: %w", objectmap.Key(obj), err)
+		}
+		ddl.WriteString(stmt)
+		ddl.WriteString("\n\n")
+	}
+	return ddl.String(), nil
+}
+
+func writeFileAtomically(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op after a successful rename
+
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
