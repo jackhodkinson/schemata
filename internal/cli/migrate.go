@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/jackhodkinson/schemata/internal/app"
@@ -56,7 +55,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--step and --to are mutually exclusive")
 	}
 
-	ctx := context.Background()
+	ctx := cmd.Context()
 	service := app.NewService(allowCascade)
 
 	// Load config
@@ -94,7 +93,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	// Connect to target
 	fmt.Printf("Connecting to target database...\n")
-	targetPool, err := db.Connect(ctx, targetConn)
+	targetPool, err := db.Connect(ctx, targetConn, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to target: %w", err)
 	}

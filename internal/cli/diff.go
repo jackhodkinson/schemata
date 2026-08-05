@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/jackhodkinson/schemata/internal/app"
@@ -40,7 +39,7 @@ func init() {
 }
 
 func runDiff(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 	service := app.NewService(allowCascade)
 
 	// Load configuration
@@ -80,7 +79,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to database
-	pool, err := db.Connect(ctx, dbConn)
+	pool, err := db.Connect(ctx, dbConn, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s database: %w", dbName, err)
 	}

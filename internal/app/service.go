@@ -101,7 +101,7 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 		return fmt.Errorf("no dev database configured")
 	}
 
-	devPool, err := db.Connect(ctx, cfg.Dev)
+	devPool, err := db.Connect(ctx, cfg.Dev, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to dev database: %w", err)
 	}

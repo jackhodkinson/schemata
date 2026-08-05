@@ -3,9 +3,11 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func TestConfigParsing(t *testing.T) {
@@ -108,6 +110,63 @@ migrations:
 				assert.Equal(t, "./sql/migrations", cfg.Migrations.GetDir())
 				assert.Equal(t, "moo", cfg.Migrations.GetFormat())
 			},
+		},
+		{
+			name: "database safety timeouts",
+			yaml: `
+dev: postgresql://localhost:5432/dev
+target: postgresql://localhost:5432/target
+database:
+  statement-timeout: 45s
+  lock-timeout: 1250ms
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: false,
+			check: func(t *testing.T, cfg *Config) {
+				require.NotNil(t, cfg.Database.StatementTimeout)
+				assert.Equal(t, 45*time.Second, cfg.Database.StatementTimeout.Duration)
+				require.NotNil(t, cfg.Database.LockTimeout)
+				assert.Equal(t, 1250*time.Millisecond, cfg.Database.LockTimeout.Duration)
+			},
+		},
+		{
+			name: "explicitly disabled database timeout",
+			yaml: `
+target: postgresql://localhost:5432/target
+database:
+  statement-timeout: 0
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: false,
+			check: func(t *testing.T, cfg *Config) {
+				require.NotNil(t, cfg.Database.StatementTimeout)
+				assert.Zero(t, cfg.Database.StatementTimeout.Duration)
+				assert.Nil(t, cfg.Database.LockTimeout)
+			},
+		},
+		{
+			name: "invalid database timeout",
+			yaml: `
+target: postgresql://localhost:5432/target
+database:
+  lock-timeout: eventually
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "negative database timeout",
+			yaml: `
+target: postgresql://localhost:5432/target
+database:
+  statement-timeout: -1s
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
 		},
 		{
 			name: "missing required fields",
@@ -297,6 +356,19 @@ func TestConfigRejectsImplicitOrInvalidConnections(t *testing.T) {
 	cfg.Target = &DBConnection{URL: strPtr("postgresql://db/app")}
 	cfg.Migrations.Format = "unknown"
 	require.ErrorContains(t, cfg.Validate(), "unsupported migrations format")
+}
+
+func TestDatabaseTimeoutsMarshalAsDurationsAndOmitEmptySection(t *testing.T) {
+	withoutTimeouts, err := yaml.Marshal(Config{})
+	require.NoError(t, err)
+	assert.NotContains(t, string(withoutTimeouts), "database:")
+
+	statementTimeout := Duration{Duration: 90 * time.Second}
+	withTimeouts, err := yaml.Marshal(Config{
+		Database: DatabaseConfig{StatementTimeout: &statementTimeout},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(withTimeouts), "statement-timeout: 1m30s")
 }
 
 func TestDetectEnvVar(t *testing.T) {

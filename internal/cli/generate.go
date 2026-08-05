@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"path/filepath"
 
@@ -32,7 +31,7 @@ Examples:
 }
 
 func runGenerate(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 	migrationName := args[0]
 	service := app.NewService(allowCascade)
 
@@ -54,7 +53,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to dev database
-	pool, err := db.Connect(ctx, cfg.Dev)
+	pool, err := db.Connect(ctx, cfg.Dev, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to dev database: %w", err)
 	}

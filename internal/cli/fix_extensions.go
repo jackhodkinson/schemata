@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -39,7 +38,7 @@ func init() {
 }
 
 func runFixExtensions(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 	service := app.NewService(allowCascade)
 
 	cfg, err := config.Load(cfgFile)
@@ -68,7 +67,7 @@ func runFixExtensions(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to target to discover installed extensions
-	targetPool, err := db.Connect(ctx, targetConn)
+	targetPool, err := db.Connect(ctx, targetConn, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to target: %w", err)
 	}

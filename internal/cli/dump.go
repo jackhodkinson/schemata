@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"path/filepath"
 
@@ -91,8 +90,8 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to target database
-	ctx := context.Background()
-	pool, err := db.Connect(ctx, targetConn)
+	ctx := cmd.Context()
+	pool, err := db.Connect(ctx, targetConn, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to target database: %w", err)
 	}

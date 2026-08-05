@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,8 +15,71 @@ type Config struct {
 	Dev        *DBConnection           `yaml:"dev,omitempty"`
 	Target     *DBConnection           `yaml:"target,omitempty"`
 	Targets    map[string]DBConnection `yaml:"targets,omitempty"`
+	Database   DatabaseConfig          `yaml:"database,omitempty"`
 	Schema     SchemaConfig            `yaml:"schema"`
 	Migrations MigrationsConfig        `yaml:"migrations"`
+}
+
+// DatabaseConfig controls PostgreSQL session safety settings for every
+// connection Schemata opens. Nil values use the finite defaults in the db
+// package; an explicit zero disables the corresponding PostgreSQL timeout.
+type DatabaseConfig struct {
+	StatementTimeout *Duration `yaml:"statement-timeout,omitempty"`
+	LockTimeout      *Duration `yaml:"lock-timeout,omitempty"`
+}
+
+// IsZero allows generated YAML to omit the database section when both values
+// use Schemata's defaults.
+func (dc DatabaseConfig) IsZero() bool {
+	return dc.StatementTimeout == nil && dc.LockTimeout == nil
+}
+
+// Validate rejects timeout values that PostgreSQL cannot use safely.
+func (dc DatabaseConfig) Validate() error {
+	for _, timeout := range []struct {
+		name  string
+		value *Duration
+	}{
+		{name: "statement-timeout", value: dc.StatementTimeout},
+		{name: "lock-timeout", value: dc.LockTimeout},
+	} {
+		if timeout.value != nil && timeout.value.Duration < 0 {
+			return fmt.Errorf("database.%s must not be negative", timeout.name)
+		}
+	}
+
+	return nil
+}
+
+// Duration is a YAML duration such as "30s", "5m", or "0". PostgreSQL
+// timeout settings have millisecond resolution; smaller positive values are
+// rounded up when a connection is configured.
+type Duration struct {
+	time.Duration
+}
+
+// UnmarshalYAML parses a human-readable Go duration and rejects negative
+// values. The bare value 0 is accepted as an explicit timeout opt-out.
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("duration must be a scalar value")
+	}
+
+	parsed, err := time.ParseDuration(node.Value)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", node.Value, err)
+	}
+	if parsed < 0 {
+		return fmt.Errorf("duration must not be negative")
+	}
+
+	d.Duration = parsed
+	return nil
+}
+
+// MarshalYAML preserves the human-readable duration form in generated config.
+func (d Duration) MarshalYAML() (interface{}, error) {
+	return d.String(), nil
 }
 
 // MigrationsConfig can be either a simple directory path or detailed configuration
@@ -272,6 +336,10 @@ func (c *Config) Save(path string) error {
 
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
+	if err := c.Database.Validate(); err != nil {
+		return err
+	}
+
 	// Must have either target or targets (not both)
 	if c.Target != nil && c.Targets != nil {
 		return fmt.Errorf("cannot have both 'target' and 'targets' in config")

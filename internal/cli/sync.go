@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/jackhodkinson/schemata/internal/app"
@@ -43,11 +42,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("dev database not configured")
 	}
 
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	// Connect to dev database
 	fmt.Println("Connecting to dev database...")
-	pool, err := db.Connect(ctx, cfg.Dev)
+	pool, err := db.Connect(ctx, cfg.Dev, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to dev database: %w", err)
 	}

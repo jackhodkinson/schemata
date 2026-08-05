@@ -67,8 +67,9 @@ complete.
      cascading changes.
    - Validate configuration after environment expansion and refuse empty or
      implicit target connections.
-   - Add target identity checks, cancellation, statement/lock timeouts, and
-     stable reviewable plan output.
+   - Cancellation plus finite, configurable PostgreSQL statement/lock timeouts
+     are implemented and documented in [operational database safety](operational-safety.md).
+   - Add target identity checks and stable reviewable plan output.
 
 7. **Resolve known security and release blockers**
    - Upgrade vulnerable dependencies and build with a supported, patched Go
