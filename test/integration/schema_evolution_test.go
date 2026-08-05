@@ -457,7 +457,7 @@ func TestMigrationRollback_OnFailure(t *testing.T) {
 			`,
 			FilePath: "/tmp/test",
 		},
-	}, migration.ApplyOptions{ContinueOnError: false})
+	}, migration.ApplyOptions{})
 	require.Error(t, err, "migration with invalid SQL should fail")
 
 	// The failed migration's first statement (ADD COLUMN) should have been rolled back.

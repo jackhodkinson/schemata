@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,12 +13,25 @@ import (
 
 // Migration represents a single migration file
 type Migration struct {
-	Version   string   // Timestamp prefix (YYYYMMDDHHMMSS)
-	Name      string   // Human-readable name
-	FilePath  string   // Full path to the migration file
-	SQL       string   // SQL content (loaded on demand)
-	DependsOn []string // Versions this migration depends on (parsed from directives)
+	Version       string   // Timestamp prefix (YYYYMMDDHHMMSS)
+	Name          string   // Human-readable name
+	FilePath      string   // Full path to the migration file
+	SQL           string   // SQL content (loaded on demand)
+	Statements    []string // Parsed top-level SQL statements
+	Checksum      string   // SHA-256 of the exact source file bytes
+	ExecutionMode string   // transactional or non_transactional
+	DependsOn     []string // Versions this migration depends on (parsed from directives)
+
+	sourceBytes               []byte
+	authoritativeSQL          string
+	authoritativeDependencies []string
+	dependenciesAuthoritative bool
 }
+
+const (
+	ExecutionModeTransactional    = "transactional"
+	ExecutionModeNonTransactional = "non_transactional"
+)
 
 // Scanner scans a directory for migration files
 type Scanner struct {
@@ -79,19 +94,56 @@ func (s *Scanner) Scan() ([]Migration, error) {
 
 // LoadSQL loads the SQL content of a migration
 func (m *Migration) LoadSQL() error {
-	if m.SQL != "" {
+	if m.sourceBytes != nil {
+		if m.SQL != m.authoritativeSQL {
+			return fmt.Errorf("migration SQL changed after its authoritative source was loaded")
+		}
+	} else if m.SQL != "" || m.FilePath == "" {
+		m.setAuthoritativeSource([]byte(m.SQL), m.SQL)
+	} else {
+		content, err := os.ReadFile(m.FilePath)
+		if err != nil {
+			return fmt.Errorf("failed to read migration file: %w", err)
+		}
+		m.SQL = string(content)
+		m.setAuthoritativeSource(content, m.SQL)
+	}
+
+	// Always derive the public checksum. Never trust a caller-supplied or stale
+	// value when deciding what immutable identity will be recorded.
+	m.Checksum = migrationChecksum(m.sourceBytes)
+	if m.dependenciesAuthoritative {
+		m.DependsOn = cloneDependencies(m.authoritativeDependencies)
+	} else {
 		m.DependsOn = parseDirectives(m.SQL)
-		return nil // Already loaded
 	}
-
-	content, err := os.ReadFile(m.FilePath)
-	if err != nil {
-		return fmt.Errorf("failed to read migration file: %w", err)
+	if m.ExecutionMode == "" {
+		m.ExecutionMode = ExecutionModeTransactional
 	}
+	return m.prepareStatements()
+}
 
-	m.SQL = string(content)
-	m.DependsOn = parseDirectives(m.SQL)
-	return nil
+func (m *Migration) setAuthoritativeSource(source []byte, sql string) {
+	m.sourceBytes = make([]byte, len(source))
+	copy(m.sourceBytes, source)
+	m.authoritativeSQL = sql
+}
+
+func (m *Migration) setAuthoritativeDependencies(dependencies []string) {
+	m.authoritativeDependencies = cloneDependencies(dependencies)
+	m.DependsOn = cloneDependencies(dependencies)
+	m.dependenciesAuthoritative = true
+}
+
+func cloneDependencies(dependencies []string) []string {
+	cloned := make([]string, len(dependencies))
+	copy(cloned, dependencies)
+	return cloned
+}
+
+func migrationChecksum(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 // Migration filename format: YYYYMMDDHHMMSS-name.sql

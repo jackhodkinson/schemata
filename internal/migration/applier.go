@@ -2,23 +2,22 @@ package migration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackhodkinson/schemata/internal/db"
 )
 
 const (
-	migrationLockName    = "schemata:migrations"
-	migrationLockTimeout = 30 * time.Second
+	migrationLockName       = "schemata:migrations"
+	migrationExecutionLock  = "schemata:migration-transaction"
+	migrationLockTimeout    = 30 * time.Second
+	migrationCleanupTimeout = 5 * time.Second
+	migrationHeartbeatEvery = 250 * time.Millisecond
+	migrationHeartbeatWait  = 2 * time.Second
 )
-
-type migrationExecutor interface {
-	db.Executor
-	Begin(context.Context) (pgx.Tx, error)
-}
 
 // Applier applies migrations to a database
 type Applier struct {
@@ -38,10 +37,9 @@ func NewApplier(pool *db.Pool, dryRun bool) *Applier {
 
 // ApplyOptions configures migration application
 type ApplyOptions struct {
-	DryRun          bool
-	ContinueOnError bool
-	Step            int    // Apply at most N pending migrations. 0 means unlimited.
-	ToVersion       string // Apply up to and including this version. Empty means unlimited.
+	DryRun    bool
+	Step      int    // Apply at most N pending migrations. 0 means unlimited.
+	ToVersion string // Apply up to and including this version. Empty means unlimited.
 }
 
 // FilterPendingMigrations applies Step and ToVersion filters to a pending
@@ -76,29 +74,43 @@ func FilterPendingMigrations(pending, allVersions []string, opts ApplyOptions) (
 
 // Apply applies all pending migrations
 func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyOptions) error {
+	opts.DryRun = opts.DryRun || a.dryRun
+
 	if err := ValidateInventory(migrations); err != nil {
 		return fmt.Errorf("invalid migration inventory: %w", err)
 	}
 
 	if opts.DryRun {
-		return a.applyPending(ctx, migrations, opts, a.pool)
-	}
-
-	// Ensure migration tracking schema exists before acquiring the migration
-	// runner lock. EnsureSchema has its own connection-owned lock for the
-	// concurrent first-run case.
-	if err := a.tracker.EnsureSchema(ctx); err != nil {
-		return fmt.Errorf("failed to ensure migration tracking schema: %w", err)
+		// Dry-run does not create schema state, but it still takes the same
+		// transient lock so history cannot change between its existence check,
+		// validation, and plan output.
+		return db.WithSessionAdvisoryLock(
+			ctx,
+			a.pool,
+			migrationLockName,
+			migrationLockTimeout,
+			func(conn *pgxpool.Conn) error {
+				return a.applyPending(ctx, migrations, opts, conn)
+			},
+		)
 	}
 
 	// One dedicated PostgreSQL session owns this lock for the complete run,
-	// including history reads and all per-migration transactions.
+	// including first-run schema creation, history reads, and all migrations.
+	// Keeping schema creation inside this boundary also gives dry-run a stable,
+	// side-effect-free view while a real runner is waiting.
 	return db.WithSessionAdvisoryLock(
 		ctx,
 		a.pool,
 		migrationLockName,
 		migrationLockTimeout,
 		func(conn *pgxpool.Conn) error {
+			if err := a.tracker.EnsureSchema(ctx); err != nil {
+				return fmt.Errorf("failed to ensure migration tracking schema: %w", err)
+			}
+			if err := verifyMigrationLock(ctx, conn); err != nil {
+				return err
+			}
 			return a.applyPending(ctx, migrations, opts, conn)
 		},
 	)
@@ -108,22 +120,44 @@ func (a *Applier) applyPending(
 	ctx context.Context,
 	migrations []Migration,
 	opts ApplyOptions,
-	executor migrationExecutor,
+	lockConn *pgxpool.Conn,
 ) error {
-	// Get pending migrations
-	versions := make([]string, len(migrations))
-	for i, m := range migrations {
-		versions[i] = m.Version
+	historyExists := true
+	if opts.DryRun {
+		var err error
+		historyExists, err = a.tracker.HistoryExistsWithExecutor(ctx, lockConn)
+		if err != nil {
+			return err
+		}
+		if historyExists {
+			if err := a.tracker.ValidateSchemaWithExecutor(ctx, lockConn); err != nil {
+				return err
+			}
+		}
 	}
 
-	pending, err := a.tracker.GetPendingVersionsWithExecutor(ctx, executor, versions)
+	var history []db.MigrationRecord
+	if historyExists {
+		var err error
+		history, err = a.tracker.GetHistoryWithExecutor(ctx, lockConn)
+		if err != nil {
+			return fmt.Errorf("failed to get migration history: %w", err)
+		}
+	}
+
+	pending, err := validateMigrationHistory(migrations, history)
 	if err != nil {
-		return fmt.Errorf("failed to get pending migrations: %w", err)
+		return fmt.Errorf("migration history validation failed: %w", err)
 	}
 
 	if len(pending) == 0 {
 		fmt.Println("No pending migrations")
 		return nil
+	}
+
+	versions := make([]string, len(migrations))
+	for i, migration := range migrations {
+		versions[i] = migration.Version
 	}
 
 	// Build filtered list of pending migrations and load their SQL
@@ -176,16 +210,13 @@ func (a *Applier) applyPending(
 
 	// Apply migrations in resolved order
 	for i := range sorted {
-		applied, err := a.applyMigration(ctx, executor, sorted[i], opts)
+		applied, updatedHistory, err := a.applyMigration(ctx, lockConn, sorted[i], opts, history)
 		if err != nil {
-			if opts.ContinueOnError {
-				fmt.Printf("Error applying migration %s: %v\n", sorted[i].Version, err)
-				continue
-			}
 			return fmt.Errorf("failed to apply migration %s: %w", sorted[i].Version, err)
 		}
 
 		if applied {
+			history = updatedHistory
 			fmt.Printf("Applied migration %s: %s\n", sorted[i].Version, sorted[i].Name)
 		}
 	}
@@ -196,48 +227,206 @@ func (a *Applier) applyPending(
 // applyMigration applies a single migration in a transaction
 func (a *Applier) applyMigration(
 	ctx context.Context,
-	executor migrationExecutor,
+	lockConn *pgxpool.Conn,
 	migration Migration,
 	opts ApplyOptions,
-) (bool, error) {
+	expectedHistory []db.MigrationRecord,
+) (bool, []db.MigrationRecord, error) {
 	if opts.DryRun {
 		fmt.Printf("[DRY RUN] Would apply migration %s:\n%s\n", migration.Version, migration.SQL)
-		return false, nil
+		return false, expectedHistory, nil
 	}
 
-	// Start transaction
-	tx, err := executor.Begin(ctx)
+	if err := verifyMigrationLock(ctx, lockConn); err != nil {
+		return false, nil, err
+	}
+
+	migrationCtx, cancelMigration := context.WithCancelCause(ctx)
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan error, 1)
+	go monitorMigrationLock(migrationCtx, lockConn, stopHeartbeat, cancelMigration, heartbeatDone)
+
+	var updatedHistory []db.MigrationRecord
+	applyErr := db.WithDedicatedConnection(migrationCtx, a.pool, func(conn *pgxpool.Conn) error {
+		var err error
+		updatedHistory, err = a.applyTransactionalMigration(
+			migrationCtx,
+			conn,
+			migration,
+			expectedHistory,
+		)
+		return err
+	})
+	close(stopHeartbeat)
+	heartbeatErr := <-heartbeatDone
+	cancelMigration(context.Canceled)
+
+	if heartbeatErr != nil {
+		return false, nil, errors.Join(applyErr, heartbeatErr)
+	}
+	if applyErr != nil {
+		return false, nil, applyErr
+	}
+	if err := verifyMigrationLock(ctx, lockConn); err != nil {
+		return false, nil, fmt.Errorf("migration committed but runner lock state is ambiguous: %w", err)
+	}
+
+	return true, updatedHistory, nil
+}
+
+func (a *Applier) applyTransactionalMigration(
+	ctx context.Context,
+	conn *pgxpool.Conn,
+	migration Migration,
+	expectedHistory []db.MigrationRecord,
+) ([]db.MigrationRecord, error) {
+	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationCleanupTimeout)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
 
-	// Re-check within the locked transaction to avoid double-applying in races.
-	var alreadyApplied bool
-	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schemata.version WHERE version_num = $1)", migration.Version).Scan(&alreadyApplied); err != nil {
-		return false, fmt.Errorf("failed to check migration tracking table: %w", err)
+	// The session lock coordinates whole runs. This second transaction-scoped
+	// fence prevents overlapping DDL even if that session disappears while a
+	// migration is executing.
+	if _, err := tx.Exec(
+		ctx,
+		"SELECT pg_advisory_xact_lock($1)",
+		db.AdvisoryLockKey(migrationExecutionLock),
+	); err != nil {
+		return nil, fmt.Errorf("failed to acquire migration transaction fence: %w", err)
 	}
-	if alreadyApplied {
-		if err := tx.Commit(ctx); err != nil {
-			return false, fmt.Errorf("failed to commit no-op transaction: %w", err)
+	if err := a.tracker.ValidateSchemaWithExecutor(ctx, tx); err != nil {
+		return nil, fmt.Errorf("migration tracking schema changed before execution: %w", err)
+	}
+	baseline, err := a.tracker.GetHistoryWithExecutor(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify migration history before execution: %w", err)
+	}
+	if !migrationHistoriesEqual(expectedHistory, baseline) {
+		return nil, fmt.Errorf("migration history changed after this run planned its pending work")
+	}
+
+	metadata := db.MigrationMetadata{
+		Version:        migration.Version,
+		Name:           migration.Name,
+		Checksum:       migration.Checksum,
+		ExecutionMode:  migration.ExecutionMode,
+		StatementCount: len(migration.Statements),
+	}
+	if err := a.tracker.MarkRunning(ctx, tx, metadata); err != nil {
+		return nil, fmt.Errorf("failed to mark migration as running: %w", err)
+	}
+	runningHistory, err := a.tracker.GetHistoryWithExecutor(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify running migration history: %w", err)
+	}
+	if err := validateRunningHistoryTransition(baseline, runningHistory, metadata); err != nil {
+		return nil, err
+	}
+
+	for i, statement := range migration.Statements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return nil, newStatementExecutionError(migration, i, err)
 		}
-		return false, nil
 	}
-
-	// Execute migration SQL
-	if _, err := tx.Exec(ctx, migration.SQL); err != nil {
-		return false, fmt.Errorf("failed to execute migration SQL: %w", err)
+	// Flush ordinary deferred constraints before inspecting the final ledger.
+	// Migration files are trusted executable code; a durable post-commit check
+	// below also makes unusual commit-time side effects visible rather than
+	// reporting silent success.
+	if _, err := tx.Exec(ctx, "SET CONSTRAINTS ALL IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("failed while resolving deferred constraints: %w", err)
+	}
+	if err := a.tracker.ValidateSchemaWithExecutor(ctx, tx); err != nil {
+		return nil, fmt.Errorf("migration changed the reserved tracking schema: %w", err)
+	}
+	historyAfterStatements, err := a.tracker.GetHistoryWithExecutor(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify migration history after SQL execution: %w", err)
+	}
+	if !migrationHistoriesEqual(runningHistory, historyAfterStatements) {
+		return nil, fmt.Errorf("migration SQL modified the reserved migration history")
 	}
 
 	// Record migration version within the same transaction
-	if err := a.tracker.MarkApplied(ctx, tx, migration.Version); err != nil {
-		return false, fmt.Errorf("failed to mark migration as applied: %w", err)
+	if err := a.tracker.MarkApplied(ctx, tx, metadata); err != nil {
+		return nil, fmt.Errorf("failed to mark migration as applied: %w", err)
+	}
+	appliedHistory, err := a.tracker.GetHistoryWithExecutor(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify applied migration history: %w", err)
+	}
+	if err := validateAppliedHistoryTransition(runningHistory, appliedHistory, metadata); err != nil {
+		return nil, err
 	}
 
 	// Commit transaction
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return true, nil
+	verificationCtx, cancelVerification := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		migrationCleanupTimeout,
+	)
+	defer cancelVerification()
+	if err := a.tracker.ValidateSchemaWithExecutor(verificationCtx, conn); err != nil {
+		return nil, fmt.Errorf("migration committed but durable tracking schema verification failed: %w", err)
+	}
+	durableHistory, err := a.tracker.GetHistoryWithExecutor(verificationCtx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("migration committed but durable history verification failed: %w", err)
+	}
+	if !migrationHistoriesEqual(appliedHistory, durableHistory) {
+		return nil, fmt.Errorf("migration committed but durable history differs from the verified transaction state")
+	}
+
+	return durableHistory, nil
+}
+
+func verifyMigrationLock(ctx context.Context, lockConn *pgxpool.Conn) error {
+	owned, err := db.SessionOwnsAdvisoryLock(ctx, lockConn, migrationLockName)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return fmt.Errorf("runner session no longer owns advisory lock %q", migrationLockName)
+	}
+	return nil
+}
+
+func monitorMigrationLock(
+	ctx context.Context,
+	lockConn *pgxpool.Conn,
+	stop <-chan struct{},
+	cancelMigration context.CancelCauseFunc,
+	done chan<- error,
+) {
+	ticker := time.NewTicker(migrationHeartbeatEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			done <- nil
+			return
+		case <-ctx.Done():
+			done <- nil
+			return
+		case <-ticker.C:
+			heartbeatCtx, cancelHeartbeat := context.WithTimeout(ctx, migrationHeartbeatWait)
+			err := verifyMigrationLock(heartbeatCtx, lockConn)
+			cancelHeartbeat()
+			if err != nil {
+				err = fmt.Errorf("migration runner lost its advisory lock: %w", err)
+				cancelMigration(err)
+				done <- err
+				return
+			}
+		}
+	}
 }

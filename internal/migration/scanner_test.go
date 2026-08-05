@@ -142,11 +142,46 @@ func TestMigrationLoadSQL(t *testing.T) {
 	err = mig.LoadSQL()
 	require.NoError(t, err)
 	assert.Equal(t, content, mig.SQL)
+	assert.Len(t, mig.Checksum, 64)
+	assert.Equal(t, ExecutionModeTransactional, mig.ExecutionMode)
+	assert.Equal(t, []string{"CREATE TABLE test (id INT)"}, mig.Statements)
 
 	// Loading again should be no-op
 	err = mig.LoadSQL()
 	require.NoError(t, err)
 	assert.Equal(t, content, mig.SQL)
+}
+
+func TestMigrationChecksumUsesExactSourceBytes(t *testing.T) {
+	withoutNewline := Migration{SQL: "SELECT 1;"}
+	withNewline := Migration{SQL: "SELECT 1;\n"}
+	require.NoError(t, withoutNewline.LoadSQL())
+	require.NoError(t, withNewline.LoadSQL())
+
+	assert.NotEqual(t, withoutNewline.Checksum, withNewline.Checksum)
+	assert.Equal(t, withoutNewline.Statements, withNewline.Statements)
+}
+
+func TestMigrationLoadSQLNeverTrustsSuppliedChecksum(t *testing.T) {
+	migration := Migration{
+		SQL:        "SELECT 1;",
+		Checksum:   "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		Statements: []string{"forged"},
+	}
+	require.NoError(t, migration.LoadSQL())
+
+	assert.Equal(t, migrationChecksum([]byte("SELECT 1;")), migration.Checksum)
+	assert.Equal(t, []string{"SELECT 1"}, migration.Statements)
+}
+
+func TestMigrationRejectsSQLMutationAfterPreparation(t *testing.T) {
+	migration := Migration{SQL: "SELECT 1;"}
+	require.NoError(t, migration.LoadSQL())
+	migration.SQL = "SELECT 2;"
+
+	err := migration.LoadSQL()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "authoritative source")
 }
 
 func TestToKebabCase(t *testing.T) {

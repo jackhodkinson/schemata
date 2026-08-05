@@ -52,11 +52,14 @@ func (g *Generator) GenerateWithVersion(version, name, sql string) (*Migration, 
 	}
 
 	migration := &Migration{
-		Version:  version,
-		Name:     kebabName,
-		FilePath: filePath,
-		SQL:      sql,
+		Version:       version,
+		Name:          kebabName,
+		FilePath:      filePath,
+		SQL:           sql,
+		ExecutionMode: ExecutionModeTransactional,
 	}
+	migration.setAuthoritativeSource([]byte(sql), sql)
+	migration.Checksum = migrationChecksum(migration.sourceBytes)
 
 	return migration, nil
 }

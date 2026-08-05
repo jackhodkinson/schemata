@@ -5,6 +5,7 @@ package integration
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +73,16 @@ func TestMigrationTracking(t *testing.T) {
 	assert.Empty(t, versions)
 
 	// Mark a version as applied
-	err = tracker.MarkApplied(ctx, pool, "20231015120530")
+	firstMetadata := db.MigrationMetadata{
+		Version:        "20231015120530",
+		Name:           "first",
+		Checksum:       strings.Repeat("a", 64),
+		ExecutionMode:  migration.ExecutionModeTransactional,
+		StatementCount: 1,
+	}
+	err = tracker.MarkRunning(ctx, pool, firstMetadata)
+	require.NoError(t, err)
+	err = tracker.MarkApplied(ctx, pool, firstMetadata)
 	require.NoError(t, err)
 
 	// Should now have one version
@@ -80,6 +90,16 @@ func TestMigrationTracking(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, versions, 1)
 	assert.Equal(t, "20231015120530", versions[0])
+
+	history, err := tracker.GetHistoryWithExecutor(ctx, pool)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	assert.Equal(t, "first", history[0].Name)
+	assert.Equal(t, strings.Repeat("a", 64), history[0].Checksum)
+	assert.Equal(t, db.MigrationStatusApplied, history[0].Status)
+	assert.Equal(t, 1, history[0].StatementCount)
+	assert.Equal(t, 1, history[0].LastConfirmedStatement)
+	assert.NotNil(t, history[0].FinishedAt)
 
 	// Confirm membership by reading applied versions
 	assert.Contains(t, versions, "20231015120530")
@@ -93,7 +113,16 @@ func TestMigrationTracking(t *testing.T) {
 	assert.Equal(t, []string{"20231015130000", "20231016090000"}, pending)
 
 	// Mark another version
-	err = tracker.MarkApplied(ctx, pool, "20231015130000")
+	secondMetadata := db.MigrationMetadata{
+		Version:        "20231015130000",
+		Name:           "second",
+		Checksum:       strings.Repeat("b", 64),
+		ExecutionMode:  migration.ExecutionModeTransactional,
+		StatementCount: 1,
+	}
+	err = tracker.MarkRunning(ctx, pool, secondMetadata)
+	require.NoError(t, err)
+	err = tracker.MarkApplied(ctx, pool, secondMetadata)
 	require.NoError(t, err)
 
 	// Confirm the second version was applied
@@ -174,6 +203,49 @@ func TestSessionAdvisoryLockHonorsWaitTimeout(t *testing.T) {
 	var result int
 	require.NoError(t, pool.QueryRow(ctx, "SELECT 1").Scan(&result))
 	assert.Equal(t, 1, result, "pool must remain usable after lock wait cancellation")
+}
+
+func TestDedicatedConnectionIsFreshAndDoesNotConsumeCallerPoolSlot(t *testing.T) {
+	ctx := context.Background()
+	config, err := pgxpool.ParseConfig(devDBURL)
+	require.NoError(t, err)
+	config.MaxConns = 1
+	callerPool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	pool := &db.Pool{Pool: callerPool}
+	defer pool.Close()
+
+	dirty, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	_, err = dirty.Exec(ctx, `
+		SET search_path = pg_catalog;
+		PREPARE contaminated_session AS SELECT 1;
+		CREATE TEMP TABLE contaminated_session_table (id integer);
+	`)
+	require.NoError(t, err)
+	dirty.Release()
+
+	err = db.WithDedicatedConnection(ctx, pool, func(conn *pgxpool.Conn) error {
+		var searchPath string
+		if err := conn.QueryRow(ctx, "SHOW search_path").Scan(&searchPath); err != nil {
+			return err
+		}
+		assert.NotEqual(t, "pg_catalog", searchPath)
+
+		var preparedCount int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM pg_prepared_statements WHERE name = 'contaminated_session'").Scan(&preparedCount); err != nil {
+			return err
+		}
+		assert.Zero(t, preparedCount)
+
+		var tempTableExists bool
+		if err := conn.QueryRow(ctx, "SELECT to_regclass('pg_temp.contaminated_session_table') IS NOT NULL").Scan(&tempTableExists); err != nil {
+			return err
+		}
+		assert.False(t, tempTableExists)
+		return nil
+	})
+	require.NoError(t, err)
 }
 
 func TestCatalogExtraction(t *testing.T) {
@@ -266,8 +338,7 @@ func TestMigrationApplication(t *testing.T) {
 
 	// Apply migrations
 	opts := migration.ApplyOptions{
-		DryRun:          false,
-		ContinueOnError: false,
+		DryRun: false,
 	}
 	err = applier.Apply(ctx, migrations, opts)
 	require.NoError(t, err, "should apply migrations")
@@ -308,6 +379,480 @@ func TestMigrationApplication(t *testing.T) {
 	_, _ = pool.Exec(ctx, "DROP SCHEMA schemata CASCADE")
 }
 
+func TestMigrationHistoryRejectsChangedAppliedSource(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS checksum_original")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS checksum_should_not_run")
+	defer pool.Exec(ctx, "DROP TABLE IF EXISTS checksum_original, checksum_should_not_run")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+	applier := migration.NewApplier(pool, false)
+	original := migration.Migration{
+		Version: "20231015120530",
+		Name:    "immutable-source",
+		SQL:     "CREATE TABLE checksum_original (id integer);",
+	}
+	require.NoError(t, original.LoadSQL())
+	require.NoError(t, applier.Apply(ctx, []migration.Migration{original}, migration.ApplyOptions{}))
+
+	changed := migration.Migration{
+		Version:       original.Version,
+		Name:          original.Name,
+		SQL:           "CREATE TABLE checksum_should_not_run (id integer);",
+		Checksum:      original.Checksum,
+		Statements:    original.Statements,
+		ExecutionMode: original.ExecutionMode,
+	}
+
+	dryRun := migration.NewApplier(pool, true)
+	err = dryRun.Apply(ctx, []migration.Migration{changed}, migration.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checksum mismatch")
+
+	err = applier.Apply(ctx, []migration.Migration{changed}, migration.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checksum mismatch")
+
+	var exists bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT to_regclass('public.checksum_should_not_run') IS NOT NULL").Scan(&exists))
+	assert.False(t, exists, "history drift must be rejected before changed SQL executes")
+
+	err = applier.Apply(ctx, nil, migration.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing from the local inventory")
+}
+
+func TestMigrationTrackerRejectsLedgerWithMissingConstraints(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, err = pool.Exec(ctx, `
+		CREATE SCHEMA schemata;
+		CREATE TABLE schemata.version (
+			version_num text NOT NULL,
+			name text NOT NULL,
+			checksum text NOT NULL,
+			execution_mode text NOT NULL,
+			status text NOT NULL,
+			started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+			finished_at timestamptz,
+			statement_count integer NOT NULL,
+			last_confirmed_statement integer NOT NULL DEFAULT 0,
+			failed_statement integer,
+			error_message text,
+			error_code text,
+			attempt_count integer NOT NULL DEFAULT 1,
+			recovered_at timestamptz,
+			recovery_action text
+		);
+		COMMENT ON TABLE schemata.version IS 'schemata:migration-history:v1';
+	`)
+	require.NoError(t, err)
+
+	tracker := db.NewMigrationTracker(pool)
+	err = tracker.EnsureSchema(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported pre-release migration tracking constraints")
+}
+
+func TestMigrationTrackerRejectsLedgerWithForgedConstraintDefinitions(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, err = pool.Exec(ctx, `
+		CREATE SCHEMA schemata;
+		CREATE TABLE schemata.version (
+			version_num text CONSTRAINT version_pkey PRIMARY KEY,
+			name text NOT NULL,
+			checksum text NOT NULL CONSTRAINT version_checksum_format CHECK (true),
+			execution_mode text NOT NULL CONSTRAINT version_execution_mode CHECK (true),
+			status text NOT NULL CONSTRAINT version_status CHECK (true),
+			started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+			finished_at timestamptz,
+			statement_count integer NOT NULL CONSTRAINT version_statement_count CHECK (true),
+			last_confirmed_statement integer NOT NULL DEFAULT 0,
+			failed_statement integer,
+			error_message text,
+			error_code text,
+			attempt_count integer NOT NULL DEFAULT 1 CONSTRAINT version_attempt_count CHECK (true),
+			recovered_at timestamptz,
+			recovery_action text CONSTRAINT version_recovery_action CHECK (true),
+			CONSTRAINT version_last_confirmed_range CHECK (true),
+			CONSTRAINT version_failed_statement_range CHECK (true),
+			CONSTRAINT version_recovery_pair CHECK (true),
+			CONSTRAINT version_status_state CHECK (true)
+		);
+		COMMENT ON TABLE schemata.version IS 'schemata:migration-history:v1';
+	`)
+	require.NoError(t, err)
+
+	err = db.NewMigrationTracker(pool).EnsureSchema(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported pre-release migration tracking constraints")
+}
+
+func TestMigrationTrackerRejectsBehaviorChangingTrigger(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.keep_old_migration_history()")
+	defer pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.keep_old_migration_history()")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+	tracker := db.NewMigrationTracker(pool)
+	require.NoError(t, tracker.EnsureSchema(ctx))
+	_, err = pool.Exec(ctx, `
+		CREATE FUNCTION public.keep_old_migration_history() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN RETURN OLD; END $$;
+		CREATE TRIGGER keep_old_migration_history
+		BEFORE UPDATE ON schemata.version
+		FOR EACH ROW EXECUTE FUNCTION public.keep_old_migration_history();
+	`)
+	require.NoError(t, err)
+
+	err = tracker.EnsureSchema(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported behavior on migration tracking table")
+}
+
+func TestMigrationTrackerRejectsInheritance(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	tracker := db.NewMigrationTracker(pool)
+	require.NoError(t, tracker.EnsureSchema(ctx))
+	_, err = pool.Exec(ctx, "CREATE TABLE schemata.version_child () INHERITS (schemata.version)")
+	require.NoError(t, err)
+
+	err = tracker.EnsureSchema(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "children=1")
+}
+
+func TestTransactionalMigrationReportsFailingStatementAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS statement_diagnostics")
+	defer pool.Exec(ctx, "DROP TABLE IF EXISTS statement_diagnostics")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+	migrations := []migration.Migration{{
+		Version: "20231015120530",
+		Name:    "statement-diagnostics",
+		SQL: `CREATE TABLE statement_diagnostics (id integer);
+INSERT INTO missing_statement_diagnostics_table VALUES (1);
+ALTER TABLE statement_diagnostics ADD COLUMN value text;`,
+		FilePath: "/migrations/20231015120530-statement-diagnostics.sql",
+	}}
+
+	err = migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "statement 2 of 3")
+	assert.Contains(t, err.Error(), "INSERT INTO missing_statement_diagnostics_table")
+
+	var tableExists bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT to_regclass('public.statement_diagnostics') IS NOT NULL").Scan(&tableExists))
+	assert.False(t, tableExists, "all schema changes must roll back with the failed transaction")
+
+	history, historyErr := db.NewMigrationTracker(pool).GetHistoryWithExecutor(ctx, pool)
+	require.NoError(t, historyErr)
+	assert.Empty(t, history, "the transactional history row must roll back with the migration")
+}
+
+func TestMigrationCannotMutateHistoryThroughDynamicSQL(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "dollar quoted dynamic SQL",
+			sql: `DO $body$
+BEGIN
+  EXECUTE 'DELETE FROM schemata.version WHERE version_num = ''20231015120530''';
+END
+$body$;
+CREATE TABLE public.dynamic_history_should_rollback (id integer);`,
+		},
+		{
+			name: "set_config and unqualified delete",
+			sql: `SELECT set_config('search_path', 'schemata,public', true);
+DELETE FROM version WHERE version_num = '20231015120530';
+CREATE TABLE public.dynamic_history_should_rollback (id integer);`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+			pool, err := db.Connect(ctx, devConn)
+			require.NoError(t, err)
+			defer pool.Close()
+
+			_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+			_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS public.dynamic_history_should_rollback")
+			defer pool.Exec(ctx, "DROP TABLE IF EXISTS public.dynamic_history_should_rollback")
+			defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+			applier := migration.NewApplier(pool, false)
+			first := migration.Migration{
+				Version: "20231015120530",
+				Name:    "history-baseline",
+				SQL:     "SELECT 1;",
+			}
+			require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{}))
+
+			second := migration.Migration{
+				Version: "20231015130000",
+				Name:    "history-tamper",
+				SQL:     testCase.sql,
+			}
+			err = applier.Apply(ctx, []migration.Migration{first, second}, migration.ApplyOptions{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "modified the reserved migration history")
+
+			versions, historyErr := db.NewMigrationTracker(pool).GetAppliedVersions(ctx)
+			require.NoError(t, historyErr)
+			assert.Equal(t, []string{"20231015120530"}, versions)
+			var tableExists bool
+			require.NoError(t, pool.QueryRow(ctx, "SELECT to_regclass('public.dynamic_history_should_rollback') IS NOT NULL").Scan(&tableExists))
+			assert.False(t, tableExists)
+		})
+	}
+}
+
+func TestDeferredConstraintTriggerCannotMutateHistoryAtCommit(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS public.deferred_history_queue")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.deferred_history_tamper()")
+	defer pool.Exec(ctx, "DROP TABLE IF EXISTS public.deferred_history_queue")
+	defer pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.deferred_history_tamper()")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+	applier := migration.NewApplier(pool, false)
+	first := migration.Migration{
+		Version: "20231015120530",
+		Name:    "history-baseline",
+		SQL:     "SELECT 1;",
+	}
+	require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{}))
+
+	second := migration.Migration{
+		Version: "20231015130000",
+		Name:    "deferred-history-tamper",
+		SQL: `CREATE TABLE public.deferred_history_queue (id integer);
+CREATE FUNCTION public.deferred_history_tamper() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+  DELETE FROM schemata.version WHERE version_num = '20231015120530';
+  RETURN NEW;
+END
+$body$;
+CREATE CONSTRAINT TRIGGER deferred_history_tamper
+AFTER INSERT ON public.deferred_history_queue
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.deferred_history_tamper();
+INSERT INTO public.deferred_history_queue VALUES (1);`,
+	}
+	err = applier.Apply(ctx, []migration.Migration{first, second}, migration.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "modified the reserved migration history")
+
+	versions, historyErr := db.NewMigrationTracker(pool).GetAppliedVersions(ctx)
+	require.NoError(t, historyErr)
+	assert.Equal(t, []string{"20231015120530"}, versions)
+	var tableExists bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT to_regclass('public.deferred_history_queue') IS NOT NULL").Scan(&tableExists))
+	assert.False(t, tableExists)
+}
+
+func TestCommitTimeHistoryMutationIsNeverReportedAsSuccess(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS public.defer_first, public.defer_second")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.defer_first_trigger(), public.defer_second_trigger()")
+	defer pool.Exec(ctx, "DROP TABLE IF EXISTS public.defer_first, public.defer_second")
+	defer pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.defer_first_trigger(), public.defer_second_trigger()")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+	applier := migration.NewApplier(pool, false)
+	first := migration.Migration{
+		Version: "20231015120530",
+		Name:    "history-baseline",
+		SQL:     "SELECT 1;",
+	}
+	require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{}))
+
+	second := migration.Migration{
+		Version: "20231015130000",
+		Name:    "commit-time-history-tamper",
+		SQL: `CREATE TABLE public.defer_first (id integer);
+CREATE TABLE public.defer_second (id integer);
+CREATE FUNCTION public.defer_second_trigger() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+  DELETE FROM schemata.version WHERE version_num = '20231015120530';
+  RETURN NEW;
+END
+$body$;
+CREATE CONSTRAINT TRIGGER defer_second_trigger
+AFTER INSERT ON public.defer_second
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.defer_second_trigger();
+CREATE FUNCTION public.defer_first_trigger() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+  SET CONSTRAINTS ALL DEFERRED;
+  INSERT INTO public.defer_second VALUES (NEW.id);
+  RETURN NEW;
+END
+$body$;
+CREATE CONSTRAINT TRIGGER defer_first_trigger
+AFTER INSERT ON public.defer_first
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.defer_first_trigger();
+INSERT INTO public.defer_first VALUES (1);`,
+	}
+	err = applier.Apply(ctx, []migration.Migration{first, second}, migration.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "durable history differs from the verified transaction state")
+}
+
+func TestMigrationAppliesSQLStandardBeginAtomicFunction(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.atomic_add_one(integer)")
+	defer pool.Exec(ctx, "DROP FUNCTION IF EXISTS public.atomic_add_one(integer)")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+
+	migrations := []migration.Migration{{
+		Version: "20231015120530",
+		Name:    "begin-atomic-function",
+		SQL: `CREATE FUNCTION public.atomic_add_one(value integer)
+RETURNS integer
+LANGUAGE SQL
+BEGIN ATOMIC
+  SELECT value + 1;
+END;`,
+	}}
+	require.NoError(t, migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{}))
+
+	var result int
+	require.NoError(t, pool.QueryRow(ctx, "SELECT public.atomic_add_one(41)").Scan(&result))
+	assert.Equal(t, 42, result)
+}
+
+func TestMigrationCancelsWhenRunnerLockBackendDies(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS public.lock_loss_should_rollback")
+	defer pool.Exec(ctx, "DROP TABLE IF EXISTS public.lock_loss_should_rollback")
+	defer pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
+	require.NoError(t, db.NewMigrationTracker(pool).EnsureSchema(ctx))
+
+	migrations := []migration.Migration{{
+		Version: "20231015120530",
+		Name:    "lock-loss",
+		SQL: `SELECT pg_sleep(10);
+CREATE TABLE public.lock_loss_should_rollback (id integer);`,
+	}}
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{})
+	}()
+
+	key := uint64(db.AdvisoryLockKey("schemata:migrations"))
+	classID := int64(uint32(key >> 32))
+	objectID := int64(uint32(key))
+	var lockPID int32
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		err = pool.QueryRow(ctx, `
+			SELECT pid
+			FROM pg_catalog.pg_locks
+			WHERE locktype = 'advisory'
+			  AND classid = $1::bigint::oid
+			  AND objid = $2::bigint::oid
+			  AND objsubid = 1
+			  AND granted
+			LIMIT 1
+		`, classID, objectID).Scan(&lockPID)
+		if err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	require.NoError(t, err, "runner advisory lock should become visible")
+
+	var terminated bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", lockPID).Scan(&terminated))
+	require.True(t, terminated)
+
+	select {
+	case err = <-applyDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "lost its advisory lock")
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration did not stop after its runner lock backend died")
+	}
+
+	var tableExists bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT to_regclass('public.lock_loss_should_rollback') IS NOT NULL").Scan(&tableExists))
+	assert.False(t, tableExists)
+	history, historyErr := db.NewMigrationTracker(pool).GetHistoryWithExecutor(ctx, pool)
+	require.NoError(t, historyErr)
+	assert.Empty(t, history)
+}
+
 func TestDryRunMode(t *testing.T) {
 	ctx := context.Background()
 
@@ -322,11 +867,6 @@ func TestDryRunMode(t *testing.T) {
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS test_dryrun_table")
 	_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS schemata CASCADE")
 
-	// Ensure schema exists first
-	tracker := db.NewMigrationTracker(pool)
-	err = tracker.EnsureSchema(ctx)
-	require.NoError(t, err)
-
 	// Create applier with dry run
 	applier := migration.NewApplier(pool, true)
 
@@ -340,10 +880,9 @@ func TestDryRunMode(t *testing.T) {
 	}
 
 	// Apply in dry run mode
-	opts := migration.ApplyOptions{
-		DryRun:          true,
-		ContinueOnError: false,
-	}
+	// Constructor-level dry-run must remain authoritative even when callers
+	// pass zero-value options.
+	opts := migration.ApplyOptions{}
 	err = applier.Apply(ctx, migrations, opts)
 	require.NoError(t, err)
 
@@ -357,6 +896,10 @@ func TestDryRunMode(t *testing.T) {
 	`).Scan(&tableExists)
 	require.NoError(t, err)
 	assert.False(t, tableExists, "table should not exist in dry run mode")
+
+	var historyExists bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT to_regclass('schemata.version') IS NOT NULL").Scan(&historyExists))
+	assert.False(t, historyExists, "dry run must not create migration history")
 }
 
 // Helper function

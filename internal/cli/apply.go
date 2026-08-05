@@ -103,10 +103,9 @@ func runApply(cmd *cobra.Command, args []string) error {
 	// Apply migrations
 	applier := migration.NewApplier(pool, applyDryRun)
 	opts := migration.ApplyOptions{
-		DryRun:          applyDryRun,
-		ContinueOnError: false,
-		Step:            applyStep,
-		ToVersion:       applyTo,
+		DryRun:    applyDryRun,
+		Step:      applyStep,
+		ToVersion: applyTo,
 	}
 
 	if err := applier.Apply(ctx, migrations, opts); err != nil {

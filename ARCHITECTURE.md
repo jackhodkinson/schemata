@@ -241,7 +241,7 @@ parse -> normalize -> hash -> diff -> plan (if needed) -> emit ddl
 
 ## Apply
 
-`schemata apply <db>` (not mentioned in README) is a lower level command that applies all pending migrations against the selected target/dev-db, recording only the migration version (the timestamp prefix) just like Alembic.
+`schemata apply <db>` is the lower-level command that applies pending migrations against the selected target or development database. Migration history is immutable: Schemata records the exact source checksum and refuses to run if applied history no longer matches the local inventory.
 
 You must specify either a target or dev as the db.
 
@@ -251,23 +251,48 @@ You must specify either a target or dev as the db.
 CREATE SCHEMA IF NOT EXISTS schemata;
 
 CREATE TABLE IF NOT EXISTS schemata.version (
-  version_num text PRIMARY KEY
+  version_num text PRIMARY KEY,
+  name text NOT NULL,
+  checksum text NOT NULL,
+  execution_mode text NOT NULL,
+  status text NOT NULL,
+  started_at timestamptz NOT NULL,
+  finished_at timestamptz,
+  statement_count integer NOT NULL,
+  last_confirmed_statement integer NOT NULL,
+  failed_statement integer,
+  error_message text,
+  error_code text,
+  attempt_count integer NOT NULL,
+  recovered_at timestamptz,
+  recovery_action text
 );
 ```
 
 •	A migration’s version is the filename prefix: YYYYMMDDHHMMSS-...sql → version_num = YYYYMMDDHHMMSS.
-•	Already-applied versions are skipped. No checksums, names, or statuses are stored.
+•	The checksum is SHA-256 over the exact source-file bytes, including comments, directives, and line endings. Moo migrations hash the complete source file rather than only the extracted Apply block.
+•	Before planning pending work, Schemata rejects changed checksums, renamed migrations, missing local versions, changed transaction modes or statement counts, incomplete states, and applied migrations whose dependencies are not applied.
+•	The progress and recovery columns form the durable state model for non-transactional execution. Until that execution path is enabled, non-transactional migrations are rejected; transactional migrations are recorded as applied atomically with their schema changes.
 
-How apply runs (lean)
-1.	Resolve target/dev, connect, and CREATE TABLE IF NOT EXISTS schemata.version.
-2.	Read local migration versions from the configured directory; sort ascending.
-3.	Read applied versions via SELECT version_num FROM schemata.version.
-4.	Compute pending = local − applied.
-5.	For each pending migration (in order):
-  •	Begin a transaction.
-  •	Execute the file’s SQL (unless --dry-run).
-  •	On success: INSERT INTO schemata.version(version_num) VALUES ($1);
-  •	Commit. On error: rollback and stop (unless --continue-on-error).
+How apply runs
+1.	Resolve the target, load and validate every migration, calculate exact checksums, split top-level statements, and reject explicit transaction-control commands.
+2.	Create and validate the internal tracking schema.
+3.	Acquire one session advisory lock on a dedicated connection for the complete history-check and execution lifecycle.
+4.	Validate the complete database history against the complete local inventory.
+5.	Compute and dependency-sort pending migrations, then apply requested step/version filters.
+6.	For each pending transactional migration:
+   - Open a fresh execution session, begin a transaction, and acquire a transaction-scoped execution fence.
+   - Recheck the exact history and insert a `running` row inside that transaction.
+   - Execute each top-level statement in order, reporting the exact failing statement if one errors (unless `--dry-run`).
+   - Resolve deferred constraints, then prove that the tracking schema and existing history were not changed by the migration.
+   - Update the row to `applied` and verify the transition.
+   - Commit. On error: roll back the migration and stop.
+   - Destroy the execution session so migration-created session state cannot leak into another migration or the pool.
+7.	Release the runner lock and destroy its dedicated session.
+
+Dry-run does not create the tracking schema on a fresh database.
+
+Migration files are trusted executable code, not sandboxed input. Schemata rejects direct tracking-schema access and verifies the durable ledger around execution, but a deployment role with unrestricted privileges can deliberately bypass in-process safeguards. Production deployments must therefore use the documented least-privilege role boundary once that operational work is complete.
 
 
 ## Migrate

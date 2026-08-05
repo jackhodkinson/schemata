@@ -26,7 +26,7 @@ Apply: |
   CREATE TABLE production.grid_schedule (
     task_id uuid PRIMARY KEY
   );`,
-			wantSQL: "CREATE TABLE production.grid_schedule (\n  task_id uuid PRIMARY KEY\n);",
+			wantSQL:     "CREATE TABLE production.grid_schedule (\n  task_id uuid PRIMARY KEY\n);",
 			wantDepends: "2026-02-25-rack-and-slot-service-status",
 		},
 		{
@@ -109,7 +109,7 @@ Apply: |
     task_id uuid PRIMARY KEY
   );`,
 
-		"README.md":              "Not a migration",
+		"README.md":               "Not a migration",
 		"20231015120530-test.sql": "CREATE TABLE test (id INT);",
 	}
 
@@ -144,10 +144,14 @@ Apply: |
 	assert.Empty(t, migrations[0].DependsOn)
 	assert.Equal(t, []string{"2026-02-26-epoch"}, migrations[1].DependsOn)
 	assert.Equal(t, []string{"2026-02-27-add-tables"}, migrations[2].DependsOn)
+	assert.Equal(t, migrationChecksum([]byte(files["2026-02-27-add-tables.yml"])), migrations[1].Checksum)
+	assert.Equal(t, ExecutionModeTransactional, migrations[1].ExecutionMode)
 
-	// LoadSQL is a no-op since SQL is already set
-	err = migrations[0].LoadSQL()
-	require.NoError(t, err)
+	// Full inventory validation must preserve Moo's Depends: metadata even
+	// though it is not present as a comment inside the extracted Apply SQL.
+	require.NoError(t, ValidateInventory(migrations))
+	assert.Equal(t, []string{"2026-02-26-epoch"}, migrations[1].DependsOn)
+	assert.Equal(t, []string{"2026-02-27-add-tables"}, migrations[2].DependsOn)
 }
 
 func TestMooScanner_NonexistentDirectory(t *testing.T) {
@@ -166,6 +170,43 @@ func TestMooScanner_EmptyDirectory(t *testing.T) {
 	migrations, err := scanner.Scan()
 	require.NoError(t, err)
 	assert.Empty(t, migrations)
+}
+
+func TestMooScanner_EmptyDependsRemainsAuthoritativelyEmpty(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := `Description: Root migration
+Created: 2026-02-26 12:00:00.000000000 UTC
+Depends:
+Apply: |
+  -- schemata:depends-on should-not-override-moo-metadata
+  CREATE SCHEMA analytics;`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "2026-02-26-root.txt"), []byte(content), 0644))
+
+	migrations, err := NewMooScanner(tmpDir).Scan()
+	require.NoError(t, err)
+	require.Len(t, migrations, 1)
+	require.NotNil(t, migrations[0].DependsOn)
+	assert.Empty(t, migrations[0].DependsOn)
+	require.NoError(t, ValidateInventory(migrations))
+	assert.Empty(t, migrations[0].DependsOn)
+}
+
+func TestMooScanner_DependsCannotBeMutatedAfterScan(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := `Description: Child migration
+Created: 2026-02-27 12:00:00.000000000 UTC
+Depends: 2026-02-26-root
+Apply: |
+  SELECT 1;`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "2026-02-27-child.txt"), []byte(content), 0644))
+
+	migrations, err := NewMooScanner(tmpDir).Scan()
+	require.NoError(t, err)
+	require.Len(t, migrations, 1)
+	migrations[0].DependsOn = []string{"forged-dependency"}
+
+	require.NoError(t, migrations[0].LoadSQL())
+	assert.Equal(t, []string{"2026-02-26-root"}, migrations[0].DependsOn)
 }
 
 func TestMooScanner_DependencyOrdering(t *testing.T) {

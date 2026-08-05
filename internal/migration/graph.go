@@ -21,6 +21,20 @@ func ValidateInventory(migrations []Migration) error {
 			return fmt.Errorf("failed to load migration %s (%s): %w",
 				migrations[i].Version, migrations[i].FilePath, err)
 		}
+		switch migrations[i].ExecutionMode {
+		case ExecutionModeTransactional:
+		case ExecutionModeNonTransactional:
+			return fmt.Errorf(
+				"migration %s requests non-transactional execution, which is not supported yet",
+				migrations[i].Version,
+			)
+		default:
+			return fmt.Errorf(
+				"migration %s has unsupported execution mode %q",
+				migrations[i].Version,
+				migrations[i].ExecutionMode,
+			)
+		}
 	}
 
 	for i := range migrations {

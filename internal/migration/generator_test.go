@@ -19,6 +19,8 @@ func TestGenerateWithVersion(t *testing.T) {
 	assert.Equal(t, "20260225235959", mig.Version)
 	assert.Equal(t, "add-extensions", mig.Name)
 	assert.Equal(t, filepath.Join(dir, "20260225235959-add-extensions.sql"), mig.FilePath)
+	assert.Equal(t, migrationChecksum([]byte("CREATE EXTENSION IF NOT EXISTS citext;\n")), mig.Checksum)
+	assert.Equal(t, ExecutionModeTransactional, mig.ExecutionMode)
 
 	content, err := os.ReadFile(mig.FilePath)
 	require.NoError(t, err)

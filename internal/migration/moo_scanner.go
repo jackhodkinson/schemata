@@ -63,14 +63,19 @@ func (s *MooScanner) Scan() ([]Migration, error) {
 		}
 
 		m := Migration{
-			Version:  version,
-			Name:     name,
-			FilePath: filePath,
-			SQL:      sql,
+			Version:       version,
+			Name:          name,
+			FilePath:      filePath,
+			SQL:           sql,
+			ExecutionMode: ExecutionModeTransactional,
 		}
+		m.setAuthoritativeSource(content, sql)
+		m.Checksum = migrationChecksum(m.sourceBytes)
+		dependencies := []string{}
 		if depends != "" {
-			m.DependsOn = []string{depends}
+			dependencies = []string{depends}
 		}
+		m.setAuthoritativeDependencies(dependencies)
 
 		migrations = append(migrations, m)
 	}
