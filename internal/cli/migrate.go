@@ -66,18 +66,9 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Pre-flight check: ensure migrations are in sync with configured schema path
-	fmt.Println("Running pre-flight check (diff --from migrations)...")
-	if err := service.CheckMigrationsInSync(
-		ctx,
-		cfg,
-		migratePreflightApplyOptions(migrateDryRun, migrateInitializeHistory),
-	); err != nil {
-		return fmt.Errorf("pre-flight check failed: %w\n\nHint: Run 'schemata generate <name>' to create a migration for the differences", err)
-	}
-	fmt.Println("✓ Migrations are in sync with configured schema path")
-
-	// Determine target connection
+	// Determine and attest the intended target before the dev preflight does
+	// any database work. This prevents an unpinned production invocation from
+	// changing even its development database before it is rejected.
 	var targetConn *config.DBConnection
 	if cfg.Target != nil {
 		if migrateTarget != "" {
@@ -96,6 +87,20 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	} else {
 		return fmt.Errorf("no target database configured")
 	}
+	if err := requirePinnedProductionTarget(targetConn, "migrate"); err != nil {
+		return err
+	}
+
+	// Pre-flight check: ensure migrations are in sync with configured schema path
+	fmt.Println("Running pre-flight check (diff --from migrations)...")
+	if err := service.CheckMigrationsInSync(
+		ctx,
+		cfg,
+		migratePreflightApplyOptions(migrateDryRun, migrateInitializeHistory),
+	); err != nil {
+		return fmt.Errorf("pre-flight check failed: %w\n\nHint: Run 'schemata generate <name>' to create a migration for the differences", err)
+	}
+	fmt.Println("✓ Migrations are in sync with configured schema path")
 
 	// Connect to target
 	fmt.Printf("Connecting to target database...\n")
