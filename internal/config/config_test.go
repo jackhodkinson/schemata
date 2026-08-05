@@ -67,6 +67,31 @@ migrations: ./migrations
 			},
 		},
 		{
+			name: "URL mapping with expected identity",
+			yaml: `
+dev: postgresql://localhost:5432/dev
+target:
+  url: postgresql://prod.example.com:5432/app
+  identity:
+    database: app
+    system-identifier: "18446744073709551615"
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: false,
+			check: func(t *testing.T, cfg *Config) {
+				require.NotNil(t, cfg.Target)
+				require.NotNil(t, cfg.Target.URL)
+				assert.Equal(t, "postgresql://prod.example.com:5432/app", *cfg.Target.URL)
+				require.NotNil(t, cfg.Target.Identity)
+				assert.Equal(t, "app", cfg.Target.Identity.Database)
+				assert.Equal(t, "18446744073709551615", cfg.Target.Identity.SystemIdentifier)
+				value, err := cfg.Target.Identity.SystemIdentifierValue()
+				require.NoError(t, err)
+				assert.Equal(t, ^uint64(0), value)
+			},
+		},
+		{
 			name: "multi-target format",
 			yaml: `
 dev: postgresql://localhost:5432/dev
@@ -183,6 +208,140 @@ dev: postgresql://localhost:5432/dev
 target: postgresql://localhost:5432/target
 targets:
   prod: postgresql://prod:5432/prod
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity requires database",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    system-identifier: "123"
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity cannot be null",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity requires system identifier",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: app
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity rejects non-decimal system identifier",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: app
+    system-identifier: "0x123"
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity requires quoted system identifier",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: app
+    system-identifier: 123
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity database must be a string",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: 123
+    system-identifier: "123"
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity rejects unknown fields",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: app
+    system-identifier: "123"
+    cluster: production
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "identity rejects system identifier overflow",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: app
+    system-identifier: "18446744073709551616"
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "URL mapping rejects structured connection fields",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  host: localhost
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "connection mapping rejects unknown identity typo",
+			yaml: `
+target:
+  url: postgresql://localhost:5432/app
+  identitiy:
+    database: app
+    system-identifier: "123"
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
+			name: "scalar connection URL must be a string",
+			yaml: `
+target: 123
 schema: schema.sql
 migrations: ./migrations
 `,
@@ -358,6 +517,60 @@ func TestConfigRejectsImplicitOrInvalidConnections(t *testing.T) {
 	require.ErrorContains(t, cfg.Validate(), "unsupported migrations format")
 }
 
+func TestDatabaseIdentityValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		identity   DatabaseIdentity
+		wantErr    string
+		wantSystem uint64
+	}{
+		{
+			name:       "valid",
+			identity:   DatabaseIdentity{Database: "app", SystemIdentifier: "00123"},
+			wantSystem: 123,
+		},
+		{
+			name:     "missing database",
+			identity: DatabaseIdentity{SystemIdentifier: "123"},
+			wantErr:  "identity.database must be specified",
+		},
+		{
+			name:     "missing system identifier",
+			identity: DatabaseIdentity{Database: "app"},
+			wantErr:  "identity.system-identifier must be specified",
+		},
+		{
+			name:     "negative",
+			identity: DatabaseIdentity{Database: "app", SystemIdentifier: "-1"},
+			wantErr:  "non-decimal character",
+		},
+		{
+			name:     "positive sign",
+			identity: DatabaseIdentity{Database: "app", SystemIdentifier: "+1"},
+			wantErr:  "non-decimal character",
+		},
+		{
+			name:     "overflow",
+			identity: DatabaseIdentity{Database: "app", SystemIdentifier: "18446744073709551616"},
+			wantErr:  "outside the uint64 range",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.identity.Validate()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			value, err := tt.identity.SystemIdentifierValue()
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantSystem, value)
+		})
+	}
+}
+
 func TestDatabaseTimeoutsMarshalAsDurationsAndOmitEmptySection(t *testing.T) {
 	withoutTimeouts, err := yaml.Marshal(Config{})
 	require.NoError(t, err)
@@ -369,6 +582,51 @@ func TestDatabaseTimeoutsMarshalAsDurationsAndOmitEmptySection(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Contains(t, string(withTimeouts), "statement-timeout: 1m30s")
+}
+
+func TestDBConnectionMarshalPreservesScalarURLAndMapsIdentity(t *testing.T) {
+	url := "postgresql://db.example/app"
+
+	scalar, err := yaml.Marshal(DBConnection{URL: &url})
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://db.example/app\n", string(scalar))
+
+	mapped, err := yaml.Marshal(DBConnection{
+		URL: &url,
+		Identity: &DatabaseIdentity{
+			Database:         "app",
+			SystemIdentifier: "7561860200789946402",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, `url: postgresql://db.example/app
+identity:
+    database: app
+    system-identifier: "7561860200789946402"
+`, string(mapped))
+}
+
+func TestIdentityEnvironmentExpansionHappensBeforeValidation(t *testing.T) {
+	t.Setenv("SCHEMATA_EXPECTED_DATABASE", "app")
+	t.Setenv("SCHEMATA_EXPECTED_SYSTEM_IDENTIFIER", "7561860200789946402")
+
+	configPath := t.TempDir() + "/schemata.yaml"
+	err := os.WriteFile(configPath, []byte(`
+target:
+  url: postgresql://localhost:5432/app
+  identity:
+    database: ${SCHEMATA_EXPECTED_DATABASE}
+    system-identifier: ${SCHEMATA_EXPECTED_SYSTEM_IDENTIFIER}
+schema: schema.sql
+migrations: ./migrations
+`), 0o600)
+	require.NoError(t, err)
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Target.Identity)
+	assert.Equal(t, "app", cfg.Target.Identity.Database)
+	assert.Equal(t, "7561860200789946402", cfg.Target.Identity.SystemIdentifier)
 }
 
 func TestDetectEnvVar(t *testing.T) {

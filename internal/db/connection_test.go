@@ -2,9 +2,12 @@ package db
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,6 +52,19 @@ func TestConnectRejectsInvalidOptionsBeforeOpeningPool(t *testing.T) {
 	require.ErrorContains(t, err, "lock timeout must not be negative")
 }
 
+func TestConnectRejectsInvalidIdentityBeforeOpeningPool(t *testing.T) {
+	url := "postgresql://localhost:1/unused"
+	conn := &config.DBConnection{
+		URL: &url,
+		Identity: &config.DatabaseIdentity{
+			Database: "unused",
+		},
+	}
+
+	_, err := Connect(context.Background(), conn)
+	require.ErrorContains(t, err, "identity.system-identifier must be specified")
+}
+
 func TestWithDatabaseConfigOverridesOnlyExplicitTimeouts(t *testing.T) {
 	statementTimeout := config.Duration{Duration: 45 * time.Second}
 	options := connectOptions{
@@ -78,4 +94,119 @@ func TestWithDatabaseConfigPreservesExplicitZero(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, options.statementTimeout)
 	assert.Zero(t, options.lockTimeout)
+}
+
+func TestVerifyTargetIdentity(t *testing.T) {
+	t.Run("match", func(t *testing.T) {
+		err := verifyTargetIdentity(
+			context.Background(),
+			stubIdentityQuerier{database: "app", systemIdentifier: "123"},
+			"schemata",
+			config.DatabaseIdentity{Database: "app", SystemIdentifier: "000123"},
+		)
+		require.NoError(t, err)
+	})
+
+	t.Run("database mismatch", func(t *testing.T) {
+		err := verifyTargetIdentity(
+			context.Background(),
+			stubIdentityQuerier{database: "wrong", systemIdentifier: "123"},
+			"schemata",
+			config.DatabaseIdentity{Database: "app", SystemIdentifier: "123"},
+		)
+		var mismatch *TargetIdentityMismatchError
+		require.ErrorAs(t, err, &mismatch)
+		assert.Equal(t, "app", mismatch.ExpectedDatabase)
+		assert.Equal(t, "wrong", mismatch.ActualDatabase)
+		assert.Equal(t, uint64(123), mismatch.ExpectedSystemIdentifier)
+		assert.Equal(t, uint64(123), mismatch.ActualSystemIdentifier)
+	})
+
+	t.Run("system identifier mismatch", func(t *testing.T) {
+		err := verifyTargetIdentity(
+			context.Background(),
+			stubIdentityQuerier{database: "app", systemIdentifier: "456"},
+			"schemata",
+			config.DatabaseIdentity{Database: "app", SystemIdentifier: "123"},
+		)
+		var mismatch *TargetIdentityMismatchError
+		require.ErrorAs(t, err, &mismatch)
+		assert.Equal(t, uint64(123), mismatch.ExpectedSystemIdentifier)
+		assert.Equal(t, uint64(456), mismatch.ActualSystemIdentifier)
+	})
+
+	t.Run("invalid server value", func(t *testing.T) {
+		err := verifyTargetIdentity(
+			context.Background(),
+			stubIdentityQuerier{database: "app", systemIdentifier: "not-a-number"},
+			"schemata",
+			config.DatabaseIdentity{Database: "app", SystemIdentifier: "123"},
+		)
+		require.ErrorContains(t, err, "PostgreSQL returned invalid system identifier")
+	})
+
+	t.Run("permission failure", func(t *testing.T) {
+		err := verifyTargetIdentity(
+			context.Background(),
+			stubIdentityQuerier{err: &pgconn.PgError{
+				Code:    "42501",
+				Message: "permission denied for function pg_control_system",
+			}},
+			"schemata",
+			config.DatabaseIdentity{Database: "app", SystemIdentifier: "123"},
+		)
+		var permissionErr *TargetIdentityPermissionError
+		require.ErrorAs(t, err, &permissionErr)
+		assert.Equal(t, "schemata", permissionErr.Role)
+	})
+}
+
+func TestTargetIdentityPermissionErrorIncludesPreciseRemediation(t *testing.T) {
+	err := targetIdentityQueryError(`deploy"role`, &pgconn.PgError{
+		Code:    "42501",
+		Message: "permission denied for function pg_control_system",
+	})
+
+	require.ErrorContains(t, err, "permission denied while reading PostgreSQL system identity")
+	assert.Contains(t, err.Error(), `GRANT pg_monitor TO "deploy""role";`)
+	assert.Contains(t, err.Error(), `GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO "deploy""role";`)
+	var permissionErr *TargetIdentityPermissionError
+	require.ErrorAs(t, err, &permissionErr)
+	assert.Equal(t, `deploy"role`, permissionErr.Role)
+
+	var pgErr *pgconn.PgError
+	require.True(t, errors.As(err, &pgErr))
+	assert.Equal(t, "42501", pgErr.Code)
+}
+
+type stubIdentityQuerier struct {
+	database         string
+	systemIdentifier string
+	err              error
+}
+
+func (querier stubIdentityQuerier) QueryRow(context.Context, string, ...any) pgx.Row {
+	return stubIdentityRow(querier)
+}
+
+type stubIdentityRow stubIdentityQuerier
+
+func (row stubIdentityRow) Scan(destinations ...any) error {
+	if row.err != nil {
+		return row.err
+	}
+	if len(destinations) != 2 {
+		return errors.New("expected two identity destinations")
+	}
+	database, ok := destinations[0].(*string)
+	if !ok {
+		return errors.New("database destination is not *string")
+	}
+	systemIdentifier, ok := destinations[1].(*string)
+	if !ok {
+		return errors.New("system identifier destination is not *string")
+	}
+	*database = row.database
+	*systemIdentifier = row.systemIdentifier
+	return nil
 }

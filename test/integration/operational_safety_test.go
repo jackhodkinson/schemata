@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -108,6 +110,119 @@ func TestDefaultPostgresTimeoutsAreFinite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, db.DefaultStatementTimeout.Milliseconds(), statementTimeoutMilliseconds)
 	assert.Equal(t, db.DefaultLockTimeout.Milliseconds(), lockTimeoutMilliseconds)
+}
+
+func TestExpectedTargetIdentityAcceptsMatchingDatabaseAndCluster(t *testing.T) {
+	ctx := context.Background()
+	database, systemIdentifier := readTargetIdentity(t, ctx, devDBURL)
+	configPath := t.TempDir() + "/schemata.yaml"
+	configYAML := fmt.Sprintf(`
+target:
+  url: %q
+  identity:
+    database: %q
+    system-identifier: %q
+schema: schema.sql
+migrations: ./migrations
+`, devDBURL, database, systemIdentifier)
+	require.NoError(t, os.WriteFile(configPath, []byte(configYAML), 0o600))
+	cfg, err := config.Load(configPath)
+	require.NoError(t, err)
+
+	pool, err := db.Connect(ctx, cfg.Target)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// Hold two sessions concurrently so the per-physical-connection check runs
+	// for pool growth, not only for the session used by Connect's Ping.
+	first, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer first.Release()
+	second, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer second.Release()
+
+	for _, connection := range []*pgxpool.Conn{first, second} {
+		var gotDatabase string
+		err := connection.QueryRow(ctx, "SELECT current_database()").Scan(&gotDatabase)
+		require.NoError(t, err)
+		assert.Equal(t, database, gotDatabase)
+	}
+
+	err = db.WithDedicatedConnection(ctx, pool, func(connection *pgxpool.Conn) error {
+		var gotDatabase string
+		if err := connection.QueryRow(ctx, "SELECT current_database()").Scan(&gotDatabase); err != nil {
+			return err
+		}
+		assert.Equal(t, database, gotDatabase)
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func TestExpectedTargetIdentityRejectsMismatches(t *testing.T) {
+	ctx := context.Background()
+	database, systemIdentifier := readTargetIdentity(t, ctx, devDBURL)
+	systemIdentifierValue, err := strconv.ParseUint(systemIdentifier, 10, 64)
+	require.NoError(t, err)
+	wrongSystemIdentifier := systemIdentifierValue + 1
+	if wrongSystemIdentifier == 0 {
+		wrongSystemIdentifier = systemIdentifierValue - 1
+	}
+
+	tests := []struct {
+		name               string
+		expectedDatabase   string
+		expectedIdentifier string
+	}{
+		{
+			name:               "database",
+			expectedDatabase:   database + "_wrong",
+			expectedIdentifier: systemIdentifier,
+		},
+		{
+			name:               "system identifier",
+			expectedDatabase:   database,
+			expectedIdentifier: strconv.FormatUint(wrongSystemIdentifier, 10),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			connectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			pool, err := db.Connect(connectCtx, &config.DBConnection{
+				URL: strPtr(devDBURL),
+				Identity: &config.DatabaseIdentity{
+					Database:         tt.expectedDatabase,
+					SystemIdentifier: tt.expectedIdentifier,
+				},
+			})
+			require.Error(t, err)
+			assert.Nil(t, pool)
+			var mismatch *db.TargetIdentityMismatchError
+			require.ErrorAs(t, err, &mismatch)
+			assert.Equal(t, database, mismatch.ActualDatabase)
+			assert.Equal(t, systemIdentifierValue, mismatch.ActualSystemIdentifier)
+		})
+	}
+}
+
+func readTargetIdentity(t *testing.T, ctx context.Context, databaseURL string) (string, string) {
+	t.Helper()
+
+	pool, err := db.Connect(ctx, &config.DBConnection{URL: strPtr(databaseURL)})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	var database string
+	var systemIdentifier string
+	err = pool.QueryRow(ctx, `
+		SELECT current_database()::text,
+		       (pg_catalog.pg_control_system()).system_identifier::text
+	`).Scan(&database, &systemIdentifier)
+	require.NoError(t, err)
+	return database, systemIdentifier
 }
 
 func TestConfiguredLockTimeoutBoundsLockWait(t *testing.T) {

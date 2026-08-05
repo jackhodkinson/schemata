@@ -69,7 +69,10 @@ complete.
      implicit target connections.
    - Cancellation plus finite, configurable PostgreSQL statement/lock timeouts
      are implemented and documented in [operational database safety](operational-safety.md).
-   - Add target identity checks and stable reviewable plan output.
+   - Per-connection database/cluster identity checks are implemented; production
+     targets must pin both values as documented in
+     [operational database safety](operational-safety.md).
+   - Add stable reviewable plan output.
 
 7. **Resolve known security and release blockers**
    - Upgrade vulnerable dependencies and build with a supported, patched Go

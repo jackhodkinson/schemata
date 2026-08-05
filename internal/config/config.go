@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -152,8 +153,9 @@ func (mc *MigrationsConfig) GetFormat() string {
 
 // DBConnection can be either a URL string or connection details
 type DBConnection struct {
-	// Simple URL format
-	URL *string `yaml:"-"`
+	// URL is emitted as a scalar for legacy/simple configurations and as the
+	// "url" key when connection metadata such as Identity is present.
+	URL *string `yaml:"url,omitempty"`
 
 	// Structured format
 	Host     *string    `yaml:"host,omitempty"`
@@ -162,19 +164,121 @@ type DBConnection struct {
 	Password *string    `yaml:"password,omitempty"`
 	Database *string    `yaml:"database,omitempty"`
 	SSL      *SSLConfig `yaml:"ssl,omitempty"`
+
+	// Identity pins this connection to an expected database in an expected
+	// PostgreSQL cluster. It is optional for compatibility, but production
+	// targets should always configure it.
+	Identity *DatabaseIdentity `yaml:"identity,omitempty"`
+}
+
+// DatabaseIdentity uniquely identifies a PostgreSQL target within a cluster.
+// SystemIdentifier is kept as a decimal string because PostgreSQL cluster
+// identifiers are unsigned 64-bit values and YAML/JSON number handling is not
+// consistently lossless at that width.
+type DatabaseIdentity struct {
+	Database         string `yaml:"database"`
+	SystemIdentifier string `yaml:"system-identifier"`
+}
+
+// UnmarshalYAML keeps the identifier lossless and rejects misspelled identity
+// fields instead of silently disabling part of the safety check.
+func (identity *DatabaseIdentity) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("identity must be a mapping with database and system-identifier")
+	}
+
+	knownFields := map[string]struct{}{
+		"database": {}, "system-identifier": {},
+	}
+	for index := 0; index < len(node.Content); index += 2 {
+		key := node.Content[index]
+		value := node.Content[index+1]
+		if _, ok := knownFields[key.Value]; !ok {
+			return fmt.Errorf("unknown identity field %q", key.Value)
+		}
+		if key.Value == "database" && value.Tag != "!!str" {
+			return fmt.Errorf("identity.database must be a string")
+		}
+		if key.Value == "system-identifier" && value.Tag != "!!str" {
+			return fmt.Errorf("identity.system-identifier must be a quoted decimal string")
+		}
+	}
+
+	type databaseIdentityAlias DatabaseIdentity
+	var details databaseIdentityAlias
+	if err := node.Decode(&details); err != nil {
+		return err
+	}
+	*identity = DatabaseIdentity(details)
+	return nil
+}
+
+// Validate requires a complete identity and a decimal uint64 PostgreSQL
+// system identifier.
+func (identity DatabaseIdentity) Validate() error {
+	if identity.Database == "" {
+		return fmt.Errorf("identity.database must be specified")
+	}
+	if identity.SystemIdentifier == "" {
+		return fmt.Errorf("identity.system-identifier must be specified")
+	}
+	if _, err := identity.SystemIdentifierValue(); err != nil {
+		return fmt.Errorf("identity.system-identifier must be a decimal uint64: %w", err)
+	}
+	return nil
+}
+
+// SystemIdentifierValue parses the lossless string representation used in
+// configuration.
+func (identity DatabaseIdentity) SystemIdentifierValue() (uint64, error) {
+	for _, char := range identity.SystemIdentifier {
+		if char < '0' || char > '9' {
+			return 0, fmt.Errorf("%q contains a non-decimal character", identity.SystemIdentifier)
+		}
+	}
+
+	value, err := strconv.ParseUint(identity.SystemIdentifier, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q is outside the uint64 range", identity.SystemIdentifier)
+	}
+	return value, nil
 }
 
 // UnmarshalYAML implements custom unmarshaling for DBConnection
 // This allows it to handle both string URLs and structured objects
 func (db *DBConnection) UnmarshalYAML(node *yaml.Node) error {
-	// Try to unmarshal as a string first
-	var urlStr string
-	if err := node.Decode(&urlStr); err == nil {
+	*db = DBConnection{}
+
+	if node.Kind == yaml.ScalarNode {
+		if node.Tag != "!!str" {
+			return fmt.Errorf("connection URL must be a string")
+		}
+		var urlStr string
+		if err := node.Decode(&urlStr); err != nil {
+			return fmt.Errorf("connection must be a URL string or mapping: %w", err)
+		}
 		db.URL = &urlStr
 		return nil
 	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("connection must be a URL string or mapping")
+	}
+	knownFields := map[string]struct{}{
+		"url": {}, "host": {}, "port": {}, "username": {},
+		"password": {}, "database": {}, "ssl": {}, "identity": {},
+	}
+	for index := 0; index < len(node.Content); index += 2 {
+		key := node.Content[index]
+		value := node.Content[index+1]
+		if _, ok := knownFields[key.Value]; !ok {
+			return fmt.Errorf("unknown connection field %q", key.Value)
+		}
+		if key.Value == "identity" && value.Tag == "!!null" {
+			return fmt.Errorf("identity must be a mapping with database and system-identifier")
+		}
+	}
 
-	// Otherwise, unmarshal as structured connection details
+	// Otherwise, unmarshal URL/identity or structured connection details.
 	type dbConnAlias DBConnection
 	var details dbConnAlias
 	if err := node.Decode(&details); err != nil {
@@ -187,13 +291,18 @@ func (db *DBConnection) UnmarshalYAML(node *yaml.Node) error {
 
 // MarshalYAML implements custom marshaling for DBConnection
 func (db DBConnection) MarshalYAML() (interface{}, error) {
-	if db.URL != nil {
+	if db.URL != nil && db.Identity == nil && !db.hasStructuredConnectionFields() {
 		return *db.URL, nil
 	}
 
 	// Marshal as structured object
 	type dbConnAlias DBConnection
 	return dbConnAlias(db), nil
+}
+
+func (db DBConnection) hasStructuredConnectionFields() bool {
+	return db.Host != nil || db.Port != nil || db.Username != nil ||
+		db.Password != nil || db.Database != nil || db.SSL != nil
 }
 
 // SSLConfig represents SSL/TLS connection configuration
@@ -394,9 +503,17 @@ func (db *DBConnection) Validate() error {
 	if db == nil {
 		return fmt.Errorf("connection is nil")
 	}
+	if db.Identity != nil {
+		if err := db.Identity.Validate(); err != nil {
+			return fmt.Errorf("invalid target identity: %w", err)
+		}
+	}
 	if db.URL != nil {
 		if strings.TrimSpace(*db.URL) == "" {
 			return fmt.Errorf("connection URL must not be empty")
+		}
+		if db.hasStructuredConnectionFields() {
+			return fmt.Errorf("connection URL cannot be combined with host, port, username, password, database, or ssl fields")
 		}
 		return nil
 	}
@@ -533,6 +650,19 @@ func (db *DBConnection) ExpandEnvVars() error {
 			return err
 		}
 		db.Database = &expanded
+	}
+
+	if db.Identity != nil {
+		database, err := expandEnvVar(db.Identity.Database)
+		if err != nil {
+			return fmt.Errorf("failed to expand identity.database: %w", err)
+		}
+		systemIdentifier, err := expandEnvVar(db.Identity.SystemIdentifier)
+		if err != nil {
+			return fmt.Errorf("failed to expand identity.system-identifier: %w", err)
+		}
+		db.Identity.Database = database
+		db.Identity.SystemIdentifier = systemIdentifier
 	}
 
 	return nil
