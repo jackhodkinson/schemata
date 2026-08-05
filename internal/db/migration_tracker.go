@@ -4,11 +4,17 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
 	schemaName = "schemata"
 	tableName  = "version"
+
+	ensureSchemaLockName    = "schemata:ensure-schema"
+	ensureSchemaLockTimeout = 30 * time.Second
 )
 
 // MigrationTracker manages migration version tracking in the database
@@ -24,17 +30,21 @@ func NewMigrationTracker(pool *Pool) *MigrationTracker {
 // EnsureSchema creates the schemata schema and version table if they don't exist.
 // This is safe to call concurrently from multiple processes.
 func (mt *MigrationTracker) EnsureSchema(ctx context.Context) error {
-	// Use an advisory lock to prevent concurrent CREATE SCHEMA races.
-	// PostgreSQL's CREATE SCHEMA IF NOT EXISTS can fail with a unique
-	// constraint violation when two sessions race.
-	_, err := mt.pool.Exec(ctx, "SELECT pg_advisory_lock(hashtext('schemata_ensure_schema'))")
-	if err != nil {
-		return fmt.Errorf("failed to acquire schema lock: %w", err)
-	}
-	defer mt.pool.Exec(ctx, "SELECT pg_advisory_unlock(hashtext('schemata_ensure_schema'))") //nolint:errcheck
+	return WithSessionAdvisoryLock(
+		ctx,
+		mt.pool,
+		ensureSchemaLockName,
+		ensureSchemaLockTimeout,
+		func(conn *pgxpool.Conn) error {
+			return mt.ensureSchema(ctx, conn)
+		},
+	)
+}
 
-	// Create schema
-	_, err = mt.pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaName))
+func (mt *MigrationTracker) ensureSchema(ctx context.Context, executor Executor) error {
+	// PostgreSQL's CREATE SCHEMA IF NOT EXISTS can still race internally, so
+	// EnsureSchema serializes this block with a session advisory lock.
+	_, err := executor.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaName))
 	if err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
 	}
@@ -46,7 +56,7 @@ func (mt *MigrationTracker) EnsureSchema(ctx context.Context) error {
 		)
 	`, schemaName, tableName)
 
-	_, err = mt.pool.Exec(ctx, createTableSQL)
+	_, err = executor.Exec(ctx, createTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create version table: %w", err)
 	}
@@ -56,9 +66,16 @@ func (mt *MigrationTracker) EnsureSchema(ctx context.Context) error {
 
 // GetAppliedVersions returns all applied migration versions
 func (mt *MigrationTracker) GetAppliedVersions(ctx context.Context) ([]string, error) {
+	return mt.GetAppliedVersionsWithExecutor(ctx, mt.pool)
+}
+
+// GetAppliedVersionsWithExecutor returns applied versions using a specific
+// connection or transaction. This is used while a session advisory lock is
+// held so history reads cannot escape to another pooled connection.
+func (mt *MigrationTracker) GetAppliedVersionsWithExecutor(ctx context.Context, executor Executor) ([]string, error) {
 	query := fmt.Sprintf("SELECT version_num FROM %s.%s ORDER BY version_num", schemaName, tableName)
 
-	rows, err := mt.pool.Query(ctx, query)
+	rows, err := executor.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query applied versions: %w", err)
 	}
@@ -95,7 +112,17 @@ func (mt *MigrationTracker) MarkApplied(ctx context.Context, executor Executor, 
 
 // GetPendingVersions returns versions that haven't been applied yet
 func (mt *MigrationTracker) GetPendingVersions(ctx context.Context, availableVersions []string) ([]string, error) {
-	appliedVersions, err := mt.GetAppliedVersions(ctx)
+	return mt.GetPendingVersionsWithExecutor(ctx, mt.pool, availableVersions)
+}
+
+// GetPendingVersionsWithExecutor computes pending versions using a specific
+// connection or transaction.
+func (mt *MigrationTracker) GetPendingVersionsWithExecutor(
+	ctx context.Context,
+	executor Executor,
+	availableVersions []string,
+) ([]string, error) {
+	appliedVersions, err := mt.GetAppliedVersionsWithExecutor(ctx, executor)
 	if err != nil {
 		return nil, err
 	}
@@ -119,4 +146,3 @@ func (mt *MigrationTracker) GetPendingVersions(ctx context.Context, availableVer
 
 	return pending, nil
 }
-

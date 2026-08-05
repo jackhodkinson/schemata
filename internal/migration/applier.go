@@ -5,8 +5,20 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackhodkinson/schemata/internal/db"
 )
+
+const (
+	migrationLockName    = "schemata:migrations"
+	migrationLockTimeout = 30 * time.Second
+)
+
+type migrationExecutor interface {
+	db.Executor
+	Begin(context.Context) (pgx.Tx, error)
+}
 
 // Applier applies migrations to a database
 type Applier struct {
@@ -68,20 +80,43 @@ func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyO
 		return fmt.Errorf("invalid migration inventory: %w", err)
 	}
 
-	// Ensure migration tracking schema exists
-	if !opts.DryRun {
-		if err := a.tracker.EnsureSchema(ctx); err != nil {
-			return fmt.Errorf("failed to ensure migration tracking schema: %w", err)
-		}
+	if opts.DryRun {
+		return a.applyPending(ctx, migrations, opts, a.pool)
 	}
 
+	// Ensure migration tracking schema exists before acquiring the migration
+	// runner lock. EnsureSchema has its own connection-owned lock for the
+	// concurrent first-run case.
+	if err := a.tracker.EnsureSchema(ctx); err != nil {
+		return fmt.Errorf("failed to ensure migration tracking schema: %w", err)
+	}
+
+	// One dedicated PostgreSQL session owns this lock for the complete run,
+	// including history reads and all per-migration transactions.
+	return db.WithSessionAdvisoryLock(
+		ctx,
+		a.pool,
+		migrationLockName,
+		migrationLockTimeout,
+		func(conn *pgxpool.Conn) error {
+			return a.applyPending(ctx, migrations, opts, conn)
+		},
+	)
+}
+
+func (a *Applier) applyPending(
+	ctx context.Context,
+	migrations []Migration,
+	opts ApplyOptions,
+	executor migrationExecutor,
+) error {
 	// Get pending migrations
 	versions := make([]string, len(migrations))
 	for i, m := range migrations {
 		versions[i] = m.Version
 	}
 
-	pending, err := a.tracker.GetPendingVersions(ctx, versions)
+	pending, err := a.tracker.GetPendingVersionsWithExecutor(ctx, executor, versions)
 	if err != nil {
 		return fmt.Errorf("failed to get pending migrations: %w", err)
 	}
@@ -141,7 +176,7 @@ func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyO
 
 	// Apply migrations in resolved order
 	for i := range sorted {
-		applied, err := a.applyMigration(ctx, sorted[i], opts)
+		applied, err := a.applyMigration(ctx, executor, sorted[i], opts)
 		if err != nil {
 			if opts.ContinueOnError {
 				fmt.Printf("Error applying migration %s: %v\n", sorted[i].Version, err)
@@ -159,26 +194,23 @@ func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyO
 }
 
 // applyMigration applies a single migration in a transaction
-func (a *Applier) applyMigration(ctx context.Context, migration Migration, opts ApplyOptions) (bool, error) {
+func (a *Applier) applyMigration(
+	ctx context.Context,
+	executor migrationExecutor,
+	migration Migration,
+	opts ApplyOptions,
+) (bool, error) {
 	if opts.DryRun {
 		fmt.Printf("[DRY RUN] Would apply migration %s:\n%s\n", migration.Version, migration.SQL)
 		return false, nil
 	}
 
 	// Start transaction
-	tx, err := a.pool.Begin(ctx)
+	tx, err := executor.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
-
-	// Prevent concurrent migration runners from racing.
-	// This is session/transaction-level and works across different processes.
-	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if _, err := tx.Exec(lockCtx, "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", "schemata", "migrations"); err != nil {
-		return false, fmt.Errorf("failed to acquire migration advisory lock: %w", err)
-	}
 
 	// Re-check within the locked transaction to avoid double-applying in races.
 	var alreadyApplied bool

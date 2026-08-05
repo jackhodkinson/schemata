@@ -6,7 +6,9 @@ package integration
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackhodkinson/schemata/internal/config"
 	"github.com/jackhodkinson/schemata/internal/db"
 	"github.com/jackhodkinson/schemata/internal/migration"
@@ -101,6 +103,79 @@ func TestMigrationTracking(t *testing.T) {
 
 	// Clean up
 	_, _ = pool.Exec(ctx, "DROP SCHEMA schemata CASCADE")
+}
+
+func TestSessionAdvisoryLockUsesDedicatedConnection(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	const lockName = "schemata:test:dedicated-connection"
+	lockKey := db.AdvisoryLockKey(lockName)
+
+	err = db.WithSessionAdvisoryLock(ctx, pool, lockName, time.Second, func(lockedConn *pgxpool.Conn) error {
+		var lockedPID int
+		require.NoError(t, lockedConn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&lockedPID))
+
+		otherConn, acquireErr := pool.Acquire(ctx)
+		require.NoError(t, acquireErr)
+		defer otherConn.Release()
+
+		var otherPID int
+		require.NoError(t, otherConn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&otherPID))
+		require.NotEqual(t, lockedPID, otherPID)
+
+		var acquired bool
+		require.NoError(t, otherConn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired))
+		assert.False(t, acquired, "a second session must not acquire the held lock")
+		return nil
+	})
+	require.NoError(t, err)
+
+	conn, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+
+	var acquired bool
+	require.NoError(t, conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired))
+	require.True(t, acquired, "lock must be released after the callback")
+	_, err = conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
+	require.NoError(t, err)
+}
+
+func TestSessionAdvisoryLockHonorsWaitTimeout(t *testing.T) {
+	ctx := context.Background()
+	devConn := &config.DBConnection{URL: strPtr(devDBURL)}
+	pool, err := db.Connect(ctx, devConn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	const lockName = "schemata:test:wait-timeout"
+	lockKey := db.AdvisoryLockKey(lockName)
+
+	holder, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer holder.Release()
+	_, err = holder.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey)
+	require.NoError(t, err)
+
+	callbackCalled := false
+	err = db.WithSessionAdvisoryLock(ctx, pool, lockName, 50*time.Millisecond, func(_ *pgxpool.Conn) error {
+		callbackCalled = true
+		return nil
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.False(t, callbackCalled)
+
+	_, err = holder.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
+	require.NoError(t, err)
+
+	var result int
+	require.NoError(t, pool.QueryRow(ctx, "SELECT 1").Scan(&result))
+	assert.Equal(t, 1, result, "pool must remain usable after lock wait cancellation")
 }
 
 func TestCatalogExtraction(t *testing.T) {
