@@ -15,7 +15,7 @@ jobs:
     env:
       CGO_CFLAGS: -DHAVE_STRCHRNUL=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -55,7 +55,7 @@ jobs:
       CGO_CFLAGS: -DHAVE_STRCHRNUL=1
       CGO_ENABLED: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -101,7 +101,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
