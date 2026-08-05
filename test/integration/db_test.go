@@ -115,33 +115,31 @@ func TestSessionAdvisoryLockUsesDedicatedConnection(t *testing.T) {
 	const lockName = "schemata:test:dedicated-connection"
 	lockKey := db.AdvisoryLockKey(lockName)
 
+	// Keep one observer session checked out for the complete lifecycle. This
+	// avoids a false pass from reacquiring the lock-owning session: PostgreSQL
+	// advisory locks are re-entrant within the same session.
+	observer, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer observer.Release()
+	var observerPID int
+	require.NoError(t, observer.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&observerPID))
+
 	err = db.WithSessionAdvisoryLock(ctx, pool, lockName, time.Second, func(lockedConn *pgxpool.Conn) error {
 		var lockedPID int
 		require.NoError(t, lockedConn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&lockedPID))
-
-		otherConn, acquireErr := pool.Acquire(ctx)
-		require.NoError(t, acquireErr)
-		defer otherConn.Release()
-
-		var otherPID int
-		require.NoError(t, otherConn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&otherPID))
-		require.NotEqual(t, lockedPID, otherPID)
+		require.NotEqual(t, lockedPID, observerPID)
 
 		var acquired bool
-		require.NoError(t, otherConn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired))
+		require.NoError(t, observer.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired))
 		assert.False(t, acquired, "a second session must not acquire the held lock")
 		return nil
 	})
 	require.NoError(t, err)
 
-	conn, err := pool.Acquire(ctx)
-	require.NoError(t, err)
-	defer conn.Release()
-
 	var acquired bool
-	require.NoError(t, conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired))
+	require.NoError(t, observer.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&acquired))
 	require.True(t, acquired, "lock must be released after the callback")
-	_, err = conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
+	_, err = observer.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
 	require.NoError(t, err)
 }
 

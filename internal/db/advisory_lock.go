@@ -12,6 +12,7 @@ import (
 )
 
 const advisoryUnlockTimeout = 5 * time.Second
+const advisoryConnectionCloseTimeout = 5 * time.Second
 
 // AdvisoryLockKey returns the stable PostgreSQL advisory-lock key for name.
 // Keeping the hash in the client avoids relying on PostgreSQL's hash functions
@@ -23,8 +24,9 @@ func AdvisoryLockKey(name string) int64 {
 
 // WithSessionAdvisoryLock acquires a dedicated pooled connection, holds a
 // session-level advisory lock on that exact connection for fn's entire
-// lifetime, and releases both afterward. A failed unlock destroys the
-// connection so a session lock can never leak back into the pool.
+// lifetime, and releases both afterward. The dedicated session is always
+// destroyed rather than returned to the pool: callers may execute arbitrary
+// SQL that changes session state or acquires additional advisory locks.
 func WithSessionAdvisoryLock(
 	ctx context.Context,
 	pool *Pool,
@@ -46,7 +48,13 @@ func WithSessionAdvisoryLock(
 	_, err = conn.Exec(lockCtx, "SELECT pg_advisory_lock($1)", AdvisoryLockKey(name))
 	cancel()
 	if err != nil {
-		return fmt.Errorf("failed to acquire advisory lock %q: %w", name, err)
+		// Cancellation can race with lock acquisition. Destroying the session
+		// guarantees an ambiguously acquired lock cannot leak into the pool.
+		closeErr := closeDedicatedConnection(conn)
+		return errors.Join(
+			fmt.Errorf("failed to acquire advisory lock %q: %w", name, err),
+			closeErr,
+		)
 	}
 
 	defer func() {
@@ -62,19 +70,23 @@ func WithSessionAdvisoryLock(
 		if unlockErr == nil && !unlocked {
 			unlockErr = fmt.Errorf("lock was not held by its dedicated connection")
 		}
-		if unlockErr == nil {
-			return
+		if unlockErr != nil {
+			err = errors.Join(
+				err,
+				fmt.Errorf("failed to release advisory lock %q: %w", name, unlockErr),
+			)
 		}
 
-		// Never return a connection with an unknown session-lock state to the
-		// pool. Release will destroy the now-closed connection.
-		closeErr := conn.Conn().Close(context.Background())
-		err = errors.Join(
-			err,
-			fmt.Errorf("failed to release advisory lock %q: %w", name, unlockErr),
-			closeErr,
-		)
+		if closeErr := closeDedicatedConnection(conn); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to close advisory lock session %q: %w", name, closeErr))
+		}
 	}()
 
 	return fn(conn)
+}
+
+func closeDedicatedConnection(conn *pgxpool.Conn) error {
+	closeCtx, cancel := context.WithTimeout(context.Background(), advisoryConnectionCloseTimeout)
+	defer cancel()
+	return conn.Conn().Close(closeCtx)
 }
