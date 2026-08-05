@@ -1,99 +1,66 @@
-# Integration Tests
+# Integration tests
 
-This directory contains integration tests that verify the end-to-end behavior of schemata.
+The integration suite exercises parsing, catalog extraction, diffing, DDL,
+migration execution, and CLI workflows against real PostgreSQL servers.
 
-## End-to-End Test
+## Run locally
 
-The `end_to_end_binary_test.sh` script replicates the actual usage of `schemata migrate` to verify that schema diffing works correctly without false positives.
+Docker and Go are required. PostgreSQL 16 is the default:
 
-### What it tests
+```sh
+make test-integration
+```
 
-1. **Sync Operation**: Drops and recreates the database schema using migrations
-2. **Diff Operation**: Compares the parsed schema.sql with the actual database schema
-3. **False Positive Detection**: Identifies any differences that shouldn't exist
+Set `POSTGRES_VERSION` to exercise another supported major release:
 
-### Running the test
+```sh
+POSTGRES_VERSION=15 make test-integration
+POSTGRES_VERSION=17 make test-integration
+POSTGRES_VERSION=18 make test-integration
+```
 
-```bash
-# Ensure Docker databases are running
-make docker-up
+The compose project starts three isolated databases:
 
-# Run the end-to-end test
+- development: `localhost:25433/schemata_dev`
+- target: `localhost:25434/schemata_target`
+- staging: `localhost:25435/schemata_staging`
+
+Each PostgreSQL major uses separate named volumes. This prevents a local
+cross-version run from trying to open another major release's data directory.
+The compose configuration also uses the versioned `PGDATA` layout required by
+the PostgreSQL 18 official image.
+
+To keep the databases running while iterating:
+
+```sh
+POSTGRES_VERSION=16 make docker-up
+go test -tags=integration -v ./test/integration/...
+go test -tags=integration -v ./internal/cli/...
+POSTGRES_VERSION=16 make docker-down
+```
+
+Run the two package groups sequentially because they intentionally share the
+same databases and some CLI cases install or remove extensions.
+
+The binary-level workflow can be run while the databases are up:
+
+```sh
+make build
 make test-e2e
-
-# Or run directly
-./test/integration/end_to_end_binary_test.sh
 ```
 
-### Expected Behavior
+To verify that integration tests compile without starting PostgreSQL:
 
-The test currently **fails** with the following known issue:
-
-```
-❌ TEST FAILED: False positives detected
-
-Objects to CREATE (1):
-  + function: public.update_updated_at_column
-
-Objects to DROP (1):
-  - function: public.update_updated_at_column
-
-⚠️  Known Issue: Function body normalization
-    The same function appears in both CREATE and DROP due to
-    formatting differences between parser and pg_get_functiondef()
+```sh
+make test-integration-compile
 ```
 
-### Fixed Issues
+## CI contract
 
-The following bugs have been successfully fixed:
+CI runs the same tagged integration suite independently against PostgreSQL 15,
+16, 17, and 18. A supported release may not be removed from that matrix without
+an explicit support-policy change.
 
-#### ✅ Index Key Expression Extraction
-- **Bug**: Catalog extracted full `CREATE INDEX` statement instead of column names
-- **Fix**: Query `pg_get_indexdef($1, k, true)` for individual column expressions
-- **File**: `internal/db/catalog.go:674`
-- **Result**: Index false positives eliminated (was 4-5 alters, now 0)
-
-#### ✅ Trigger ForEachRow Parsing
-- **Bug**: Catalog wasn't extracting the `ForEachRow` flag from `tgtype` bitfield
-- **Fix**: Added `trig.ForEachRow = (timingEvents & 1) != 0`
-- **File**: `internal/db/catalog.go:917`
-- **Result**: Trigger "for each row changed" false positive eliminated
-
-### Remaining Issues
-
-#### ⚠️ Function Body Normalization
-- **Status**: Still failing
-- **Issue**: Same function appears in both CREATE and DROP
-- **Root Cause**: `pg_get_functiondef()` returns functions with different formatting than the parser
-  - Parser extracts: `BEGIN\n    NEW.updated_at = CURRENT_TIMESTAMP;\n    RETURN NEW;\nEND;`
-  - Catalog extracts: `\nBEGIN\n    NEW.updated_at = CURRENT_TIMESTAMP;\n    RETURN NEW;\nEND;\n`
-- **Normalization Exists**: `internal/differ/hash.go` has `normalizeFunction()` that trims whitespace
-- **Why Still Failing**: Need to investigate if normalization is being applied correctly
-
-### Test Structure
-
-The test uses the actual schema from `../../testdata/schema.sql` which is copied from `../test-schemata/schema.sql`. This ensures we're testing against real-world schemas, not mock data.
-
-The test flow:
-1. Connect to test database
-2. Run `schemata sync` to apply migrations
-3. Run `schemata diff --from migrations` to compare
-4. Parse output to identify false positives
-5. Report results with specific issue classification
-
-## Go Integration Test (Currently Broken)
-
-The `end_to_end_test.go` file contains a proper Go integration test, but it currently fails to build due to a pg_query_go compilation issue on macOS 15+:
-
-```
-error: static declaration of 'strchrnul' follows non-static declaration
-```
-
-This is a known third-party library issue. Once resolved, the Go test can be used instead of the bash script for better error reporting and CI integration.
-
-## Future Work
-
-1. **Fix Function Body Normalization**: Investigate why `normalizeFunction()` isn't catching the whitespace differences
-2. **Fix pg_query Build Issue**: Update pg_query_go or add macOS-specific build flags
-3. **Add More Test Cases**: Test with more complex schemas (views, materialized views, policies, etc.)
-4. **CI Integration**: Add these tests to GitHub Actions once stable
+Integration failures must not be documented as expected false positives. Fix
+the behavior or add a precise fail-closed rejection, then keep the case as a
+deterministic regression test.

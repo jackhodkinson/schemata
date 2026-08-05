@@ -72,6 +72,19 @@ jobs:
       - name: Scan reachable code for known vulnerabilities
         run: make vulncheck
 
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    env:
+      CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run bounded fuzz smoke suite
+        run: make fuzz-smoke
+
   integration-compile-macos:
     runs-on: macos-latest
     env:
@@ -86,21 +99,29 @@ jobs:
         run: mkdir -p bin && go test -tags=integration -c -o bin/integration.test ./test/integration
 
   integration-tests:
+    name: integration-tests (Postgres ${{ matrix.postgres }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [15, 16, 17, 18]
     env:
       CGO_CFLAGS: -DHAVE_STRCHRNUL=1
+      POSTGRES_VERSION: ${{ matrix.postgres }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Start Docker Compose
-        run: docker compose up -d
-      - name: Wait for databases
-        run: sleep 5
+      - name: Start PostgreSQL ${{ matrix.postgres }} databases
+        run: docker compose up -d --wait --wait-timeout 60
       - name: Run integration tests
-        run: go test -tags=integration -v ./test/integration/...
+        # These packages intentionally share the same databases. Keep them
+        # sequential: some CLI integration cases install/drop extensions.
+        run: |
+          go test -tags=integration -v ./test/integration/...
+          go test -tags=integration -v ./internal/cli/...
       - name: Stop Docker Compose
         if: always()
         run: docker compose down

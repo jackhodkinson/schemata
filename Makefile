@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-pgquery-smoke test-integration test-integration-compile architecture deadcode vulncheck clean docker-up docker-down
+.PHONY: build test test-unit test-pgquery-smoke fuzz-smoke test-integration test-integration-compile architecture deadcode vulncheck clean docker-up docker-down
 
 BIN_DIR := bin
 
@@ -39,12 +39,16 @@ test-unit:
 test-pgquery-smoke:
 	go test -v ./test -run '^TestPgQuery(Basic|Select|MultipleStatements|DDLStatements|ComplexSchema|Normalization|ErrorHandling|PatchContract)$$'
 
+# Run bounded component fuzzing suitable for pull requests and local checks.
+fuzz-smoke:
+	go test ./internal/normalize -run '^$$' -fuzz '^FuzzExprIdempotent$$' -fuzztime=10s -parallel=4
+	go test ./internal/normalize -run '^$$' -fuzz '^FuzzFunctionBodyIdempotent$$' -fuzztime=10s -parallel=4
+	go test ./internal/parser -run '^$$' -fuzz '^FuzzParseSQLDeterministicAndPanicFree$$' -fuzztime=10s -parallel=4
+
 # Run integration tests (requires Docker)
 test-integration:
 	@echo "Starting Docker databases..."
-	@docker compose up -d
-	@echo "Waiting for databases to be ready..."
-	@sleep 5
+	@docker compose up -d --wait --wait-timeout 60
 	go test -tags=integration -v ./test/integration/...
 	go test -tags=integration -v ./internal/cli/...
 	@echo "Stopping Docker databases..."
@@ -62,9 +66,7 @@ test-e2e:
 
 # Start Docker test databases
 docker-up:
-	docker compose up -d
-	@echo "Waiting for databases to be ready..."
-	@sleep 5
+	docker compose up -d --wait --wait-timeout 60
 
 # Stop Docker test databases
 docker-down:
