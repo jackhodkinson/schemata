@@ -9,51 +9,41 @@ type identityDefaults struct {
 	increment int64
 	min       int64
 	max       int64
-	typeMin   int64
-	typeMax   int64
 	cache     int64
 	cycle     bool
 }
 
-func identityDefaultsForType(columnType TypeName) (identityDefaults, bool) {
+// identityDefaultsForTypeAndIncrement returns PostgreSQL's effective sequence
+// defaults. START, MINVALUE, and MAXVALUE depend on the increment direction:
+// descending sequences start at -1 and use the data type minimum through -1.
+func identityDefaultsForTypeAndIncrement(columnType TypeName, increment int64) (identityDefaults, bool) {
 	base := normalizeIntegerType(string(columnType))
+	var typeMin, typeMax int64
 	switch base {
 	case "int2":
-		return identityDefaults{
-			start:     1,
-			increment: 1,
-			min:       1,
-			max:       32767,
-			typeMin:   -32768,
-			typeMax:   32767,
-			cache:     1,
-			cycle:     false,
-		}, true
+		typeMin, typeMax = -32768, 32767
 	case "int4":
-		return identityDefaults{
-			start:     1,
-			increment: 1,
-			min:       1,
-			max:       2147483647,
-			typeMin:   -2147483648,
-			typeMax:   2147483647,
-			cache:     1,
-			cycle:     false,
-		}, true
+		typeMin, typeMax = -2147483648, 2147483647
 	case "int8":
-		return identityDefaults{
-			start:     1,
-			increment: 1,
-			min:       1,
-			max:       9223372036854775807,
-			typeMin:   -9223372036854775808,
-			typeMax:   9223372036854775807,
-			cache:     1,
-			cycle:     false,
-		}, true
+		typeMin, typeMax = -9223372036854775808, 9223372036854775807
 	default:
 		return identityDefaults{}, false
 	}
+
+	defaults := identityDefaults{
+		start:     1,
+		increment: 1,
+		min:       1,
+		max:       typeMax,
+		cache:     1,
+		cycle:     false,
+	}
+	if increment < 0 {
+		defaults.start = -1
+		defaults.min = typeMin
+		defaults.max = -1
+	}
+	return defaults, true
 }
 
 func normalizeIntegerType(typeName string) string {
@@ -76,7 +66,14 @@ func normalizeIntegerType(typeName string) string {
 // NormalizeIdentityOptions canonicalizes identity sequence options provided in DDL by
 // removing entries that match the data type defaults and collapsing equivalent forms.
 func NormalizeIdentityOptions(columnType TypeName, options []SequenceOption) []SequenceOption {
-	defaults, ok := identityDefaultsForType(columnType)
+	effectiveIncrement := int64(1)
+	for _, opt := range options {
+		if strings.EqualFold(opt.Type, "INCREMENT BY") && opt.HasValue {
+			effectiveIncrement = opt.Value
+		}
+	}
+
+	defaults, ok := identityDefaultsForTypeAndIncrement(columnType, effectiveIncrement)
 	if !ok {
 		// Unknown type: return options as-is
 		return options
@@ -86,9 +83,7 @@ func NormalizeIdentityOptions(columnType TypeName, options []SequenceOption) []S
 	startSet := false
 	incrementSet := false
 	minSet := false
-	minNo := false
 	maxSet := false
-	maxNo := false
 	cacheSet := false
 	cycleSet := false
 
@@ -108,22 +103,18 @@ func NormalizeIdentityOptions(columnType TypeName, options []SequenceOption) []S
 			if opt.HasValue {
 				state.min = opt.Value
 				minSet = true
-				minNo = false
 			}
 		case "NO MINVALUE":
-			state.min = defaults.typeMin
+			state.min = defaults.min
 			minSet = true
-			minNo = true
 		case "MAXVALUE":
 			if opt.HasValue {
 				state.max = opt.Value
 				maxSet = true
-				maxNo = false
 			}
 		case "NO MAXVALUE":
-			state.max = defaults.typeMax
+			state.max = defaults.max
 			maxSet = true
-			maxNo = true
 		case "CACHE":
 			if opt.HasValue {
 				state.cache = opt.Value
@@ -146,24 +137,12 @@ func NormalizeIdentityOptions(columnType TypeName, options []SequenceOption) []S
 		normalized = append(normalized, SequenceOption{Type: "INCREMENT BY", Value: state.increment, HasValue: true})
 	}
 
-	if minSet {
-		switch {
-		case minNo:
-			normalized = append(normalized, SequenceOption{Type: "NO MINVALUE"})
-		case state.min != defaults.min:
-			normalized = append(normalized, SequenceOption{Type: "MINVALUE", Value: state.min, HasValue: true})
-		}
+	if minSet && state.min != defaults.min {
+		normalized = append(normalized, SequenceOption{Type: "MINVALUE", Value: state.min, HasValue: true})
 	}
 
-	if maxSet {
-		switch {
-		case maxNo && state.max != defaults.max:
-			// If the user explicitly set NO MAXVALUE but the default matches, omit it.
-			// Only emit when it differs from defaults.
-			normalized = append(normalized, SequenceOption{Type: "NO MAXVALUE"})
-		case !maxNo && state.max != defaults.max:
-			normalized = append(normalized, SequenceOption{Type: "MAXVALUE", Value: state.max, HasValue: true})
-		}
+	if maxSet && state.max != defaults.max {
+		normalized = append(normalized, SequenceOption{Type: "MAXVALUE", Value: state.max, HasValue: true})
 	}
 
 	if cacheSet && state.cache != defaults.cache {
@@ -183,7 +162,11 @@ func NormalizeIdentityOptions(columnType TypeName, options []SequenceOption) []S
 // IdentityOptionsFromParameters converts catalog sequence parameters into a canonical
 // option list that omits default values for the column's data type.
 func IdentityOptionsFromParameters(columnType TypeName, start, increment, min, max, cache *int64, cycle *bool) []SequenceOption {
-	defaults, ok := identityDefaultsForType(columnType)
+	effectiveIncrement := int64(1)
+	if increment != nil {
+		effectiveIncrement = *increment
+	}
+	defaults, ok := identityDefaultsForTypeAndIncrement(columnType, effectiveIncrement)
 	if !ok {
 		return nil
 	}
@@ -197,13 +180,8 @@ func IdentityOptionsFromParameters(columnType TypeName, start, increment, min, m
 		options = append(options, SequenceOption{Type: "INCREMENT BY", Value: *increment, HasValue: true})
 	}
 
-	if min != nil {
-		switch {
-		case *min == defaults.typeMin && defaults.min != defaults.typeMin:
-			options = append(options, SequenceOption{Type: "NO MINVALUE"})
-		case *min != defaults.min:
-			options = append(options, SequenceOption{Type: "MINVALUE", Value: *min, HasValue: true})
-		}
+	if min != nil && *min != defaults.min {
+		options = append(options, SequenceOption{Type: "MINVALUE", Value: *min, HasValue: true})
 	}
 
 	if max != nil && *max != defaults.max {

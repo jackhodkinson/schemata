@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v5"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
@@ -81,6 +82,7 @@ func FunctionBody(body string) string {
 		stateSingleQuote
 		stateDoubleQuote
 		stateDollarQuote
+		stateLineComment
 	)
 
 	state := stateNormal
@@ -122,6 +124,12 @@ func FunctionBody(body string) string {
 				i += len(tag) - 1
 				continue
 			}
+			if ch == '-' && i+1 < len(body) && body[i+1] == '-' {
+				state = stateLineComment
+				out.WriteString("--")
+				i++
+				continue
+			}
 
 			out.WriteByte(toLowerASCII(ch))
 
@@ -152,6 +160,20 @@ func FunctionBody(body string) string {
 				out.WriteString(dollarTag)
 				i += len(dollarTag) - 1
 				state = stateNormal
+				continue
+			}
+			out.WriteByte(ch)
+
+		case stateLineComment:
+			if ch == '\r' || ch == '\n' {
+				if ch == '\r' && i+1 < len(body) && body[i+1] == '\n' {
+					i++
+				}
+				// Unlike ordinary whitespace, this newline terminates the SQL
+				// comment and is therefore meaning-bearing.
+				out.WriteByte('\n')
+				state = stateNormal
+				pendingSpace = false
 				continue
 			}
 			out.WriteByte(ch)
@@ -230,6 +252,11 @@ func view(v schema.View) schema.View {
 		v.Grants = schema.CanonicalizeGrants(v.Grants)
 		return v
 	}
+	if err := validateASTForDeparse(parsed.ProtoReflect()); err != nil {
+		v.Grants = schema.CanonicalizeGrants(v.Grants)
+		return v
+	}
+	stripPublicRangeVarQualifications(parsed.ProtoReflect())
 	deparsed, err := pg_query.Deparse(parsed)
 	if err != nil {
 		v.Grants = schema.CanonicalizeGrants(v.Grants)
@@ -240,6 +267,39 @@ func view(v schema.View) schema.View {
 	v.Definition.Query = deparsed
 	v.Grants = schema.CanonicalizeGrants(v.Grants)
 	return v
+}
+
+// stripPublicRangeVarQualifications makes explicit public relation references
+// canonical with the parser's unqualified default. Qualifications for every
+// other schema are preserved. Walking protobuf reflection keeps this valid for
+// nested SELECTs, CTE bodies, and subqueries without a fragile SQL text rewrite.
+func stripPublicRangeVarQualifications(message protoreflect.Message) {
+	if message.Descriptor().FullName() == "pg_query.RangeVar" {
+		field := message.Descriptor().Fields().ByName("schemaname")
+		// PostgreSQL's parser has already folded unquoted identifiers to lower
+		// case. Exact comparison therefore includes public, PUBLIC, and
+		// "public", while preserving the distinct quoted schema "PUBLIC".
+		if field != nil && message.Get(field).String() == "public" {
+			message.Clear(field)
+		}
+	}
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		switch {
+		case field.IsList() && field.Kind() == protoreflect.MessageKind:
+			list := value.List()
+			for i := 0; i < list.Len(); i++ {
+				stripPublicRangeVarQualifications(list.Get(i).Message())
+			}
+		case field.IsMap() && field.MapValue().Kind() == protoreflect.MessageKind:
+			value.Map().Range(func(_ protoreflect.MapKey, item protoreflect.Value) bool {
+				stripPublicRangeVarQualifications(item.Message())
+				return true
+			})
+		case !field.IsList() && !field.IsMap() && field.Kind() == protoreflect.MessageKind:
+			stripPublicRangeVarQualifications(value.Message())
+		}
+		return true
+	})
 }
 
 func function(fn schema.Function) schema.Function {
@@ -272,11 +332,13 @@ func function(fn schema.Function) schema.Function {
 }
 
 func sequence(seq schema.Sequence) schema.Sequence {
+	seq.Type = string(schema.NormalizeTypeName(schema.TypeName(seq.Type)))
 	seq.Grants = schema.CanonicalizeGrants(seq.Grants)
 	return seq
 }
 
 func enum(enum schema.EnumDef) schema.EnumDef {
+	enum.Grants = schema.CanonicalizeGrants(enum.Grants)
 	return enum
 }
 
@@ -290,10 +352,15 @@ func domain(domain schema.DomainDef) schema.DomainDef {
 		normalized := Expr(*domain.Check)
 		domain.Check = &normalized
 	}
+	domain.Grants = schema.CanonicalizeGrants(domain.Grants)
 	return domain
 }
 
 func composite(comp schema.CompositeDef) schema.CompositeDef {
+	for i := range comp.Attributes {
+		comp.Attributes[i].Type = schema.NormalizeTypeName(comp.Attributes[i].Type)
+	}
+	comp.Grants = schema.CanonicalizeGrants(comp.Grants)
 	return comp
 }
 
@@ -451,10 +518,20 @@ func canonicalizeExpr(expr string) (string, error) {
 }
 
 func canonicalizeExprOnce(expr string) (string, error) {
+	return canonicalizeExprOnceWithTransforms(expr, stripPublicRegclassQualifications)
+}
+
+func canonicalizeExprOnceWithTransforms(expr string, transforms ...func(protoreflect.Message)) (string, error) {
 	query := fmt.Sprintf("SELECT %s", expr)
 	parsed, err := pg_query.Parse(query)
 	if err != nil {
 		return "", err
+	}
+	if err := validateASTForDeparse(parsed.ProtoReflect()); err != nil {
+		return "", err
+	}
+	for _, transform := range transforms {
+		transform(parsed.ProtoReflect())
 	}
 	deparsed, err := pg_query.Deparse(parsed)
 	if err != nil {
@@ -464,6 +541,136 @@ func canonicalizeExprOnce(expr string) (string, error) {
 	deparsed = strings.TrimPrefix(deparsed, "SELECT ")
 	deparsed = strings.TrimSuffix(deparsed, ";")
 	return strings.TrimSpace(deparsed), nil
+}
+
+// stripPublicRegclassQualifications makes explicit public references canonical
+// with the unqualified form emitted under catalog extraction's fixed
+// `pg_catalog, public` search path. It only rewrites a parsed regclass cast and
+// an exact public qualifier, never an arbitrary string or substring.
+func stripPublicRegclassQualifications(message protoreflect.Message) {
+	if cast, ok := message.Interface().(*pg_query.TypeCast); ok && isRegclassTypeName(cast.TypeName) {
+		if len(cast.TypeName.Names) == 2 {
+			cast.TypeName.Names = cast.TypeName.Names[1:]
+		}
+		if constant := cast.Arg.GetAConst(); constant != nil {
+			if value := constant.GetSval(); value != nil {
+				if unqualified, ok := stripPublicRegclassQualifier(value.Sval); ok {
+					value.Sval = unqualified
+				}
+			}
+		}
+	}
+	if call, ok := message.Interface().(*pg_query.FuncCall); ok && isPgCatalogNextval(call.Funcname) {
+		call.Funcname = call.Funcname[1:]
+	}
+
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		switch {
+		case field.IsList() && field.Kind() == protoreflect.MessageKind:
+			list := value.List()
+			for i := 0; i < list.Len(); i++ {
+				stripPublicRegclassQualifications(list.Get(i).Message())
+			}
+		case field.IsMap() && field.MapValue().Kind() == protoreflect.MessageKind:
+			value.Map().Range(func(_ protoreflect.MapKey, item protoreflect.Value) bool {
+				stripPublicRegclassQualifications(item.Message())
+				return true
+			})
+		case !field.IsList() && !field.IsMap() && field.Kind() == protoreflect.MessageKind:
+			stripPublicRegclassQualifications(value.Message())
+		}
+		return true
+	})
+}
+
+func isPgCatalogNextval(parts []*pg_query.Node) bool {
+	if len(parts) != 2 {
+		return false
+	}
+	prefix := parts[0].GetString_()
+	name := parts[1].GetString_()
+	return prefix != nil && name != nil &&
+		strings.EqualFold(prefix.Sval, "pg_catalog") &&
+		strings.EqualFold(name.Sval, "nextval")
+}
+
+func isRegclassTypeName(typeName *pg_query.TypeName) bool {
+	if typeName == nil || len(typeName.Names) == 0 || len(typeName.Names) > 2 {
+		return false
+	}
+	last := typeName.Names[len(typeName.Names)-1].GetString_()
+	if last == nil || !strings.EqualFold(last.Sval, "regclass") {
+		return false
+	}
+	if len(typeName.Names) == 2 {
+		prefix := typeName.Names[0].GetString_()
+		return prefix != nil && strings.EqualFold(prefix.Sval, "pg_catalog")
+	}
+	return true
+}
+
+func stripPublicRegclassQualifier(value string) (string, bool) {
+	if value == "" {
+		return "", false
+	}
+
+	var separator int
+	if value[0] == '"' {
+		separator = quotedIdentifierEnd(value)
+		if separator < 0 || value[1:separator-1] != "public" {
+			return "", false
+		}
+	} else {
+		separator = strings.IndexByte(value, '.')
+		if separator <= 0 || !strings.EqualFold(value[:separator], "public") {
+			return "", false
+		}
+		for _, char := range value[:separator] {
+			if char == '"' || char == ' ' || char == '\t' || char == '\r' || char == '\n' {
+				return "", false
+			}
+		}
+	}
+
+	if separator >= len(value) || value[separator] != '.' {
+		return "", false
+	}
+	unqualified := value[separator+1:]
+	if !isSingleRegclassIdentifier(unqualified) {
+		return "", false
+	}
+	return unqualified, true
+}
+
+// quotedIdentifierEnd returns the index immediately after a complete quoted
+// identifier at the start of value, accounting for doubled quote escapes.
+func quotedIdentifierEnd(value string) int {
+	for i := 1; i < len(value); i++ {
+		if value[i] != '"' {
+			continue
+		}
+		if i+1 < len(value) && value[i+1] == '"' {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return -1
+}
+
+func isSingleRegclassIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	if value[0] == '"' {
+		return quotedIdentifierEnd(value) == len(value)
+	}
+	for _, char := range value {
+		if char == '.' || char == '"' || char == ' ' || char == '\t' || char == '\r' || char == '\n' {
+			return false
+		}
+	}
+	return true
 }
 
 func stripOuterParentheses(expr string) string {

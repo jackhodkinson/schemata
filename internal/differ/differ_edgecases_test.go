@@ -636,9 +636,23 @@ func TestExpressionsEquivalentOnlyStripsCatalogSideCasts(t *testing.T) {
 		`status = 'pending'::first_status`,
 		`status = 'pending'::second_status`,
 	))
-	actualGenerated := schema.Expr(`(((COALESCE(first_name, ''::character varying))::text || ' '::text) || (COALESCE(last_name, ''::character varying))::text)`)
+	actualGenerated := schema.Expr(`((COALESCE(first_name, ''::character varying) || ' '::text) || COALESCE(last_name, ''::character varying))`)
 	require.True(t, expressionsEquivalent(
 		`COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')`,
 		actualGenerated,
+	))
+	actualGeneratedWithResolvedConcatCasts := schema.Expr(`(((COALESCE(first_name, ''::character varying)::text || ' '::text) || COALESCE(last_name, ''::character varying)::text))`)
+	require.True(t, expressionsEquivalent(
+		`COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')`,
+		actualGeneratedWithResolvedConcatCasts,
+	))
+
+	// Cast-looking text inside a literal is data, and a cast on a column or
+	// other non-literal expression can change operator/function resolution.
+	require.False(t, expressionsEquivalent(`''`, `'::text'`))
+	require.False(t, expressionsEquivalent(`value = '1'`, `value::text = '1'`))
+	require.False(t, expressionsEquivalent(
+		`COALESCE(first_name, '')`,
+		`COALESCE(first_name, ''::character varying)::text`,
 	))
 }

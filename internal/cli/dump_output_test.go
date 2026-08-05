@@ -105,7 +105,7 @@ func TestWriteDumpSingleFileFailsClosedAndPreservesExistingOutput(t *testing.T) 
 
 	objs := []schema.DatabaseObject{
 		schema.Table{Schema: "public", Name: "ok"},
-		schema.CompositeDef{Schema: "public", Name: "unsupported"},
+		schema.Table{Schema: "public", Name: "unsupported", Inherits: []schema.QualifiedName{{Schema: "public", Name: "parent"}}},
 	}
 	_, err := writeDumpSingleFile(path, objs, planner.NewDDLGenerator())
 	require.Error(t, err)
@@ -120,7 +120,7 @@ func TestWriteDumpPerSchemaFailsBeforeCreatingOutput(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "dump")
 	objs := []schema.DatabaseObject{
 		schema.Table{Schema: "public", Name: "ok"},
-		schema.CompositeDef{Schema: "sales", Name: "unsupported"},
+		schema.Table{Schema: "sales", Name: "unsupported", Inherits: []schema.QualifiedName{{Schema: "sales", Name: "parent"}}},
 	}
 
 	_, err := writeDumpPerSchemaDir(dir, objs, planner.NewDDLGenerator())

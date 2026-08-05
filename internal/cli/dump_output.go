@@ -212,6 +212,18 @@ func writeDumpSingleFile(schemaPath string, objects []schema.DatabaseObject, ddl
 // writeDumpPerSchemaDir writes one <schema>.sql file per schema bucket under dirPath.
 // Creates dirPath if missing. Returns the number of files written.
 func writeDumpPerSchemaDir(dirPath string, objects []schema.DatabaseObject, ddlGen *planner.DDLGenerator) (filesWritten int, err error) {
+	for _, object := range objects {
+		sequence, ok := object.(schema.Sequence)
+		if !ok || sequence.OwnedBy == nil || sequence.Schema == sequence.OwnedBy.Schema {
+			continue
+		}
+		return 0, fmt.Errorf(
+			"sequence %s.%s is owned by a table in schema %s, but PostgreSQL requires an OWNED BY sequence and table to be in the same schema",
+			sequence.Schema,
+			sequence.Name,
+			sequence.OwnedBy.Schema,
+		)
+	}
 	groups := groupObjectsBySchema(objects)
 	names := sortedSchemaNames(groups)
 	seenOut := make(map[string]schema.SchemaName)
@@ -255,16 +267,11 @@ func writeDumpPerSchemaDir(dirPath string, objects []schema.DatabaseObject, ddlG
 }
 
 func renderDumpObjects(objects []schema.DatabaseObject, ddlGen *planner.DDLGenerator) (string, error) {
-	var ddl strings.Builder
-	for _, obj := range objects {
-		stmt, err := ddlGen.GenerateCreateStatement(obj)
-		if err != nil {
-			return "", fmt.Errorf("failed to render %v for dump: %w", objectmap.Key(obj), err)
-		}
-		ddl.WriteString(stmt)
-		ddl.WriteString("\n\n")
+	ddl, err := ddlGen.GenerateCreateObjects(objects)
+	if err != nil {
+		return "", fmt.Errorf("failed to render replayable dump: %w", err)
 	}
-	return ddl.String(), nil
+	return ddl, nil
 }
 
 func writeFileAtomically(path string, data []byte, mode os.FileMode) error {

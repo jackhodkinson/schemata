@@ -85,8 +85,12 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 
 	// Use actual schema for drop ordering if provided, otherwise fall back to desired.
 	dropMap := objectMap
+	strictDropMap := false
+	var actualMap schema.SchemaObjectMap
 	if len(actualObjectMap) > 0 && actualObjectMap[0] != nil {
 		dropMap = actualObjectMap[0]
+		actualMap = actualObjectMap[0]
+		strictDropMap = true
 	}
 
 	// Split creates into structural (before ALTER) and dependent (after ALTER).
@@ -102,18 +106,28 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 	schema.SortObjectKeys(structuralKeys)
 	schema.SortObjectKeys(dependentKeys)
 
-	// 1. Create structural objects (types, tables, functions, etc.)
+	if err := validateOwnedSequenceState(diff, objectMap, actualMap, false); err != nil {
+		return "", err
+	}
+
+	// 1. Create structural objects (types, tables, functions, etc.). Sequence
+	// OWNED BY clauses are deferred because a table can itself reference the
+	// sequence from an inline DEFAULT, while OWNED BY requires the target
+	// table/column to already exist.
+	var deferredCreateStatements []string
 	if len(structuralKeys) > 0 {
-		stmts, err := g.generateCreateStatements(structuralKeys, objectMap)
+		stmts, deferred, err := g.generateCreateStatementsPhased(structuralKeys, objectMap)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate CREATE statements: %w", err)
 		}
 		statements = append(statements, stmts...)
+		deferredCreateStatements = append(deferredCreateStatements, deferred...)
 	}
 
 	// 2. ALTER existing objects (may add columns that new indexes reference)
-	for _, alter := range diff.ToAlter {
-		stmts, err := g.generateAlter(alter)
+	orderedAlters, cascadedSequenceOwners := orderAlterOperations(diff.ToAlter, objectMap)
+	for _, alter := range orderedAlters {
+		stmts, err := g.generateAlter(alter, cascadedSequenceOwners[alter.Key])
 		if err != nil {
 			return "", fmt.Errorf("failed to generate ALTER for %v: %w", alter.Key, err)
 		}
@@ -122,16 +136,20 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 
 	// 3. Create dependent objects (indexes, triggers, policies)
 	if len(dependentKeys) > 0 {
-		stmts, err := g.generateCreateStatements(dependentKeys, objectMap)
+		stmts, deferred, err := g.generateCreateStatementsPhased(dependentKeys, objectMap)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate dependent CREATE statements: %w", err)
 		}
 		statements = append(statements, stmts...)
+		deferredCreateStatements = append(deferredCreateStatements, deferred...)
 	}
 
-	// 4. DROP statements (in reverse dependency order, using actual schema)
+	// 4. Bind newly-created sequences only after all target columns exist.
+	statements = append(statements, deferredCreateStatements...)
+
+	// 5. DROP statements (in reverse dependency order, using actual schema)
 	if len(diff.ToDrop) > 0 {
-		dropStatements, err := g.generateDropStatements(diff.ToDrop, dropMap)
+		dropStatements, err := g.generateDropStatements(diff.ToDrop, dropMap, strictDropMap)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate DROP statements: %w", err)
 		}
@@ -141,10 +159,184 @@ func (g *DDLGenerator) GenerateDDL(diff *differ.Diff, objectMap schema.SchemaObj
 	return strings.Join(statements, "\n\n"), nil
 }
 
+func validateOwnedSequenceState(diff *differ.Diff, desired, actual schema.SchemaObjectMap, validateAll bool) error {
+	created := make(map[schema.ObjectKey]struct{}, len(diff.ToCreate))
+	changed := make(map[schema.ObjectKey]struct{}, len(diff.ToCreate)+len(diff.ToAlter)+len(diff.ToDrop))
+	dropped := make(map[schema.ObjectKey]struct{}, len(diff.ToDrop))
+	ownerAltered := make(map[schema.ObjectKey]struct{})
+	for _, key := range diff.ToCreate {
+		created[key] = struct{}{}
+		changed[key] = struct{}{}
+	}
+	for _, alter := range diff.ToAlter {
+		changed[alter.Key] = struct{}{}
+		if hasAlterChange(alter.Changes, "owner changed") {
+			ownerAltered[alter.Key] = struct{}{}
+		}
+	}
+	for _, key := range diff.ToDrop {
+		changed[key] = struct{}{}
+		dropped[key] = struct{}{}
+	}
+
+	for key, hashed := range desired {
+		sequence, ok := hashed.Payload.(schema.Sequence)
+		if !ok || sequence.OwnedBy == nil {
+			continue
+		}
+		tableKey := schema.ObjectKey{
+			Kind: schema.TableKind, Schema: sequence.OwnedBy.Schema, Name: string(sequence.OwnedBy.Table),
+		}
+		_, sequenceChanged := changed[key]
+		_, tableChanged := changed[tableKey]
+		if !validateAll && !sequenceChanged && !tableChanged {
+			continue
+		}
+		if sequence.Schema != sequence.OwnedBy.Schema {
+			return fmt.Errorf("sequence %s.%s cannot be OWNED BY table %s.%s: PostgreSQL requires a linked sequence and table to be in the same schema", sequence.Schema, sequence.Name, sequence.OwnedBy.Schema, sequence.OwnedBy.Table)
+		}
+		if _, targetDropped := dropped[tableKey]; targetDropped {
+			return fmt.Errorf("sequence %s.%s cannot retain OWNED BY %s.%s because the target table is being dropped", sequence.Schema, sequence.Name, sequence.OwnedBy.Schema, sequence.OwnedBy.Table)
+		}
+		table, tableExists := tableFromMap(desired, tableKey)
+		if !tableExists {
+			table, tableExists = tableFromMap(actual, tableKey)
+		}
+		if !tableExists {
+			return fmt.Errorf("sequence %s.%s OWNED BY target table %s.%s is not present in the desired or actual object map", sequence.Schema, sequence.Name, sequence.OwnedBy.Schema, sequence.OwnedBy.Table)
+		}
+		columnExists := false
+		for _, column := range table.Columns {
+			if column.Name == sequence.OwnedBy.Column {
+				columnExists = true
+				break
+			}
+		}
+		if !columnExists {
+			return fmt.Errorf("sequence %s.%s OWNED BY target column %s.%s.%s does not exist", sequence.Schema, sequence.Name, sequence.OwnedBy.Schema, sequence.OwnedBy.Table, sequence.OwnedBy.Column)
+		}
+
+		_, sequenceCreated := created[key]
+		_, tableCreated := created[tableKey]
+		_, sequenceOwnerAltered := ownerAltered[key]
+		_, tableOwnerAltered := ownerAltered[tableKey]
+		if !validateAll && !sequenceCreated && !tableCreated && !sequenceOwnerAltered && !tableOwnerAltered {
+			continue
+		}
+		sequenceOwner := sequence.Owner
+		tableOwner := table.Owner
+
+		// Existing owned sequences follow an ALTER TABLE OWNER automatically.
+		// A newly-created sequence is not bound yet, so it cannot benefit from
+		// that cascade and must be assigned the same explicit owner itself.
+		if sequenceOwner == nil && !sequenceCreated && table.Owner != nil {
+			sequenceOwner = table.Owner
+		}
+		if sequenceOwner == nil && !sequenceCreated {
+			if current, exists := sequenceFromMap(actual, key); exists {
+				sequenceOwner = current.Owner
+			}
+		}
+		if tableOwner == nil && !tableCreated {
+			if current, exists := tableFromMap(actual, tableKey); exists {
+				tableOwner = current.Owner
+			}
+		}
+
+		switch {
+		case sequenceOwner != nil && tableOwner != nil && *sequenceOwner != *tableOwner:
+			return fmt.Errorf("sequence %s.%s owner %q must match OWNED BY table %s.%s owner %q", sequence.Schema, sequence.Name, *sequenceOwner, table.Schema, table.Name, *tableOwner)
+		case sequenceCreated && tableCreated && (sequenceOwner == nil) != (tableOwner == nil):
+			return fmt.Errorf("new sequence %s.%s and its OWNED BY table %s.%s must either both use the migration role or declare the same explicit owner", sequence.Schema, sequence.Name, table.Schema, table.Name)
+		case sequenceCreated && !tableCreated && sequenceOwner == nil:
+			return fmt.Errorf("new sequence %s.%s owned by existing table %s.%s requires an explicit owner matching the table owner", sequence.Schema, sequence.Name, table.Schema, table.Name)
+		case sequenceOwner != nil && tableOwner == nil:
+			return fmt.Errorf("cannot verify that sequence %s.%s owner %q matches unmanaged OWNED BY table %s.%s; provide the actual object map or manage both owners", sequence.Schema, sequence.Name, *sequenceOwner, table.Schema, table.Name)
+		}
+	}
+	return nil
+}
+
+func tableFromMap(objects schema.SchemaObjectMap, key schema.ObjectKey) (schema.Table, bool) {
+	if objects == nil {
+		return schema.Table{}, false
+	}
+	hashed, ok := objects[key]
+	if !ok {
+		return schema.Table{}, false
+	}
+	table, ok := hashed.Payload.(schema.Table)
+	return table, ok
+}
+
+func sequenceFromMap(objects schema.SchemaObjectMap, key schema.ObjectKey) (schema.Sequence, bool) {
+	if objects == nil {
+		return schema.Sequence{}, false
+	}
+	hashed, ok := objects[key]
+	if !ok {
+		return schema.Sequence{}, false
+	}
+	sequence, ok := hashed.Payload.(schema.Sequence)
+	return sequence, ok
+}
+
+func orderAlterOperations(alters []differ.AlterOperation, desired schema.SchemaObjectMap) ([]differ.AlterOperation, map[schema.ObjectKey]bool) {
+	prerequisiteTables := make(map[schema.ObjectKey]struct{})
+	cascadedSequenceOwners := make(map[schema.ObjectKey]bool)
+	tableAlters := make(map[schema.ObjectKey]differ.AlterOperation)
+	for _, alter := range alters {
+		if alter.Key.Kind == schema.TableKind && hasAlterChange(alter.Changes, "owner changed") {
+			tableAlters[alter.Key] = alter
+		}
+	}
+	for _, alter := range alters {
+		if alter.Key.Kind != schema.SequenceKind || !hasAlterChange(alter.Changes, "owner changed") {
+			continue
+		}
+		hashed, exists := desired[alter.Key]
+		if !exists {
+			continue
+		}
+		sequence, ok := hashed.Payload.(schema.Sequence)
+		if !ok || sequence.OwnedBy == nil {
+			continue
+		}
+		tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: sequence.OwnedBy.Schema, Name: string(sequence.OwnedBy.Table)}
+		if _, exists := tableAlters[tableKey]; exists {
+			prerequisiteTables[tableKey] = struct{}{}
+			cascadedSequenceOwners[alter.Key] = true
+		}
+	}
+
+	ordered := make([]differ.AlterOperation, 0, len(alters))
+	for _, alter := range alters {
+		if _, prerequisite := prerequisiteTables[alter.Key]; prerequisite {
+			ordered = append(ordered, alter)
+		}
+	}
+	for _, alter := range alters {
+		if _, prerequisite := prerequisiteTables[alter.Key]; !prerequisite {
+			ordered = append(ordered, alter)
+		}
+	}
+	return ordered, cascadedSequenceOwners
+}
+
 // generateCreateStatements generates CREATE statements in dependency order
 func (g *DDLGenerator) generateCreateStatements(keys []schema.ObjectKey, objectMap schema.SchemaObjectMap) ([]string, error) {
+	statements, deferred, err := g.generateCreateStatementsPhased(keys, objectMap)
+	if err != nil {
+		return nil, err
+	}
+	return append(statements, deferred...), nil
+}
+
+// generateCreateStatementsPhased returns immediately executable CREATE DDL
+// separately from post-create bindings such as ALTER SEQUENCE ... OWNED BY.
+func (g *DDLGenerator) generateCreateStatementsPhased(keys []schema.ObjectKey, objectMap schema.SchemaObjectMap) ([]string, []string, error) {
 	if len(keys) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Build a graph for only the objects being created
@@ -159,9 +351,9 @@ func (g *DDLGenerator) generateCreateStatements(keys []schema.ObjectKey, objectM
 		// Circular dependency detected - provide helpful error
 		cycle, _ := filteredGraph.DetectCycle()
 		if cycle != nil {
-			return nil, fmt.Errorf("circular dependency detected: %s\nCannot determine creation order. Consider creating tables first without foreign keys, then adding foreign keys with ALTER TABLE", formatCycle(cycle))
+			return nil, nil, fmt.Errorf("circular dependency detected: %s\nCannot determine creation order. Consider creating tables first without foreign keys, then adding foreign keys with ALTER TABLE", formatCycle(cycle))
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Build set of keys that actually need CREATE (not just dependency-ordering nodes)
@@ -171,25 +363,73 @@ func (g *DDLGenerator) generateCreateStatements(keys []schema.ObjectKey, objectM
 	}
 
 	// Generate CREATE statements in sorted order, skipping dependency-only nodes
-	var statements []string
+	var statements, deferred []string
 	for _, key := range sortedKeys {
 		if !createSet[key] {
 			continue // included only for ordering, already exists
 		}
-		if obj, exists := objectMap[key]; exists {
-			stmt, err := g.generateCreate(obj.Payload)
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate CREATE for %v: %w", key, err)
-			}
-			statements = append(statements, stmt)
+		obj, exists := objectMap[key]
+		if !exists {
+			return nil, nil, fmt.Errorf("CREATE object %v is missing from the desired object map", key)
 		}
+		payload := obj.Payload
+		if sequence, ok := payload.(schema.Sequence); ok && sequence.OwnedBy != nil {
+			ownedBy := sequence.OwnedBy
+			sequence.OwnedBy = nil
+			payload = sequence
+			deferred = append(deferred, fmt.Sprintf(
+				"ALTER SEQUENCE %s OWNED BY %s;",
+				qualifiedName(string(sequence.Schema), sequence.Name),
+				qualifiedColumnName(string(ownedBy.Schema), string(ownedBy.Table), string(ownedBy.Column)),
+			))
+		}
+		stmt, err := g.generateCreate(payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to generate CREATE for %v: %w", key, err)
+		}
+		statements = append(statements, stmt)
 	}
 
-	return statements, nil
+	return statements, deferred, nil
+}
+
+// GenerateCreateObjects renders a replayable, dependency-ordered schema dump.
+// Unlike calling GenerateCreateStatement object-by-object, it can defer
+// cross-object metadata until every prerequisite has been created.
+func (g *DDLGenerator) GenerateCreateObjects(objects []schema.DatabaseObject) (string, error) {
+	objectMap := make(schema.SchemaObjectMap, len(objects))
+	firstIndex := make(map[schema.ObjectKey]int, len(objects))
+	for index, object := range objects {
+		key := schema.ObjectKeyFor(object)
+		if key.Kind == "" {
+			return "", fmt.Errorf("cannot render unrecognized database object %T at position %d", object, index+1)
+		}
+		if first, duplicate := firstIndex[key]; duplicate {
+			return "", fmt.Errorf("duplicate schema object %v at positions %d and %d", key, first+1, index+1)
+		}
+		firstIndex[key] = index
+		objectMap[key] = schema.HashedObject{Payload: object}
+	}
+	keys := make([]schema.ObjectKey, 0, len(objectMap))
+	for key := range objectMap {
+		keys = append(keys, key)
+	}
+	schema.SortObjectKeys(keys)
+	if err := validateOwnedSequenceState(&differ.Diff{ToCreate: keys}, objectMap, nil, true); err != nil {
+		return "", err
+	}
+	statements, err := g.generateCreateStatements(keys, objectMap)
+	if err != nil {
+		return "", err
+	}
+	if len(statements) == 0 {
+		return "", nil
+	}
+	return strings.Join(statements, "\n\n") + "\n", nil
 }
 
 // generateDropStatements generates DROP statements in reverse dependency order
-func (g *DDLGenerator) generateDropStatements(keys []schema.ObjectKey, objectMap schema.SchemaObjectMap) ([]string, error) {
+func (g *DDLGenerator) generateDropStatements(keys []schema.ObjectKey, objectMap schema.SchemaObjectMap, strict ...bool) ([]string, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -216,7 +456,19 @@ func (g *DDLGenerator) generateDropStatements(keys []schema.ObjectKey, objectMap
 		if !dropSet[key] {
 			continue // retained dependency included only to calculate ordering
 		}
-		stmt, err := g.generateDrop(key)
+		hashed, exists := objectMap[key]
+		if !exists {
+			if len(strict) > 0 && strict[0] {
+				return nil, fmt.Errorf("DROP object %v is missing from the actual object map", key)
+			}
+			stmt, err := g.generateDrop(key)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate DROP for %v: %w", key, err)
+			}
+			statements = append(statements, stmt)
+			continue
+		}
+		stmt, err := g.generateDropObject(key, hashed.Payload)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate DROP for %v: %w", key, err)
 		}
@@ -264,6 +516,8 @@ func (g *DDLGenerator) generateCreate(obj schema.DatabaseObject) (string, error)
 		return g.generateCreateEnum(v), nil
 	case schema.DomainDef:
 		return g.generateCreateDomain(v), nil
+	case schema.CompositeDef:
+		return g.generateCreateComposite(v), nil
 	case schema.Extension:
 		return g.generateCreateExtension(v), nil
 	case schema.Trigger:
@@ -278,15 +532,6 @@ func (g *DDLGenerator) generateCreate(obj schema.DatabaseObject) (string, error)
 			Object:      schema.ObjectKey{Kind: schema.SchemaKind, Schema: v.Name, Name: string(v.Name)},
 			Reason:      "CREATE SCHEMA rendering is not implemented",
 			Remediation: "use an explicit migration until schema rendering is supported",
-		}
-	case schema.CompositeDef:
-		return "", &capability.UnsupportedError{
-			Stage:       capability.CreateStage,
-			Family:      capability.CompositeFamily,
-			Feature:     "composite type definition",
-			Object:      schema.ObjectKey{Kind: schema.TypeKind, Schema: v.Schema, Name: string(v.Name)},
-			Reason:      "CREATE TYPE AS composite rendering is not implemented",
-			Remediation: "use an explicit migration until composite rendering is supported",
 		}
 	default:
 		return "", &capability.UnsupportedError{
@@ -305,7 +550,6 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	// Column order is semantic in PostgreSQL (including SELECT * and physical
 	// tuple layout), so preserve the declaration order.
 	var colDefs []string
-	var columnComments []string
 	for _, col := range tbl.Columns {
 		base := fmt.Sprintf("  %s %s", quotedIdentifier(string(col.Name)), col.Type)
 		colParts := []string{base}
@@ -328,9 +572,6 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 
 		colDefs = append(colDefs, strings.Join(colParts, " "))
 
-		if col.Comment != nil {
-			columnComments = append(columnComments, formatColumnCommentStatement(tbl.Schema, tbl.Name, col.Name, col.Comment))
-		}
 	}
 
 	// Primary key
@@ -416,18 +657,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 
 	stmt := strings.Join(parts, "\n")
 
-	var commentStatements []string
-	if tbl.Comment != nil {
-		commentStatements = append(commentStatements, formatTableCommentStatement(tbl.Schema, tbl.Name, tbl.Comment))
-	}
-	if len(columnComments) > 0 {
-		commentStatements = append(commentStatements, columnComments...)
-	}
-	if len(commentStatements) > 0 {
-		stmt += "\n\n" + strings.Join(commentStatements, "\n")
-	}
-
-	return stmt
+	return appendMetadata(stmt, tableCreateMetadata(tbl))
 }
 
 func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
@@ -490,18 +720,25 @@ func (g *DDLGenerator) generateCreateView(view schema.View) string {
 		viewType = "MATERIALIZED "
 	}
 
-	return fmt.Sprintf("CREATE %sVIEW %s AS\n%s;",
+	stmt := fmt.Sprintf("CREATE %sVIEW %s AS\n%s;",
 		viewType, qualifiedName(string(view.Schema), view.Name), view.Definition.Query)
+	return appendMetadata(stmt, viewCreateMetadata(view))
 }
 
 func (g *DDLGenerator) generateCreateFunction(fn schema.Function) string {
-	return g.renderFunction(fn, false)
+	return appendMetadata(g.renderFunction(fn, false), functionCreateMetadata(fn))
 }
 
 func (g *DDLGenerator) renderFunction(fn schema.Function, replace bool) string {
 	// Build arguments
-	args := make([]string, len(fn.Args))
-	for i, arg := range fn.Args {
+	args := make([]string, 0, len(fn.Args))
+	for _, arg := range fn.Args {
+		// PostgreSQL represents RETURNS TABLE columns as TABLE-mode function
+		// parameters in its AST/catalog, but their SQL spelling belongs in the
+		// RETURNS TABLE clause rather than the input argument list.
+		if arg.Mode == schema.TableMode {
+			continue
+		}
 		var argParts []string
 		switch arg.Mode {
 		case schema.OutMode:
@@ -518,7 +755,7 @@ func (g *DDLGenerator) renderFunction(fn schema.Function, replace bool) string {
 		if arg.Default != nil {
 			argParts = append(argParts, "DEFAULT", string(*arg.Default))
 		}
-		args[i] = strings.Join(argParts, " ")
+		args = append(args, strings.Join(argParts, " "))
 	}
 
 	// Build returns clause
@@ -556,7 +793,7 @@ AS %s
 	// Default for plpgsql is VOLATILE, so we can omit it in most cases
 	// But for completeness, we'll include it if specified
 	if fn.Volatility != "" && fn.Volatility != schema.Volatile {
-		stmt += fmt.Sprintf("\nVOLATILITY %s", fn.Volatility)
+		stmt += fmt.Sprintf("\n%s", fn.Volatility)
 	}
 	if fn.Strict {
 		stmt += "\nSTRICT"
@@ -567,12 +804,16 @@ AS %s
 	if fn.Parallel != "" && fn.Parallel != schema.ParallelUnsafe {
 		stmt += fmt.Sprintf("\nPARALLEL %s", fn.Parallel)
 	}
-	if len(fn.SearchPath) > 0 {
-		path := make([]string, len(fn.SearchPath))
-		for i := range fn.SearchPath {
-			path[i] = quotedIdentifier(string(fn.SearchPath[i]))
+	if fn.SearchPath != nil {
+		if len(fn.SearchPath) == 0 {
+			stmt += "\nSET search_path TO ''"
+		} else {
+			path := make([]string, len(fn.SearchPath))
+			for i := range fn.SearchPath {
+				path[i] = quotedIdentifier(string(fn.SearchPath[i]))
+			}
+			stmt += fmt.Sprintf("\nSET search_path TO %s", strings.Join(path, ", "))
 		}
-		stmt += fmt.Sprintf("\nSET search_path TO %s", strings.Join(path, ", "))
 	}
 
 	stmt += ";"
@@ -593,6 +834,9 @@ func functionDollarTag(body string) string {
 
 func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
 	stmt := fmt.Sprintf("CREATE SEQUENCE %s", qualifiedName(string(seq.Schema), seq.Name))
+	if seq.Type != "" {
+		stmt += fmt.Sprintf(" AS %s", seq.Type)
+	}
 
 	if seq.Start != nil {
 		stmt += fmt.Sprintf(" START %d", *seq.Start)
@@ -614,7 +858,7 @@ func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
 	}
 
 	stmt += ";"
-	return stmt
+	return appendMetadata(stmt, sequenceCreateMetadata(seq))
 }
 
 func (g *DDLGenerator) generateCreateEnum(enum schema.EnumDef) string {
@@ -623,8 +867,9 @@ func (g *DDLGenerator) generateCreateEnum(enum schema.EnumDef) string {
 		values[i] = quotedLiteral(v)
 	}
 
-	return fmt.Sprintf("CREATE TYPE %s AS ENUM (%s);",
+	stmt := fmt.Sprintf("CREATE TYPE %s AS ENUM (%s);",
 		qualifiedName(string(enum.Schema), string(enum.Name)), strings.Join(values, ", "))
+	return appendMetadata(stmt, typeCreateMetadata("TYPE", enum.Schema, enum.Name, enum.Owner, enum.Comment, enum.Grants))
 }
 
 func (g *DDLGenerator) generateCreateDomain(domain schema.DomainDef) string {
@@ -641,7 +886,16 @@ func (g *DDLGenerator) generateCreateDomain(domain schema.DomainDef) string {
 	}
 
 	stmt += ";"
-	return stmt
+	return appendMetadata(stmt, typeCreateMetadata("DOMAIN", domain.Schema, domain.Name, domain.Owner, domain.Comment, domain.Grants))
+}
+
+func (g *DDLGenerator) generateCreateComposite(composite schema.CompositeDef) string {
+	attributes := make([]string, len(composite.Attributes))
+	for i, attribute := range composite.Attributes {
+		attributes[i] = fmt.Sprintf("%s %s", quotedIdentifier(attribute.Name), attribute.Type)
+	}
+	stmt := fmt.Sprintf("CREATE TYPE %s AS (%s);", qualifiedName(string(composite.Schema), string(composite.Name)), strings.Join(attributes, ", "))
+	return appendMetadata(stmt, typeCreateMetadata("TYPE", composite.Schema, composite.Name, composite.Owner, composite.Comment, composite.Grants))
 }
 
 func (g *DDLGenerator) generateCreateExtension(ext schema.Extension) string {
@@ -697,7 +951,7 @@ func (g *DDLGenerator) generateCreatePolicy(pol schema.Policy) string {
 	return stmt
 }
 
-func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, error) {
+func (g *DDLGenerator) generateAlter(alter differ.AlterOperation, sequenceOwnerCascaded bool) ([]string, error) {
 	if err := validateObjectKeyRenderInputs(alter.Key); err != nil {
 		return nil, fmt.Errorf("invalid ALTER object identity: %w", err)
 	}
@@ -719,42 +973,60 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 		if onlyOwnerOrGrantChanges(alter.Changes) {
 			return g.generateAlterViewOwnerAndGrants(obj, alter)
 		}
-		dropStmt, err := g.generateDrop(alter.Key)
+		oldView, ok := alter.OldObject.(schema.View)
+		if !ok {
+			return nil, fmt.Errorf("cannot preserve unmanaged metadata while replacing view %v without the prior view definition", alter.Key)
+		}
+		// A nil desired owner or ACL means unmanaged, not "replace with the
+		// migration user's defaults". Structural view changes require DROP +
+		// CREATE, so carry the observed metadata through the replacement.
+		replacement := obj
+		if replacement.Owner == nil {
+			replacement.Owner = oldView.Owner
+		}
+		if replacement.Grants == nil {
+			replacement.Grants = oldView.Grants
+		}
+		dropStmt, err := g.generateDropObject(alter.Key, alter.OldObject)
 		if err != nil {
 			return nil, err
 		}
-		createStmt, err := g.generateCreate(alter.NewObject)
-		if err != nil {
-			return nil, err
-		}
-		out := []string{dropStmt, createStmt}
-		if obj.Owner != nil {
-			kw := viewAlterKeyword(obj)
-			out = append(out, fmt.Sprintf("ALTER %s %s OWNER TO %s;", kw,
-				qualifiedName(string(obj.Schema), obj.Name), quotedRole(*obj.Owner)))
-		}
-		out = append(out, grantStatementsFromView(obj)...)
-		return out, nil
-	case schema.Function:
-		return g.generateAlterFunction(obj, alter)
-	case schema.Sequence:
-		if onlyOwnerOrGrantChanges(alter.Changes) {
-			return g.generateAlterSequenceOwnerAndGrants(obj, alter)
-		}
-		dropStmt, err := g.generateDrop(alter.Key)
-		if err != nil {
-			return nil, err
-		}
-		createStmt, err := g.generateCreate(alter.NewObject)
+		createStmt, err := g.generateCreate(replacement)
 		if err != nil {
 			return nil, err
 		}
 		return []string{dropStmt, createStmt}, nil
+	case schema.Function:
+		return g.generateAlterFunction(obj, alter)
+	case schema.Sequence:
+		if onlyOwnerOrGrantChanges(alter.Changes) {
+			return g.generateAlterSequenceOwnerAndGrants(obj, alter, sequenceOwnerCascaded)
+		}
+		return nil, &UnsupportedChangeError{
+			Key: alter.Key, Change: strings.Join(alter.Changes, ", "),
+			Remediation: "sequence structural changes require an explicit ALTER SEQUENCE migration so current state and dependencies are preserved",
+		}
 	case schema.EnumDef:
 		return g.generateAlterEnum(obj, alter)
+	case schema.DomainDef:
+		if onlyOwnerOrGrantChanges(alter.Changes) {
+			return g.generateAlterTypeMetadata("DOMAIN", obj.Schema, obj.Name, obj.Owner, obj.Comment, obj.Grants, alter)
+		}
+		return nil, &UnsupportedChangeError{
+			Key: alter.Key, Change: strings.Join(alter.Changes, ", "),
+			Remediation: "domain structural changes require an explicit migration that accounts for dependent columns and data",
+		}
+	case schema.CompositeDef:
+		if onlyOwnerOrGrantChanges(alter.Changes) {
+			return g.generateAlterTypeMetadata("TYPE", obj.Schema, obj.Name, obj.Owner, obj.Comment, obj.Grants, alter)
+		}
+		return nil, &UnsupportedChangeError{
+			Key: alter.Key, Change: strings.Join(alter.Changes, ", "),
+			Remediation: "composite structural changes require an explicit migration that accounts for dependent columns and functions",
+		}
 	default:
 		// For other objects, drop and recreate
-		dropStmt, err := g.generateDrop(alter.Key)
+		dropStmt, err := g.generateDropObject(alter.Key, alter.OldObject)
 		if err != nil {
 			return nil, err
 		}
@@ -792,7 +1064,11 @@ func (g *DDLGenerator) generateAlterEnum(enum schema.EnumDef, alter differ.Alter
 		}
 	}
 
-	statements := make([]string, 0, len(enum.Values)-len(oldEnum.Values)+1)
+	statements := make([]string, 0, len(enum.Values)-len(oldEnum.Values)+4)
+	replaceACL := enum.Grants != nil && hasAlterChange(alter.Changes, "owner changed")
+	if hasAlterChange(alter.Changes, "owner changed") && enum.Owner != nil {
+		statements = append(statements, fmt.Sprintf("ALTER TYPE %s OWNER TO %s;", qualifiedName(string(enum.Schema), string(enum.Name)), quotedRole(*enum.Owner)))
+	}
 	for _, value := range enum.Values[len(oldEnum.Values):] {
 		statements = append(statements, fmt.Sprintf("ALTER TYPE %s ADD VALUE %s;",
 			qualifiedName(string(enum.Schema), string(enum.Name)), quotedLiteral(value)))
@@ -804,6 +1080,25 @@ func (g *DDLGenerator) generateAlterEnum(enum schema.EnumDef, alter differ.Alter
 			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s IS %s;",
 				qualifiedName(string(enum.Schema), string(enum.Name)), quotedLiteral(*enum.Comment)))
 		}
+	}
+	for _, change := range alter.Changes {
+		if strings.HasPrefix(change, "add grant\t") || strings.HasPrefix(change, "revoke grant\t") {
+			if replaceACL {
+				continue
+			}
+			revoke, grantee, privileges, grantable, ok := differ.ParseGrantChange(change)
+			if !ok {
+				return nil, fmt.Errorf("invalid encoded type grant change %q", change)
+			}
+			if revoke {
+				statements = append(statements, formatTypeRevoke(enum.Schema, enum.Name, grantee, privileges, grantable))
+			} else {
+				statements = append(statements, formatTypeGrant(enum.Schema, enum.Name, grantee, privileges, grantable))
+			}
+		}
+	}
+	if replaceACL {
+		statements = append(statements, typeManagedACLStatements(enum.Schema, enum.Name, enum.Owner, enum.Grants, oldEnum.Grants)...)
 	}
 	return statements, nil
 }
@@ -826,6 +1121,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 	}
 	var statements []string
 	tableSQL := qualifiedName(string(tbl.Schema), string(tbl.Name))
+	replaceACL := tbl.Grants != nil && hasAlterChange(alter.Changes, "owner changed")
 
 	// Build column and constraint maps for quick lookup (new table)
 	colMap := make(map[schema.ColumnName]schema.Column)
@@ -861,14 +1157,20 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				statements = append(statements, fmt.Sprintf("ALTER TABLE %s OWNER TO %s;", tableSQL, quotedRole(*tbl.Owner)))
 			}
 		} else if strings.HasPrefix(change, "add grant\t") || strings.HasPrefix(change, "revoke grant\t") {
-			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(change)
-			if ok {
-				if revoke {
-					statements = append(statements, formatTableRevoke(tbl, grantee, privs, grantable))
-				} else {
-					statements = append(statements, formatTableGrant(tbl, grantee, privs, grantable))
-				}
+			if replaceACL {
+				continue
 			}
+			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(change)
+			if !ok {
+				return nil, fmt.Errorf("invalid encoded table grant change %q", change)
+			}
+			if revoke {
+				statements = append(statements, formatTableRevoke(tbl, grantee, privs, grantable))
+			} else {
+				statements = append(statements, formatTableGrant(tbl, grantee, privs, grantable))
+			}
+		} else if change == "comment changed" {
+			statements = append(statements, formatTableCommentStatement(tbl.Schema, tbl.Name, tbl.Comment))
 		} else if strings.HasPrefix(change, "add column ") {
 			colName := schema.ColumnName(strings.TrimPrefix(change, "add column "))
 			if col, exists := colMap[colName]; exists {
@@ -1150,6 +1452,12 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			}
 		}
 	}
+	if replaceACL {
+		if oldTable == nil {
+			return nil, fmt.Errorf("cannot rebuild managed table ACL without the prior table definition")
+		}
+		statements = append(statements, tableManagedACLStatements(tbl, oldTable.Grants)...)
+	}
 
 	return statements, nil
 }
@@ -1214,13 +1522,22 @@ func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Ta
 				tableName, columnName, formatGeneratedClause(*newCol.Generated)))
 		}
 	} else if changeDetail == "identity spec changed" {
-		if oldCol != nil && oldCol.Identity != nil {
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP IDENTITY IF EXISTS;",
-				tableName, columnName))
-		}
-		if newCol != nil && newCol.Identity != nil {
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD %s;",
-				tableName, columnName, formatIdentityClause(*newCol.Identity)))
+		if oldCol != nil && newCol != nil && oldCol.Identity != nil && newCol.Identity != nil &&
+			identityDefinitionEqualExceptMode(newCol.Type, *oldCol.Identity, *newCol.Identity) {
+			mode := "BY DEFAULT"
+			if newCol.Identity.Always {
+				mode = "ALWAYS"
+			}
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET GENERATED %s;",
+				tableName, columnName, mode))
+		} else {
+			return nil, &UnsupportedChangeError{
+				Key: schema.ObjectKey{
+					Kind: schema.ColumnKind, Schema: tbl.Schema, Name: colName, TableName: tbl.Name, ColumnName: schema.ColumnName(colName),
+				},
+				Change:      changeDetail,
+				Remediation: "Only switching an existing identity column between GENERATED ALWAYS and BY DEFAULT is changed automatically. Adding, removing, renaming, restarting, or changing identity sequence options requires an explicit migration that preserves the backing sequence and reviews existing values.",
+			}
 		}
 	} else if changeDetail == "collation changed" {
 		if newCol != nil {
@@ -1347,11 +1664,38 @@ func formatIdentityClause(spec schema.IdentitySpec) string {
 
 	clause := fmt.Sprintf("GENERATED %s AS IDENTITY", mode)
 
-	if options := formatSequenceOptions(spec.SequenceOptions); options != "" {
-		clause += fmt.Sprintf(" (%s)", options)
+	var options []string
+	if spec.SequenceName != nil {
+		options = append(options, "SEQUENCE NAME "+qualifiedName(string(spec.SequenceName.Schema), spec.SequenceName.Name))
+	}
+	if sequenceOptions := formatSequenceOptions(spec.SequenceOptions); sequenceOptions != "" {
+		options = append(options, sequenceOptions)
+	}
+	if len(options) > 0 {
+		clause += fmt.Sprintf(" (%s)", strings.Join(options, " "))
 	}
 
 	return clause
+}
+
+func identityDefinitionEqualExceptMode(columnType schema.TypeName, oldIdentity, newIdentity schema.IdentitySpec) bool {
+	// A nil desired sequence name deliberately leaves PostgreSQL's generated
+	// backing-sequence name unmanaged. Catalog extraction always has that name,
+	// so it must not block an otherwise in-place ALWAYS/BY DEFAULT change.
+	if newIdentity.SequenceName != nil && (oldIdentity.SequenceName == nil || *oldIdentity.SequenceName != *newIdentity.SequenceName) {
+		return false
+	}
+	oldOptions := schema.NormalizeIdentityOptions(columnType, oldIdentity.SequenceOptions)
+	newOptions := schema.NormalizeIdentityOptions(columnType, newIdentity.SequenceOptions)
+	if len(oldOptions) != len(newOptions) {
+		return false
+	}
+	for i := range oldOptions {
+		if oldOptions[i] != newOptions[i] {
+			return false
+		}
+	}
+	return oldIdentity.Always != newIdentity.Always
 }
 
 func formatSequenceOptions(options []schema.SequenceOption) string {
@@ -1453,6 +1797,10 @@ func formatIndexCommentStatement(schemaName schema.SchemaName, indexName string,
 }
 
 func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
+	return g.generateDropObject(key, nil)
+}
+
+func (g *DDLGenerator) generateDropObject(key schema.ObjectKey, object schema.DatabaseObject) (string, error) {
 	if err := validateObjectKeyRenderInputs(key); err != nil {
 		return "", fmt.Errorf("invalid DROP render input: %w", err)
 	}
@@ -1463,6 +1811,9 @@ func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
 	case schema.IndexKind:
 		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", qualified), nil
 	case schema.ViewKind:
+		if view, ok := object.(schema.View); ok && view.Type == schema.MaterializedView {
+			return fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
+		}
 		return fmt.Sprintf("DROP VIEW IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.FunctionKind:
 		if key.Signature == "" {
@@ -1476,6 +1827,9 @@ func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
 	case schema.SequenceKind:
 		return fmt.Sprintf("DROP SEQUENCE IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.TypeKind:
+		if _, ok := object.(schema.DomainDef); ok {
+			return fmt.Sprintf("DROP DOMAIN IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
+		}
 		return fmt.Sprintf("DROP TYPE IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.TriggerKind:
 		return fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", quotedIdentifier(key.Name), qualifiedName(string(key.Schema), string(key.TableName))), nil

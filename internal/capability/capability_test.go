@@ -21,12 +21,13 @@ func TestRequireFailsClosedForPartialAndUnsupportedCapabilities(t *testing.T) {
 	t.Parallel()
 
 	key := schema.ObjectKey{Kind: schema.TypeKind, Schema: "public", Name: "address"}
-	err := Require(CompositeFamily, CreateStage, "composite type", key)
+	assert.NoError(t, Require(CompositeFamily, CreateStage, "composite type", key))
+	err := Require(CompositeFamily, CaptureStage, "composite type", key)
 	var unsupported *UnsupportedError
 	require.True(t, errors.As(err, &unsupported))
 	assert.Equal(t, CompositeFamily, unsupported.Family)
-	assert.Equal(t, CreateStage, unsupported.Stage)
-	assert.Contains(t, err.Error(), "CREATE TYPE AS composite rendering is not implemented")
+	assert.Equal(t, CaptureStage, unsupported.Stage)
+	assert.Contains(t, err.Error(), "explicit composites are captured")
 
 	assert.NoError(t, Require(EnumFamily, CreateStage, "enum", key))
 }

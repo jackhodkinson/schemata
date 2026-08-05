@@ -44,15 +44,15 @@ func TestGrantRenderingQuotesRolesAndKeepsPublicExplicit(t *testing.T) {
 	table := schema.Table{Schema: "tenant.data", Name: "select"}
 	assert.Equal(t,
 		`GRANT SELECT ON TABLE "tenant.data"."select" TO "ops""; DROP ROLE admin; --";`,
-		formatTableGrant(table, `ops"; DROP ROLE admin; --`, []schema.Privilege{schema.PrivSelect}, false),
+		formatTableGrant(table, schema.RoleGrantee(`ops"; DROP ROLE admin; --`), []schema.Privilege{schema.PrivSelect}, false),
 	)
 	assert.Equal(t,
 		`GRANT SELECT ON TABLE "tenant.data"."select" TO PUBLIC;`,
-		formatTableGrant(table, "PUBLIC", []schema.Privilege{schema.PrivSelect}, false),
+		formatTableGrant(table, schema.PublicGrantee(), []schema.Privilege{schema.PrivSelect}, false),
 	)
 	assert.Equal(t,
 		`GRANT SELECT ON TABLE "tenant.data"."select" TO "public";`,
-		formatTableGrant(table, "public", []schema.Privilege{schema.PrivSelect}, false),
+		formatTableGrant(table, schema.RoleGrantee("public"), []schema.Privilege{schema.PrivSelect}, false),
 	)
 }
 
@@ -95,6 +95,44 @@ func TestDDLRenderingAcceptsExplicitlyQuotedDottedQualifiedName(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Contains(t, ddl, `COLLATE "odd.schema"."select"`)
+}
+
+func TestSequenceRenderingRejectsRawTypeAndIdentityOptionSQL(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewDDLGenerator().GenerateCreateStatement(schema.Sequence{
+		Schema: "public", Name: "ids", Type: `bigint; DROP TABLE public.accounts; --`,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported type")
+
+	_, err = NewDDLGenerator().GenerateCreateStatement(schema.Table{
+		Schema: "public", Name: "accounts",
+		Columns: []schema.Column{{
+			Name: "id", Type: "bigint",
+			Identity: &schema.IdentitySpec{SequenceOptions: []schema.SequenceOption{{
+				Type: `CACHE 1); DROP TABLE public.accounts; --`,
+			}}},
+		}},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported option")
+}
+
+func TestIdentitySequenceMustShareTableSchema(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewDDLGenerator().GenerateCreateStatement(schema.Table{
+		Schema: "tenant", Name: "accounts",
+		Columns: []schema.Column{{
+			Name: "id", Type: "bigint",
+			Identity: &schema.IdentitySpec{SequenceName: &schema.QualifiedName{
+				Schema: "other", Name: "accounts_id_seq",
+			}},
+		}},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be in table schema tenant")
 }
 
 func ptrString(value string) *string { return &value }

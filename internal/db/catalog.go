@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -15,6 +16,24 @@ import (
 // Catalog provides methods to query PostgreSQL catalog tables
 type Catalog struct {
 	pool *Pool
+}
+
+// sequenceDependencyKind records PostgreSQL's typed pg_depend relationship for
+// a column-backed sequence. `a` is the auto dependency used by SERIAL; `i` is
+// the internal dependency used by IDENTITY. Treating them as interchangeable
+// causes identity sequences to be dumped as standalone objects and loses their
+// column options.
+type sequenceDependencyKind string
+
+const (
+	sequenceStandalone sequenceDependencyKind = ""
+	sequenceSerial     sequenceDependencyKind = "serial"
+	sequenceIdentity   sequenceDependencyKind = "identity"
+)
+
+type catalogSequence struct {
+	Sequence       schema.Sequence
+	DependencyKind sequenceDependencyKind
 }
 
 // NewCatalog creates a new catalog querier
@@ -53,8 +72,14 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 	}
 	objects = append(objects, domains...)
 
+	composites, err := c.extractComposites(ctx, schemaFilter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract composite types: %w", err)
+	}
+	objects = append(objects, composites...)
+
 	// Extract sequences
-	sequenceObjs, err := c.extractSequences(ctx, schemaFilter)
+	catalogSequences, err := c.extractSequences(ctx, schemaFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract sequences: %w", err)
 	}
@@ -65,38 +90,23 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 		return nil, fmt.Errorf("failed to extract tables: %w", err)
 	}
 
-	// Normalize tables to convert expanded SERIAL types back to SERIAL
-	// Build sequence slice for normalization
-	var sequences []schema.Sequence
-	for _, obj := range sequenceObjs {
-		if seq, ok := obj.(schema.Sequence); ok {
-			sequences = append(sequences, seq)
-		}
+	// Validate and consume IDENTITY backing sequences. PostgreSQL creates these
+	// implicitly with an internal dependency; they must be represented by their
+	// column, never as a second standalone CREATE SEQUENCE object.
+	identitySequences, err := validateIdentityBackingSequences(tableObjs, catalogSequences)
+	if err != nil {
+		return nil, err
 	}
 
-	// Normalize each table and filter out sequences owned by SERIAL columns
-	var serialSequences = make(map[schema.ObjectKey]bool)
+	// Normalize only exact, metadata-free PostgreSQL SERIAL expansions. Any
+	// noncanonical sequence remains explicit so its name/options/ACL are retained.
+	serialSequences := make(map[schema.ObjectKey]bool)
 	for i, obj := range tableObjs {
 		if tbl, ok := obj.(schema.Table); ok {
-			normalizedTable := NormalizeTable(tbl, sequences)
+			normalizedTable, collapsed := normalizeCatalogTable(tbl, catalogSequences)
 			tableObjs[i] = normalizedTable
-
-			// Mark sequences that are owned by SERIAL columns so we can filter them out
-			for _, col := range normalizedTable.Columns {
-				// If column type is serial/bigserial/smallserial, it has an owned sequence
-				typeLower := strings.ToLower(string(col.Type))
-				if typeLower == "serial" || typeLower == "bigserial" || typeLower == "smallserial" {
-					// Find the sequence owned by this column
-					for _, seq := range sequences {
-						if seq.OwnedBy != nil &&
-							seq.OwnedBy.Schema == normalizedTable.Schema &&
-							seq.OwnedBy.Table == normalizedTable.Name &&
-							seq.OwnedBy.Column == col.Name {
-							key := objectmap.Key(seq)
-							serialSequences[key] = true
-						}
-					}
-				}
+			for key := range collapsed {
+				serialSequences[key] = true
 			}
 		}
 	}
@@ -104,14 +114,15 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 	// Add tables to objects
 	objects = append(objects, tableObjs...)
 
-	// Add only non-SERIAL sequences to objects (filter out auto-generated sequences)
-	for _, obj := range sequenceObjs {
-		if seq, ok := obj.(schema.Sequence); ok {
-			key := objectmap.Key(seq)
-			if !serialSequences[key] {
-				objects = append(objects, seq)
-			}
+	// Add standalone and noncanonical SERIAL sequences. IDENTITY sequences are
+	// already represented by their owning column and exact sequence name/options.
+	for _, catalogSeq := range catalogSequences {
+		seq := catalogSeq.Sequence
+		key := objectmap.Key(seq)
+		if identitySequences[key] || serialSequences[key] {
+			continue
 		}
+		objects = append(objects, seq)
 	}
 
 	// Extract indexes (excluding implicit indexes for PK/UNIQUE)
@@ -230,13 +241,15 @@ func (c *Catalog) extractEnums(ctx context.Context, schemaFilter string) ([]sche
 		SELECT
 			n.nspname as schema,
 			t.typname as name,
+			t.oid,
+			pg_get_userbyid(t.typowner) as owner,
 			array_agg(e.enumlabel ORDER BY e.enumsortorder) as values,
 			obj_description(t.oid, 'pg_type') as comment
 		FROM pg_type t
 		JOIN pg_namespace n ON t.typnamespace = n.oid
 		JOIN pg_enum e ON t.oid = e.enumtypid
 		WHERE t.typtype = 'e' AND %s
-		GROUP BY n.nspname, t.typname, t.oid
+		GROUP BY n.nspname, t.typname, t.oid, t.typowner
 		ORDER BY n.nspname, t.typname
 	`, schemaFilter)
 
@@ -250,11 +263,19 @@ func (c *Catalog) extractEnums(ctx context.Context, schemaFilter string) ([]sche
 	for rows.Next() {
 		var enum schema.EnumDef
 		var comment *string
+		var oid uint32
+		var owner *string
 
-		if err := rows.Scan(&enum.Schema, &enum.Name, &enum.Values, &comment); err != nil {
+		if err := rows.Scan(&enum.Schema, &enum.Name, &oid, &owner, &enum.Values, &comment); err != nil {
 			return nil, err
 		}
+		enum.Owner = owner
 		enum.Comment = comment
+		grants, err := c.extractTypeACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for enum %s.%s: %w", enum.Schema, enum.Name, err)
+		}
+		enum.Grants = grants
 
 		objects = append(objects, enum)
 	}
@@ -264,15 +285,21 @@ func (c *Catalog) extractEnums(ctx context.Context, schemaFilter string) ([]sche
 
 func (c *Catalog) extractDomains(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
 	query := fmt.Sprintf(`
+		WITH canonical_search_path AS MATERIALIZED (
+			SELECT set_config('search_path', 'pg_catalog, public', true)
+		)
 		SELECT
 			n.nspname as schema,
 			t.typname as name,
+			t.oid,
+			pg_get_userbyid(t.typowner) as owner,
 			format_type(t.typbasetype, t.typtypmod) as base_type,
 			t.typnotnull as not_null,
 			pg_get_expr(t.typdefaultbin, t.typrelid) as default_expr,
 			pg_get_expr(c.conbin, c.conrelid) as check_expr,
 			obj_description(t.oid, 'pg_type') as comment
 		FROM pg_type t
+		CROSS JOIN canonical_search_path
 		JOIN pg_namespace n ON t.typnamespace = n.oid
 		LEFT JOIN pg_constraint c ON t.oid = c.contypid
 		WHERE t.typtype = 'd' AND %s
@@ -289,10 +316,13 @@ func (c *Catalog) extractDomains(ctx context.Context, schemaFilter string) ([]sc
 	for rows.Next() {
 		var domain schema.DomainDef
 		var defaultExpr, checkExpr, comment *string
+		var oid uint32
+		var owner *string
 
-		if err := rows.Scan(&domain.Schema, &domain.Name, &domain.BaseType, &domain.NotNull, &defaultExpr, &checkExpr, &comment); err != nil {
+		if err := rows.Scan(&domain.Schema, &domain.Name, &oid, &owner, &domain.BaseType, &domain.NotNull, &defaultExpr, &checkExpr, &comment); err != nil {
 			return nil, err
 		}
+		domain.Owner = owner
 
 		if defaultExpr != nil {
 			expr := schema.Expr(*defaultExpr)
@@ -303,6 +333,11 @@ func (c *Catalog) extractDomains(ctx context.Context, schemaFilter string) ([]sc
 			domain.Check = &expr
 		}
 		domain.Comment = comment
+		grants, err := c.extractTypeACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for domain %s.%s: %w", domain.Schema, domain.Name, err)
+		}
+		domain.Grants = grants
 
 		objects = append(objects, domain)
 	}
@@ -310,27 +345,103 @@ func (c *Catalog) extractDomains(ctx context.Context, schemaFilter string) ([]sc
 	return objects, rows.Err()
 }
 
-func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
+func (c *Catalog) extractComposites(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
 	query := fmt.Sprintf(`
+		WITH canonical_search_path AS MATERIALIZED (
+			SELECT set_config('search_path', 'pg_catalog, public', true)
+		)
+		SELECT
+			n.nspname,
+			t.typname,
+			t.oid,
+			pg_get_userbyid(t.typowner),
+			obj_description(t.oid, 'pg_type'),
+			COALESCE(array_agg(a.attname::text ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL), ARRAY[]::text[]),
+			COALESCE(array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL), ARRAY[]::text[]),
+			COALESCE(bool_or(a.attcollation <> attribute_type.typcollation) FILTER (WHERE a.attnum IS NOT NULL), false)
+		FROM pg_type t
+		CROSS JOIN canonical_search_path
+		JOIN pg_namespace n ON n.oid = t.typnamespace
+		JOIN pg_class relation ON relation.oid = t.typrelid AND relation.relkind = 'c'
+		LEFT JOIN pg_attribute a ON a.attrelid = relation.oid AND a.attnum > 0 AND NOT a.attisdropped
+		LEFT JOIN pg_type attribute_type ON attribute_type.oid = a.atttypid
+		WHERE t.typtype = 'c' AND %s
+		GROUP BY n.nspname, t.typname, t.oid, t.typowner
+		ORDER BY n.nspname, t.typname
+	`, schemaFilter)
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var objects []schema.DatabaseObject
+	for rows.Next() {
+		var composite schema.CompositeDef
+		var oid uint32
+		var owner, comment *string
+		var names, types []string
+		var hasNondefaultCollation bool
+		if err := rows.Scan(&composite.Schema, &composite.Name, &oid, &owner, &comment, &names, &types, &hasNondefaultCollation); err != nil {
+			return nil, err
+		}
+		if hasNondefaultCollation {
+			return nil, fmt.Errorf("composite %s.%s has an attribute with non-default collation, which is not modeled", composite.Schema, composite.Name)
+		}
+		if len(names) != len(types) {
+			return nil, fmt.Errorf("composite %s.%s returned %d names and %d types", composite.Schema, composite.Name, len(names), len(types))
+		}
+		composite.Owner = owner
+		composite.Comment = comment
+		composite.Attributes = make([]schema.CompositeAttr, len(names))
+		for i := range names {
+			composite.Attributes[i] = schema.CompositeAttr{Name: names[i], Type: schema.TypeName(types[i])}
+		}
+		grants, err := c.extractTypeACL(ctx, oid)
+		if err != nil {
+			return nil, fmt.Errorf("acl for composite %s.%s: %w", composite.Schema, composite.Name, err)
+		}
+		composite.Grants = grants
+		objects = append(objects, composite)
+	}
+	return objects, rows.Err()
+}
+
+func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]catalogSequence, error) {
+	query := fmt.Sprintf(`
+		WITH canonical_search_path AS MATERIALIZED (
+			SELECT set_config('search_path', 'pg_catalog, public', true)
+		)
 		SELECT
 			n.nspname as schema,
 			c.relname as name,
 			c.oid,
 			pg_get_userbyid(c.relowner) as owner,
+			obj_description(c.oid, 'pg_class') as comment,
+			c.relpersistence::text,
 			s.seqtypid::regtype::text as type,
 			s.seqstart as start_value,
 			s.seqincrement as increment,
 			s.seqmin as min_value,
 			s.seqmax as max_value,
-			s.seqcache as cache_size,
-			s.seqcycle as cycle,
-			tn.nspname as owned_by_schema,
+				s.seqcache as cache_size,
+				s.seqcycle as cycle,
+				d.deptype::text as dependency_type,
+				tn.nspname as owned_by_schema,
 			tc.relname as owned_by_table,
 			a.attname as owned_by_column
 		FROM pg_sequence s
+		CROSS JOIN canonical_search_path
 		JOIN pg_class c ON s.seqrelid = c.oid
 		JOIN pg_namespace n ON c.relnamespace = n.oid
-		LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype = 'a'
+			LEFT JOIN pg_depend d
+				ON d.classid = 'pg_class'::regclass
+				AND d.objid = c.oid
+				AND d.objsubid = 0
+				AND d.refclassid = 'pg_class'::regclass
+				AND d.refobjsubid > 0
+				AND d.deptype IN ('a', 'i')
 		LEFT JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
 		LEFT JOIN pg_class tc ON tc.oid = d.refobjid
 		LEFT JOIN pg_namespace tn ON tc.relnamespace = tn.oid
@@ -344,22 +455,48 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 	}
 	defer rows.Close()
 
-	var objects []schema.DatabaseObject
+	var sequences []catalogSequence
 	for rows.Next() {
 		var seq schema.Sequence
-		var ownedBySchema, ownedByTable, ownedByColumn *string
+		var dependencyType, ownedBySchema, ownedByTable, ownedByColumn *string
 		var oid uint32
 		var owner *string
+		var comment *string
+		var persistence string
 
-		if err := rows.Scan(&seq.Schema, &seq.Name, &oid, &owner, &seq.Type, &seq.Start, &seq.Increment,
+		if err := rows.Scan(&seq.Schema, &seq.Name, &oid, &owner, &comment, &persistence, &seq.Type, &seq.Start, &seq.Increment,
 			&seq.MinValue, &seq.MaxValue, &seq.Cache, &seq.Cycle,
-			&ownedBySchema, &ownedByTable, &ownedByColumn); err != nil {
+			&dependencyType, &ownedBySchema, &ownedByTable, &ownedByColumn); err != nil {
 			return nil, err
+		}
+		if persistence != "p" {
+			return nil, fmt.Errorf("sequence %s.%s has unsupported persistence %q", seq.Schema, seq.Name, persistence)
 		}
 
 		seq.Owner = owner
+		seq.Comment = comment
 
-		if ownedBySchema != nil && ownedByTable != nil && ownedByColumn != nil {
+		dependencyKind := sequenceStandalone
+		if dependencyType != nil {
+			switch *dependencyType {
+			case "a":
+				dependencyKind = sequenceSerial
+			case "i":
+				dependencyKind = sequenceIdentity
+			default:
+				return nil, fmt.Errorf("sequence %s.%s has unsupported column dependency type %q", seq.Schema, seq.Name, *dependencyType)
+			}
+		}
+
+		hasAnyOwnerPart := ownedBySchema != nil || ownedByTable != nil || ownedByColumn != nil
+		hasAllOwnerParts := ownedBySchema != nil && ownedByTable != nil && ownedByColumn != nil
+		if dependencyKind == sequenceStandalone && hasAnyOwnerPart {
+			return nil, fmt.Errorf("standalone sequence %s.%s unexpectedly has partial column ownership metadata", seq.Schema, seq.Name)
+		}
+		if dependencyKind != sequenceStandalone && !hasAllOwnerParts {
+			return nil, fmt.Errorf("column-backed sequence %s.%s has incomplete ownership metadata", seq.Schema, seq.Name)
+		}
+		if hasAllOwnerParts {
 			seq.OwnedBy = &schema.SequenceOwner{
 				Schema: schema.SchemaName(*ownedBySchema),
 				Table:  schema.TableName(*ownedByTable),
@@ -373,10 +510,74 @@ func (c *Catalog) extractSequences(ctx context.Context, schemaFilter string) ([]
 		}
 		seq.Grants = grants
 
-		objects = append(objects, seq)
+		sequences = append(sequences, catalogSequence{Sequence: seq, DependencyKind: dependencyKind})
 	}
 
-	return objects, rows.Err()
+	return sequences, rows.Err()
+}
+
+func validateIdentityBackingSequences(tableObjects []schema.DatabaseObject, sequences []catalogSequence) (map[schema.ObjectKey]bool, error) {
+	byKey := make(map[schema.ObjectKey]catalogSequence, len(sequences))
+	for _, catalogSeq := range sequences {
+		seq := catalogSeq.Sequence
+		key := schema.ObjectKey{Kind: schema.SequenceKind, Schema: seq.Schema, Name: seq.Name}
+		if _, duplicate := byKey[key]; duplicate {
+			return nil, fmt.Errorf("catalog returned duplicate sequence identity %v", key)
+		}
+		byKey[key] = catalogSeq
+	}
+
+	consumed := make(map[schema.ObjectKey]bool)
+	for _, object := range tableObjects {
+		table, ok := object.(schema.Table)
+		if !ok {
+			continue
+		}
+		for _, column := range table.Columns {
+			if column.Identity == nil {
+				continue
+			}
+			if column.Identity.SequenceName == nil {
+				return nil, fmt.Errorf("identity column %s.%s.%s has no modeled backing-sequence name", table.Schema, table.Name, column.Name)
+			}
+			sequenceName := column.Identity.SequenceName
+			key := schema.ObjectKey{Kind: schema.SequenceKind, Schema: sequenceName.Schema, Name: sequenceName.Name}
+			catalogSeq, exists := byKey[key]
+			if !exists {
+				return nil, fmt.Errorf("identity column %s.%s.%s references backing sequence %s.%s outside the extracted object set", table.Schema, table.Name, column.Name, sequenceName.Schema, sequenceName.Name)
+			}
+			if catalogSeq.DependencyKind != sequenceIdentity || catalogSeq.Sequence.OwnedBy == nil {
+				return nil, fmt.Errorf("identity column %s.%s.%s backing sequence %s.%s is not classified as an internal identity dependency", table.Schema, table.Name, column.Name, sequenceName.Schema, sequenceName.Name)
+			}
+			owner := catalogSeq.Sequence.OwnedBy
+			if owner.Schema != table.Schema || owner.Table != table.Name || owner.Column != column.Name {
+				return nil, fmt.Errorf("identity sequence %s.%s is linked to %s.%s.%s, expected %s.%s.%s", catalogSeq.Sequence.Schema, catalogSeq.Sequence.Name, owner.Schema, owner.Table, owner.Column, table.Schema, table.Name, column.Name)
+			}
+			if table.Owner == nil || catalogSeq.Sequence.Owner == nil || *table.Owner != *catalogSeq.Sequence.Owner {
+				return nil, fmt.Errorf("identity sequence %s.%s owner does not match owning table %s.%s", catalogSeq.Sequence.Schema, catalogSeq.Sequence.Name, table.Schema, table.Name)
+			}
+			if schema.NormalizeTypeName(schema.TypeName(catalogSeq.Sequence.Type)) != schema.NormalizeTypeName(column.Type) {
+				return nil, fmt.Errorf("identity sequence %s.%s type %q does not match column %s.%s.%s type %q", catalogSeq.Sequence.Schema, catalogSeq.Sequence.Name, catalogSeq.Sequence.Type, table.Schema, table.Name, column.Name, column.Type)
+			}
+			if catalogSeq.Sequence.Comment != nil || !hasDefaultSequenceACL(catalogSeq.Sequence) {
+				return nil, fmt.Errorf("identity sequence %s.%s has a comment or non-default ACL that the identity-column model cannot preserve; remove that metadata or use an explicit migration", catalogSeq.Sequence.Schema, catalogSeq.Sequence.Name)
+			}
+			consumed[key] = true
+		}
+	}
+
+	for _, catalogSeq := range sequences {
+		if catalogSeq.DependencyKind != sequenceIdentity {
+			continue
+		}
+		seq := catalogSeq.Sequence
+		key := schema.ObjectKey{Kind: schema.SequenceKind, Schema: seq.Schema, Name: seq.Name}
+		if !consumed[key] {
+			return nil, fmt.Errorf("identity sequence %s.%s has no owning identity column in the extracted object set", seq.Schema, seq.Name)
+		}
+	}
+
+	return consumed, nil
 }
 
 func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
@@ -386,6 +587,7 @@ func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]sch
 			n.nspname as schema,
 			c.relname as table_name,
 			c.oid,
+			c.relpersistence::text,
 			pg_get_userbyid(c.relowner) as owner,
 			c.reloptions,
 			obj_description(c.oid, 'pg_class') as comment
@@ -405,11 +607,15 @@ func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]sch
 	for rows.Next() {
 		var tbl schema.Table
 		var relOptions []string
+		var persistence string
 		var owner, comment *string
 		var oid uint32
 
-		if err := rows.Scan(&tbl.Schema, &tbl.Name, &oid, &owner, &relOptions, &comment); err != nil {
+		if err := rows.Scan(&tbl.Schema, &tbl.Name, &oid, &persistence, &owner, &relOptions, &comment); err != nil {
 			return nil, err
+		}
+		if persistence != "p" {
+			return nil, fmt.Errorf("table %s.%s has unsupported persistence %q; temporary and unlogged tables are not modeled", tbl.Schema, tbl.Name, persistence)
 		}
 
 		tbl.Owner = owner
@@ -458,6 +664,9 @@ func (c *Catalog) extractTables(ctx context.Context, schemaFilter string) ([]sch
 
 func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaName, tableName schema.TableName) ([]schema.Column, error) {
 	query := `
+	WITH canonical_search_path AS MATERIALIZED (
+		SELECT set_config('search_path', 'pg_catalog, public', true)
+	)
     SELECT
         a.attname as column_name,
         format_type(a.atttypid, a.atttypmod) as column_type,
@@ -468,12 +677,17 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
         seq.seqstart,
         seq.seqincrement,
         seq.seqmin,
-        seq.seqmax,
-        seq.seqcache,
-        seq.seqcycle,
-        col.collname as collation,
-        col_description(a.attrelid, a.attnum) as comment
+			seq.seqmax,
+			seq.seqcache,
+			seq.seqcycle,
+			seq.sequence_schema,
+			seq.sequence_name,
+			seq.dependency_type,
+			col.collname as collation,
+		col_description(a.attrelid, a.attnum) as comment,
+		a.attacl IS NOT NULL AS has_column_acl
 		FROM pg_attribute a
+		CROSS JOIN canonical_search_path
 		JOIN pg_class c ON a.attrelid = c.oid
 		JOIN pg_namespace n ON c.relnamespace = n.oid
     LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
@@ -482,14 +696,19 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
             s.seqstart,
             s.seqincrement,
             s.seqmin,
-            s.seqmax,
-            s.seqcache,
-            s.seqcycle
-        FROM pg_depend d
-        JOIN pg_class seq_class ON d.objid = seq_class.oid AND d.deptype = 'a'
-        JOIN pg_sequence s ON s.seqrelid = seq_class.oid
-        WHERE d.classid = 'pg_class'::regclass
-          AND d.refclassid = 'pg_class'::regclass
+	            s.seqmax,
+	            s.seqcache,
+	            s.seqcycle,
+	            seq_namespace.nspname AS sequence_schema,
+	            seq_class.relname AS sequence_name,
+	            d.deptype::text AS dependency_type
+	        FROM pg_depend d
+	        JOIN pg_class seq_class ON d.objid = seq_class.oid AND d.deptype IN ('a', 'i')
+	        JOIN pg_namespace seq_namespace ON seq_namespace.oid = seq_class.relnamespace
+	        JOIN pg_sequence s ON s.seqrelid = seq_class.oid
+	        WHERE d.classid = 'pg_class'::regclass
+	          AND d.objsubid = 0
+	          AND d.refclassid = 'pg_class'::regclass
           AND d.refobjid = c.oid
           AND d.refobjsubid = a.attnum
         LIMIT 1
@@ -511,14 +730,19 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
 	var columns []schema.Column
 	for rows.Next() {
 		var col schema.Column
-		var defaultExpr, generated, identity, collation, comment *string
+		var defaultExpr, generated, identity, sequenceSchema, sequenceName, dependencyType, collation, comment *string
 		var seqStart, seqIncrement, seqMin, seqMax, seqCache sql.NullInt64
 		var seqCycle sql.NullBool
+		var hasColumnACL bool
 
 		if err := rows.Scan(&col.Name, &col.Type, &col.NotNull, &defaultExpr, &generated, &identity,
 			&seqStart, &seqIncrement, &seqMin, &seqMax, &seqCache, &seqCycle,
-			&collation, &comment); err != nil {
+			&sequenceSchema, &sequenceName, &dependencyType,
+			&collation, &comment, &hasColumnACL); err != nil {
 			return nil, err
+		}
+		if hasColumnACL {
+			return nil, fmt.Errorf("column-level ACL on %s.%s.%s is not modeled; use object-level grants or an explicit migration", schemaName, tableName, col.Name)
 		}
 
 		if generated != nil && len(*generated) > 0 {
@@ -539,9 +763,13 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
 		}
 
 		if identity != nil && len(*identity) > 0 {
+			if dependencyType == nil || *dependencyType != "i" || sequenceSchema == nil || sequenceName == nil {
+				return nil, fmt.Errorf("identity column %s.%s.%s has no complete internal backing-sequence dependency", schemaName, tableName, col.Name)
+			}
 			// 'a' = ALWAYS, 'd' = BY DEFAULT
 			spec := &schema.IdentitySpec{
-				Always: (*identity)[0] == 'a',
+				Always:       (*identity)[0] == 'a',
+				SequenceName: &schema.QualifiedName{Schema: schema.SchemaName(*sequenceSchema), Name: *sequenceName},
 			}
 
 			var startPtr, incrementPtr, minPtr, maxPtr, cachePtr *int64
@@ -574,6 +802,8 @@ func (c *Catalog) extractColumns(ctx context.Context, schemaName schema.SchemaNa
 
 			spec.SequenceOptions = schema.IdentityOptionsFromParameters(col.Type, startPtr, incrementPtr, minPtr, maxPtr, cachePtr, cyclePtr)
 			col.Identity = spec
+		} else if dependencyType != nil && *dependencyType == "i" {
+			return nil, fmt.Errorf("column %s.%s.%s has an identity backing sequence but is not marked as an identity column", schemaName, tableName, col.Name)
 		}
 
 		// Normalize default collation to nil
@@ -987,6 +1217,9 @@ func deparseExpr(node *pg_query.Node) string {
 
 func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
 	query := fmt.Sprintf(`
+		WITH canonical_search_path AS MATERIALIZED (
+			SELECT set_config('search_path', 'pg_catalog, public', true)
+		)
 		SELECT
 			n.nspname as schema,
 			c.relname as name,
@@ -994,9 +1227,16 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 			pg_get_userbyid(c.relowner) as owner,
 			c.relkind = 'm' as is_materialized,
 			pg_get_viewdef(c.oid, true) as definition,
-			obj_description(c.oid, 'pg_class') as comment
+			obj_description(c.oid, 'pg_class') as comment,
+			c.reloptions,
+			c.reltablespace,
+			COALESCE(am.amname, ''),
+			c.relispopulated,
+			c.relpersistence::text
 		FROM pg_class c
+		CROSS JOIN canonical_search_path
 		JOIN pg_namespace n ON c.relnamespace = n.oid
+		LEFT JOIN pg_am am ON am.oid = c.relam
 		WHERE c.relkind IN ('v', 'm') AND %s
 		ORDER BY n.nspname, c.relname
 	`, schemaFilter)
@@ -1014,8 +1254,24 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 		var isMaterialized bool
 		var definition string
 		var oid uint32
+		var relOptions []string
+		var tablespaceOID uint32
+		var accessMethod, persistence string
+		var populated bool
 
-		if err := rows.Scan(&view.Schema, &view.Name, &oid, &owner, &isMaterialized, &definition, &comment); err != nil {
+		if err := rows.Scan(&view.Schema, &view.Name, &oid, &owner, &isMaterialized, &definition, &comment, &relOptions, &tablespaceOID, &accessMethod, &populated, &persistence); err != nil {
+			return nil, err
+		}
+		if persistence != "p" {
+			return nil, fmt.Errorf("view %s.%s has unsupported persistence %q", view.Schema, view.Name, persistence)
+		}
+		if len(relOptions) > 0 {
+			return nil, fmt.Errorf("view %s.%s has storage or view options that are not modeled", view.Schema, view.Name)
+		}
+		if isMaterialized && (tablespaceOID != 0 || accessMethod != "heap" || !populated) {
+			return nil, fmt.Errorf("materialized view %s.%s uses a tablespace, non-heap access method, or unpopulated state that is not modeled", view.Schema, view.Name)
+		}
+		if err := c.validateViewColumnMetadata(ctx, oid, view.Schema, view.Name, isMaterialized); err != nil {
 			return nil, err
 		}
 
@@ -1041,6 +1297,81 @@ func (c *Catalog) extractViews(ctx context.Context, schemaFilter string) ([]sche
 	}
 
 	return objects, rows.Err()
+}
+
+// validateViewColumnMetadata rejects pg_attribute state that schema.View
+// cannot represent. PostgreSQL permits column ACLs and comments on both view
+// kinds, defaults on regular views, and physical column tuning on materialized
+// views. Silently omitting any of it would make a dump lossy.
+func (c *Catalog) validateViewColumnMetadata(ctx context.Context, oid uint32, schemaName schema.SchemaName, viewName string, materialized bool) error {
+	query := `
+		SELECT
+			a.attname,
+			a.attacl IS NOT NULL AS has_acl,
+			col_description(a.attrelid, a.attnum) IS NOT NULL AS has_comment,
+			ad.oid IS NOT NULL AS has_default,
+			a.attstattarget <> -1 AS has_statistics_target,
+			a.attstorage <> t.typstorage AS has_nondefault_storage,
+			a.attcompression::text <> '' AS has_compression,
+			a.attoptions IS NOT NULL AS has_options,
+			a.attfdwoptions IS NOT NULL AS has_fdw_options
+		FROM pg_attribute a
+		JOIN pg_type t ON t.oid = a.atttypid
+		LEFT JOIN pg_attrdef ad
+			ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+		WHERE a.attrelid = $1
+		  AND a.attnum > 0
+		  AND NOT a.attisdropped
+		ORDER BY a.attnum
+	`
+	rows, err := c.pool.Query(ctx, query, oid)
+	if err != nil {
+		return fmt.Errorf("inspect view column metadata for %s.%s: %w", schemaName, viewName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var column string
+		var hasACL, hasComment, hasDefault bool
+		var hasStatistics, hasStorage, hasCompression, hasOptions, hasFDWOptions bool
+		if err := rows.Scan(
+			&column,
+			&hasACL,
+			&hasComment,
+			&hasDefault,
+			&hasStatistics,
+			&hasStorage,
+			&hasCompression,
+			&hasOptions,
+			&hasFDWOptions,
+		); err != nil {
+			return fmt.Errorf("inspect view column metadata for %s.%s: %w", schemaName, viewName, err)
+		}
+
+		identity := fmt.Sprintf("%s.%s.%s", schemaName, viewName, column)
+		switch {
+		case hasACL:
+			return fmt.Errorf("view column %s has a column-level ACL, which is not modeled", identity)
+		case hasComment:
+			return fmt.Errorf("view column %s has a comment, which is not modeled", identity)
+		case hasDefault:
+			return fmt.Errorf("view column %s has a default, which is not modeled", identity)
+		case materialized && hasStatistics:
+			return fmt.Errorf("materialized view column %s has a statistics target, which is not modeled", identity)
+		case materialized && hasStorage:
+			return fmt.Errorf("materialized view column %s has non-default storage, which is not modeled", identity)
+		case materialized && hasCompression:
+			return fmt.Errorf("materialized view column %s has compression metadata, which is not modeled", identity)
+		case materialized && hasOptions:
+			return fmt.Errorf("materialized view column %s has attribute options, which are not modeled", identity)
+		case materialized && hasFDWOptions:
+			return fmt.Errorf("materialized view column %s has FDW options, which are not modeled", identity)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect view column metadata for %s.%s: %w", schemaName, viewName, err)
+	}
+	return nil
 }
 
 // extractFunctionBody extracts the function body from pg_get_functiondef() output
@@ -1079,19 +1410,39 @@ func extractFunctionBody(fullDef string) (string, error) {
 		}
 
 		if strings.ToLower(defElem.DefElem.Defname) == "as" {
-			// Function body can be a single string or a list of strings
-			// This matches the parser logic in internal/parser/objects.go:238-246
-			if body := extractStringValue(defElem.DefElem.Arg); body != "" {
-				return strings.TrimSpace(body), nil
-			} else if bodyParts := extractListValues(defElem.DefElem.Arg); len(bodyParts) > 0 {
-				// PL/pgSQL functions often have body as a list of strings
-				return strings.TrimSpace(strings.Join(bodyParts, "\n")), nil
+			body, err := extractSingleFunctionBody(defElem.DefElem.Arg)
+			if err != nil {
+				return "", err
 			}
-			return "", fmt.Errorf("CREATE FUNCTION AS option did not contain a body")
+			return strings.TrimSpace(body), nil
 		}
 	}
 
 	return "", fmt.Errorf("CREATE FUNCTION definition did not contain an AS body")
+}
+
+func extractSingleFunctionBody(node *pg_query.Node) (string, error) {
+	if node == nil {
+		return "", fmt.Errorf("CREATE FUNCTION AS option did not contain a body")
+	}
+	switch value := node.Node.(type) {
+	case *pg_query.Node_String_:
+		if value.String_ == nil {
+			return "", fmt.Errorf("CREATE FUNCTION AS option contained an empty string node")
+		}
+		return value.String_.Sval, nil
+	case *pg_query.Node_List:
+		if value.List == nil || len(value.List.Items) != 1 {
+			return "", fmt.Errorf("multi-part AS bodies used by C/internal functions are not modeled")
+		}
+		item, ok := value.List.Items[0].Node.(*pg_query.Node_String_)
+		if !ok || item.String_ == nil {
+			return "", fmt.Errorf("CREATE FUNCTION AS body has an unsupported AST node")
+		}
+		return item.String_.Sval, nil
+	default:
+		return "", fmt.Errorf("CREATE FUNCTION AS body has an unsupported AST node %T", node.Node)
+	}
 }
 
 // extractStringValue extracts a string from a pg_query Node (helper for AST traversal)
@@ -1124,21 +1475,46 @@ func extractListValues(node *pg_query.Node) []string {
 
 func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
 	query := fmt.Sprintf(`
+		WITH canonical_search_path AS MATERIALIZED (
+			SELECT set_config('search_path', 'pg_catalog, public', true)
+		)
 		SELECT
 			n.nspname as schema,
 			p.proname as name,
 			p.oid,
+			p.prokind::text,
 			pg_get_userbyid(p.proowner) as owner,
-			pg_get_function_identity_arguments(p.oid) as args,
-			pg_get_function_result(p.oid) as returns,
+			COALESCE((
+				SELECT jsonb_agg(
+					jsonb_build_object(
+						'mode', COALESCE(p.proargmodes[arg.ordinality]::text, 'i'),
+						'name', NULLIF(p.proargnames[arg.ordinality], ''),
+						'type', pg_catalog.format_type(arg.type_oid, NULL)
+					)
+					ORDER BY arg.ordinality
+				)::text
+				FROM unnest(COALESCE(p.proallargtypes, p.proargtypes::oid[]))
+					WITH ORDINALITY AS arg(type_oid, ordinality)
+			), '[]') as args,
+			COALESCE(pg_get_expr(p.proargdefaults, 0), '') as argument_defaults,
+			p.pronargdefaults,
+			pg_catalog.format_type(p.prorettype, NULL) as returns,
+			p.proretset,
 			l.lanname as language,
 			p.provolatile::text as volatility,
 			p.proisstrict as is_strict,
 			p.prosecdef as security_definer,
 			p.proparallel::text as parallel,
+			p.proleakproof,
+			p.procost,
+			p.prorows,
+			p.prosupport::oid <> 0::oid as has_support,
+			COALESCE(cardinality(p.protrftypes::oid[]), 0) > 0 as has_transforms,
+			COALESCE(to_json(p.proconfig)::text, 'null') as config,
 			pg_get_functiondef(p.oid) as source,
 			obj_description(p.oid, 'pg_proc') as comment
 		FROM pg_proc p
+		CROSS JOIN canonical_search_path
 		JOIN pg_namespace n ON p.pronamespace = n.oid
 		JOIN pg_language l ON p.prolang = l.oid
 		LEFT JOIN pg_depend d
@@ -1146,7 +1522,7 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			AND d.objid = p.oid
 			AND d.refclassid = 'pg_extension'::regclass
 			AND d.deptype = 'e'
-		WHERE %s AND p.prokind = 'f' AND d.objid IS NULL
+		WHERE %s AND p.prokind IN ('f', 'w') AND d.objid IS NULL
 		ORDER BY n.nspname, p.proname
 	`, schemaFilter)
 
@@ -1159,24 +1535,59 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 	var objects []schema.DatabaseObject
 	for rows.Next() {
 		fn := schema.Function{
-			Args:       []schema.FunctionArg{},
-			SearchPath: []schema.SchemaName{},
+			Args: []schema.FunctionArg{},
 		}
-		var args, returns, language, volatility, parallel, source string
-		var isStrict, securityDefiner bool
+		var argsJSON, argumentDefaults string
+		var defaultCount int
+		var routineKind, returns, language, volatility, parallel, configJSON, source string
+		var cost, rowsEstimate float32
+		var isStrict, securityDefiner, returnsSet, leakproof, hasSupport, hasTransforms bool
 		var comment *string
 		var oid uint32
 		var owner *string
 
-		if err := rows.Scan(&fn.Schema, &fn.Name, &oid, &owner, &args, &returns, &language, &volatility, &isStrict, &securityDefiner, &parallel, &source, &comment); err != nil {
+		if err := rows.Scan(
+			&fn.Schema,
+			&fn.Name,
+			&oid,
+			&routineKind,
+			&owner,
+			&argsJSON,
+			&argumentDefaults,
+			&defaultCount,
+			&returns,
+			&returnsSet,
+			&language,
+			&volatility,
+			&isStrict,
+			&securityDefiner,
+			&parallel,
+			&leakproof,
+			&cost,
+			&rowsEstimate,
+			&hasSupport,
+			&hasTransforms,
+			&configJSON,
+			&source,
+			&comment,
+		); err != nil {
 			return nil, err
+		}
+		if routineKind != "f" {
+			return nil, fmt.Errorf("window function %s.%s is not modeled", fn.Schema, fn.Name)
+		}
+		if err := validateCatalogFunctionAttributes(language, returnsSet, leakproof, cost, rowsEstimate, hasSupport, hasTransforms); err != nil {
+			return nil, fmt.Errorf("unsupported attributes on function %s.%s: %w", fn.Schema, fn.Name, err)
 		}
 
 		fn.Owner = owner
 
-		parsedArgs, err := parseFunctionIdentityArguments(args)
+		parsedArgs, err := parseCatalogFunctionArguments(argsJSON)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse function %s.%s identity args %q: %w", fn.Schema, fn.Name, args, err)
+			return nil, fmt.Errorf("failed to decode function %s.%s arguments: %w", fn.Schema, fn.Name, err)
+		}
+		if err := attachFunctionArgumentDefaults(parsedArgs, argumentDefaults, defaultCount); err != nil {
+			return nil, fmt.Errorf("failed to decode function %s.%s argument defaults: %w", fn.Schema, fn.Name, err)
 		}
 		fn.Args = parsedArgs
 
@@ -1192,6 +1603,10 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			return nil, fmt.Errorf("failed to extract function %s.%s body: %w", fn.Schema, fn.Name, err)
 		}
 		fn.Comment = comment
+		fn.SearchPath, err = parseFunctionConfig(configJSON)
+		if err != nil {
+			return nil, fmt.Errorf("unsupported configuration on function %s.%s: %w", fn.Schema, fn.Name, err)
+		}
 
 		// Parse volatility
 		switch volatility {
@@ -1213,9 +1628,9 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 			fn.Parallel = schema.ParallelUnsafe
 		}
 
-		parsedReturn, err := parseFunctionReturn(returns)
+		parsedReturn, err := functionReturnFromCatalog(fn.Args, returns, returnsSet)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse function %s.%s return %q: %w", fn.Schema, fn.Name, returns, err)
+			return nil, fmt.Errorf("failed to decode function %s.%s return type %q: %w", fn.Schema, fn.Name, returns, err)
 		}
 		fn.Returns = parsedReturn
 
@@ -1231,153 +1646,240 @@ func (c *Catalog) extractFunctions(ctx context.Context, schemaFilter string) ([]
 	return objects, rows.Err()
 }
 
-func parseFunctionIdentityArguments(args string) ([]schema.FunctionArg, error) {
-	args = strings.TrimSpace(args)
-	if args == "" {
-		return nil, nil
+func validateCatalogFunctionAttributes(language string, returnsSet, leakproof bool, cost, rowsEstimate float32, hasSupport, hasTransforms bool) error {
+	if leakproof {
+		return fmt.Errorf("LEAKPROOF is not modeled")
+	}
+	defaultCost := float32(100)
+	if strings.EqualFold(language, "c") || strings.EqualFold(language, "internal") {
+		defaultCost = 1
+	}
+	if cost != defaultCost {
+		return fmt.Errorf("non-default COST %v is not modeled", cost)
+	}
+	defaultRows := float32(0)
+	if returnsSet {
+		defaultRows = 1000
+	}
+	if rowsEstimate != defaultRows {
+		return fmt.Errorf("non-default ROWS %v is not modeled", rowsEstimate)
+	}
+	if hasSupport {
+		return fmt.Errorf("SUPPORT functions are not modeled")
+	}
+	if hasTransforms {
+		return fmt.Errorf("TRANSFORM clauses are not modeled")
+	}
+	return nil
+}
+
+type catalogFunctionArgument struct {
+	Mode string  `json:"mode"`
+	Name *string `json:"name"`
+	Type string  `json:"type"`
+}
+
+func parseCatalogFunctionArguments(encoded string) ([]schema.FunctionArg, error) {
+	var catalogArgs []catalogFunctionArgument
+	if err := json.Unmarshal([]byte(encoded), &catalogArgs); err != nil {
+		return nil, fmt.Errorf("invalid argument metadata JSON: %w", err)
 	}
 
-	parts := splitTopLevelComma(args)
-	out := make([]schema.FunctionArg, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	args := make([]schema.FunctionArg, len(catalogArgs))
+	for i, catalogArg := range catalogArgs {
+		if strings.TrimSpace(catalogArg.Type) == "" {
+			return nil, fmt.Errorf("argument %d has no type", i+1)
+		}
+
+		arg := schema.FunctionArg{
+			Name: catalogArg.Name,
+			Type: schema.NormalizeTypeName(schema.TypeName(catalogArg.Type)),
+		}
+		switch catalogArg.Mode {
+		case "i":
+			arg.Mode = schema.InMode
+		case "o":
+			arg.Mode = schema.OutMode
+		case "b":
+			arg.Mode = schema.InOutMode
+		case "v":
+			arg.Mode = schema.VariadicMode
+		case "t":
+			arg.Mode = schema.TableMode
+		default:
+			return nil, fmt.Errorf("argument %d has unknown mode %q", i+1, catalogArg.Mode)
+		}
+		args[i] = arg
+	}
+	return args, nil
+}
+
+func attachFunctionArgumentDefaults(args []schema.FunctionArg, defaultsSQL string, defaultCount int) error {
+	if defaultCount < 0 {
+		return fmt.Errorf("negative default count %d", defaultCount)
+	}
+	if defaultCount == 0 {
+		if strings.TrimSpace(defaultsSQL) != "" {
+			return fmt.Errorf("catalog returned defaults %q with a zero default count", defaultsSQL)
+		}
+		return nil
+	}
+	if strings.TrimSpace(defaultsSQL) == "" {
+		return fmt.Errorf("catalog returned %d defaults without expressions", defaultCount)
+	}
+
+	parsed, err := pg_query.Parse("SELECT " + defaultsSQL)
+	if err != nil {
+		return fmt.Errorf("invalid default expression list: %w", err)
+	}
+	if len(parsed.Stmts) != 1 || parsed.Stmts[0].Stmt == nil {
+		return fmt.Errorf("default expression list did not parse to one statement")
+	}
+	selectNode, ok := parsed.Stmts[0].Stmt.Node.(*pg_query.Node_SelectStmt)
+	if !ok {
+		return fmt.Errorf("default expression list parsed as %T, not SELECT", parsed.Stmts[0].Stmt.Node)
+	}
+	if len(selectNode.SelectStmt.TargetList) != defaultCount {
+		return fmt.Errorf("catalog returned %d default expressions for count %d", len(selectNode.SelectStmt.TargetList), defaultCount)
+	}
+
+	inputPositions := make([]int, 0, len(args))
+	for i, arg := range args {
+		if arg.Mode == schema.InMode || arg.Mode == schema.InOutMode || arg.Mode == schema.VariadicMode {
+			inputPositions = append(inputPositions, i)
+		}
+	}
+	if defaultCount > len(inputPositions) {
+		return fmt.Errorf("catalog returned %d defaults for only %d input arguments", defaultCount, len(inputPositions))
+	}
+	defaultPositions := inputPositions[len(inputPositions)-defaultCount:]
+	for i, targetNode := range selectNode.SelectStmt.TargetList {
+		target, ok := targetNode.Node.(*pg_query.Node_ResTarget)
+		if !ok || target.ResTarget == nil || target.ResTarget.Val == nil {
+			return fmt.Errorf("default expression %d has unsupported AST node %T", i+1, targetNode.Node)
+		}
+		expression := deparseExpr(target.ResTarget.Val)
+		if expression == "" {
+			return fmt.Errorf("default expression %d could not be deparsed", i+1)
+		}
+		value := schema.Expr(expression)
+		args[defaultPositions[i]].Default = &value
+	}
+	return nil
+}
+
+func functionReturnFromCatalog(args []schema.FunctionArg, returnType string, returnsSet bool) (schema.FunctionReturn, error) {
+	var tableColumns []schema.TableColumn
+	for i, arg := range args {
+		if arg.Mode != schema.TableMode {
 			continue
 		}
-
-		arg := schema.FunctionArg{Mode: schema.InMode}
-
-		upper := strings.ToUpper(part)
-		switch {
-		case strings.HasPrefix(upper, "VARIADIC "):
-			arg.Mode = schema.VariadicMode
-			part = strings.TrimSpace(part[len("VARIADIC "):])
-		case strings.HasPrefix(upper, "INOUT "):
-			arg.Mode = schema.InOutMode
-			part = strings.TrimSpace(part[len("INOUT "):])
-		case strings.HasPrefix(upper, "OUT "):
-			arg.Mode = schema.OutMode
-			part = strings.TrimSpace(part[len("OUT "):])
-		case strings.HasPrefix(upper, "IN "):
-			arg.Mode = schema.InMode
-			part = strings.TrimSpace(part[len("IN "):])
+		if arg.Name == nil || *arg.Name == "" {
+			return nil, fmt.Errorf("TABLE argument %d has no name", i+1)
 		}
-
-		if name, typ, ok := splitIdentifierAndType(part); ok {
-			argName := name
-			arg.Name = &argName
-			arg.Type = schema.NormalizeTypeName(schema.TypeName(typ))
-		} else {
-			// Fallback for identity arguments provided as type-only.
-			arg.Type = schema.NormalizeTypeName(schema.TypeName(part))
-		}
-		out = append(out, arg)
+		tableColumns = append(tableColumns, schema.TableColumn{Name: *arg.Name, Type: arg.Type})
+	}
+	if len(tableColumns) > 0 {
+		return schema.ReturnsTable{Columns: tableColumns}, nil
 	}
 
-	return out, nil
+	returnType = strings.TrimSpace(returnType)
+	if returnType == "" {
+		return nil, fmt.Errorf("empty return type")
+	}
+	normalized := schema.NormalizeTypeName(schema.TypeName(returnType))
+	if returnsSet {
+		return schema.ReturnsSetOf{Type: normalized}, nil
+	}
+	return schema.ReturnsType{Type: normalized}, nil
 }
 
-func parseFunctionReturn(returns string) (schema.FunctionReturn, error) {
-	returns = strings.TrimSpace(returns)
-	if returns == "" {
-		return schema.ReturnsType{Type: "void"}, nil
+func parseFunctionConfig(encoded string) ([]schema.SchemaName, error) {
+	if encoded == "null" {
+		return nil, nil
+	}
+	var entries []string
+	if err := json.Unmarshal([]byte(encoded), &entries); err != nil {
+		return nil, fmt.Errorf("invalid proconfig JSON: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("empty non-NULL proconfig")
 	}
 
-	upper := strings.ToUpper(returns)
-	if strings.HasPrefix(upper, "SETOF ") {
-		typ := strings.TrimSpace(returns[len("SETOF "):])
-		return schema.ReturnsSetOf{Type: schema.NormalizeTypeName(schema.TypeName(typ))}, nil
+	var searchPath []schema.SchemaName
+	seenSearchPath := false
+	for _, entry := range entries {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("malformed configuration entry %q", entry)
+		}
+		if key != "search_path" {
+			return nil, fmt.Errorf("configuration key %q is not modeled", key)
+		}
+		if seenSearchPath {
+			return nil, fmt.Errorf("duplicate search_path configuration")
+		}
+		seenSearchPath = true
+		var err error
+		searchPath, err = parseCatalogSearchPath(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid search_path value %q: %w", value, err)
+		}
 	}
-
-	if strings.HasPrefix(upper, "TABLE") {
-		rest := strings.TrimSpace(returns[len("TABLE"):])
-		if !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
-			return nil, fmt.Errorf("invalid TABLE return syntax")
-		}
-		inside := strings.TrimSpace(rest[1 : len(rest)-1])
-		if inside == "" {
-			return schema.ReturnsTable{Columns: nil}, nil
-		}
-		colParts := splitTopLevelComma(inside)
-		cols := make([]schema.TableColumn, 0, len(colParts))
-		for _, colPart := range colParts {
-			colPart = strings.TrimSpace(colPart)
-			if colPart == "" {
-				continue
-			}
-			name, typ, ok := splitIdentifierAndType(colPart)
-			if !ok {
-				return nil, fmt.Errorf("invalid TABLE column %q", colPart)
-			}
-			cols = append(cols, schema.TableColumn{
-				Name: name,
-				Type: schema.NormalizeTypeName(schema.TypeName(typ)),
-			})
-		}
-		return schema.ReturnsTable{Columns: cols}, nil
-	}
-
-	return schema.ReturnsType{Type: schema.NormalizeTypeName(schema.TypeName(returns))}, nil
+	return searchPath, nil
 }
 
-func splitTopLevelComma(s string) []string {
-	var parts []string
-	start := 0
-	depth := 0
-	inQuotes := false
-
-	for i, r := range s {
-		switch r {
-		case '"':
-			inQuotes = !inQuotes
-		case '(':
-			if !inQuotes {
-				depth++
-			}
-		case ')':
-			if !inQuotes && depth > 0 {
-				depth--
-			}
-		case ',':
-			if !inQuotes && depth == 0 {
-				parts = append(parts, s[start:i])
-				start = i + 1
-			}
-		}
+func parseCatalogSearchPath(value string) ([]schema.SchemaName, error) {
+	// PostgreSQL represents an explicitly empty list as two double quotes in
+	// the GUC text value. Preserve it as a non-nil empty slice so the renderer
+	// can distinguish it from a function without any SET search_path clause.
+	if value == `""` {
+		return make([]schema.SchemaName, 0), nil
 	}
 
-	parts = append(parts, s[start:])
-	return parts
+	parsed, err := pg_query.Parse("SET search_path TO " + value)
+	if err != nil {
+		return nil, err
+	}
+	if len(parsed.Stmts) != 1 || parsed.Stmts[0].Stmt == nil {
+		return nil, fmt.Errorf("search_path did not parse to one statement")
+	}
+	setNode, ok := parsed.Stmts[0].Stmt.Node.(*pg_query.Node_VariableSetStmt)
+	if !ok || setNode.VariableSetStmt == nil {
+		return nil, fmt.Errorf("search_path parsed as %T, not SET", parsed.Stmts[0].Stmt.Node)
+	}
+	set := setNode.VariableSetStmt
+	if set.Kind != pg_query.VariableSetKind_VAR_SET_VALUE || set.Name != "search_path" || set.IsLocal {
+		return nil, fmt.Errorf("unsupported SET search_path form")
+	}
+	if len(set.Args) == 0 {
+		return nil, fmt.Errorf("search_path has no values")
+	}
+
+	path := make([]schema.SchemaName, len(set.Args))
+	for i, arg := range set.Args {
+		value, ok := variableSetStringValue(arg)
+		if !ok || value == "" {
+			return nil, fmt.Errorf("search_path item %d is not a non-empty schema name", i+1)
+		}
+		path[i] = schema.SchemaName(value)
+	}
+	return path, nil
 }
 
-func splitIdentifierAndType(s string) (name string, typ string, ok bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", "", false
+func variableSetStringValue(node *pg_query.Node) (string, bool) {
+	if node == nil {
+		return "", false
 	}
-
-	// Column name may be quoted; type may contain spaces and parentheses.
-	if s[0] == '"' {
-		end := strings.Index(s[1:], `"`)
-		if end == -1 {
-			return "", "", false
+	switch value := node.Node.(type) {
+	case *pg_query.Node_String_:
+		return value.String_.Sval, true
+	case *pg_query.Node_AConst:
+		if stringValue := value.AConst.GetSval(); stringValue != nil {
+			return stringValue.Sval, true
 		}
-		name = s[1 : 1+end]
-		rest := strings.TrimSpace(s[2+end:])
-		if rest == "" {
-			return "", "", false
-		}
-		return name, rest, true
 	}
-
-	fields := strings.Fields(s)
-	if len(fields) < 2 {
-		return "", "", false
-	}
-
-	name = fields[0]
-	typ = strings.TrimSpace(s[len(name):])
-	return name, typ, true
+	return "", false
 }
 
 func (c *Catalog) extractTriggers(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {

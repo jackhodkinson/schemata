@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -145,9 +146,9 @@ func (p *Parser) parseSQLObjects(sql string) ([]schema.DatabaseObject, error) {
 		}
 
 		if commentStmt := rawStmt.Stmt.GetCommentStmt(); commentStmt != nil {
-			instr, err := p.parseCommentInstruction(commentStmt)
+			snippet := extractStatementSnippet(sql, int(rawStmt.StmtLocation), int(rawStmt.StmtLen))
+			instr, err := p.parseCommentInstruction(commentStmt, snippet)
 			if err != nil {
-				snippet := extractStatementSnippet(sql, int(rawStmt.StmtLocation), int(rawStmt.StmtLen))
 				return nil, fmt.Errorf("failed to parse COMMENT statement: %w\n\nStatement snippet:\n%s", err, snippet)
 			}
 			if instr != nil {
@@ -177,7 +178,10 @@ func (p *Parser) parseSQLObjects(sql string) ([]schema.DatabaseObject, error) {
 		}
 	}
 
-	objects = p.mergeGrantsAndOwners(objects, result)
+	objects, err = p.mergeGrantsAndOwners(objects, result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to attach grant/owner metadata: %w", err)
+	}
 
 	return objects, nil
 }
@@ -214,8 +218,24 @@ func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, erro
 		return p.parseCreateIndex(node.IndexStmt)
 	case *pg_query.Node_ViewStmt:
 		return p.parseCreateView(node.ViewStmt)
+	case *pg_query.Node_CreateTableAsStmt:
+		if node.CreateTableAsStmt.Objtype == pg_query.ObjectType_OBJECT_MATVIEW {
+			return p.parseCreateMaterializedView(node.CreateTableAsStmt)
+		}
+		return nil, &UnsupportedStatementError{
+			StatementType: "CREATE TABLE AS",
+			Remediation:   "only CREATE MATERIALIZED VIEW is modeled; define tables structurally",
+		}
 	case *pg_query.Node_CreateSeqStmt:
 		return p.parseCreateSequence(node.CreateSeqStmt)
+	case *pg_query.Node_AlterSeqStmt:
+		if isOwnedByOnlyAlterSequenceStmt(node.AlterSeqStmt) {
+			return nil, nil
+		}
+		return nil, &UnsupportedStatementError{
+			StatementType: "ALTER SEQUENCE",
+			Remediation:   "only OWNED BY metadata is accepted here; express sequence options in CREATE SEQUENCE",
+		}
 	case *pg_query.Node_CreateEnumStmt:
 		return p.parseCreateEnum(node.CreateEnumStmt)
 	case *pg_query.Node_CreateDomainStmt:
@@ -236,6 +256,16 @@ func (p *Parser) extractObject(stmt *pg_query.Node) (schema.DatabaseObject, erro
 		*pg_query.Node_AlterOwnerStmt:
 		// Handled in mergeGrantsAndOwners after object extraction.
 		return nil, nil
+	case *pg_query.Node_AlterTableStmt:
+		if isOwnerOnlyAlterTableStmt(node.AlterTableStmt) {
+			// PostgreSQL represents ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE
+			// OWNER as an AlterTableStmt rather than AlterOwnerStmt.
+			return nil, nil
+		}
+		return nil, &UnsupportedStatementError{
+			StatementType: "ALTER TABLE",
+			Remediation:   "only declarative OWNER metadata is accepted here; express structural changes in the CREATE definition or an explicit migration",
+		}
 	case *pg_query.Node_VariableShowStmt,
 		*pg_query.Node_TransactionStmt:
 		// These statements inspect/session-wrap work but do not define schema objects.
@@ -313,27 +343,28 @@ func (p *Parser) deparseExpr(node *pg_query.Node) (string, error) {
 }
 
 type commentInstruction struct {
-	schema  schema.SchemaName
-	table   schema.TableName
+	target  metadataTarget
 	column  *schema.ColumnName
 	comment *string
 }
 
-func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) (*commentInstruction, error) {
+var commentNullSuffix = regexp.MustCompile(`(?is)\bIS\s+NULL\s*;?\s*$`)
+
+func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt, source string) (*commentInstruction, error) {
 	if stmt == nil {
 		return nil, fmt.Errorf("nil COMMENT statement")
 	}
 
 	var commentPtr *string
-	if stmt.Comment != "" {
+	if stmt.Comment != "" || !commentNullSuffix.MatchString(source) {
 		comment := stmt.Comment
 		commentPtr = &comment
 	}
 
 	switch stmt.Objtype {
-	case pg_query.ObjectType_OBJECT_TABLE, pg_query.ObjectType_OBJECT_MATVIEW:
+	case pg_query.ObjectType_OBJECT_TABLE:
 		names := extractStringList(stmt.Object)
-		if len(names) == 0 {
+		if len(names) < 1 || len(names) > 2 {
 			return nil, fmt.Errorf("COMMENT ON TABLE is missing an object name")
 		}
 		schemaName := schema.SchemaName("public")
@@ -342,10 +373,37 @@ func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) (*commentIn
 			schemaName = schema.SchemaName(names[len(names)-2])
 		}
 		return &commentInstruction{
-			schema:  schemaName,
-			table:   schema.TableName(tableName),
+			target:  metadataTarget{kind: schema.TableKind, schema: schemaName, name: tableName},
 			comment: commentPtr,
 		}, nil
+	case pg_query.ObjectType_OBJECT_VIEW, pg_query.ObjectType_OBJECT_MATVIEW:
+		schemaName, name, err := qualifiedNameNode(stmt.Object)
+		if err != nil {
+			return nil, fmt.Errorf("COMMENT ON VIEW: %w", err)
+		}
+		viewType := schema.RegularView
+		if stmt.Objtype == pg_query.ObjectType_OBJECT_MATVIEW {
+			viewType = schema.MaterializedView
+		}
+		return &commentInstruction{target: metadataTarget{kind: schema.ViewKind, schema: schemaName, name: name, viewType: &viewType}, comment: commentPtr}, nil
+	case pg_query.ObjectType_OBJECT_SEQUENCE:
+		schemaName, name, err := qualifiedNameNode(stmt.Object)
+		if err != nil {
+			return nil, fmt.Errorf("COMMENT ON SEQUENCE: %w", err)
+		}
+		return &commentInstruction{target: metadataTarget{kind: schema.SequenceKind, schema: schemaName, name: name}, comment: commentPtr}, nil
+	case pg_query.ObjectType_OBJECT_FUNCTION:
+		schemaName, name, signature, err := p.objectWithArgsIdentity(stmt.Object)
+		if err != nil {
+			return nil, fmt.Errorf("COMMENT ON FUNCTION: %w", err)
+		}
+		return &commentInstruction{target: metadataTarget{kind: schema.FunctionKind, schema: schemaName, name: name, signature: signature}, comment: commentPtr}, nil
+	case pg_query.ObjectType_OBJECT_TYPE, pg_query.ObjectType_OBJECT_DOMAIN:
+		schemaName, name, err := qualifiedNameNode(stmt.Object)
+		if err != nil {
+			return nil, fmt.Errorf("COMMENT ON TYPE: %w", err)
+		}
+		return &commentInstruction{target: metadataTarget{kind: schema.TypeKind, schema: schemaName, name: name}, comment: commentPtr}, nil
 	case pg_query.ObjectType_OBJECT_COLUMN:
 		names := extractStringList(stmt.Object)
 		if len(names) < 2 {
@@ -358,8 +416,7 @@ func (p *Parser) parseCommentInstruction(stmt *pg_query.CommentStmt) (*commentIn
 			schemaName = schema.SchemaName(names[len(names)-3])
 		}
 		return &commentInstruction{
-			schema:  schemaName,
-			table:   schema.TableName(tableName),
+			target:  metadataTarget{kind: schema.TableKind, schema: schemaName, name: tableName},
 			column:  &columnName,
 			comment: commentPtr,
 		}, nil
@@ -373,46 +430,61 @@ func (p *Parser) applyCommentInstructions(objects []schema.DatabaseObject, comme
 		return objects, nil
 	}
 
-	type tableKey struct {
-		schema schema.SchemaName
-		name   schema.TableName
-	}
-
-	index := make(map[tableKey]int)
-	for i, obj := range objects {
-		if tbl, ok := obj.(schema.Table); ok {
-			index[tableKey{schema: tbl.Schema, name: tbl.Name}] = i
-		}
-	}
-
 	for _, instr := range comments {
-		key := tableKey{schema: instr.schema, name: instr.table}
-		idx, ok := index[key]
-		if !ok {
-			return nil, fmt.Errorf("COMMENT target table %s.%s was not defined in the schema input", instr.schema, instr.table)
-		}
-		tbl, ok := objects[idx].(schema.Table)
-		if !ok {
-			return nil, fmt.Errorf("COMMENT target %s.%s is not a table", instr.schema, instr.table)
-		}
-
-		if instr.column == nil {
-			tbl.Comment = instr.comment
-		} else {
-			found := false
-			for i := range tbl.Columns {
-				if tbl.Columns[i].Name == *instr.column {
-					tbl.Columns[i].Comment = instr.comment
-					found = true
-					break
+		matches := 0
+		for idx := range objects {
+			if !metadataTargetMatches(instr.target, objects[idx]) {
+				continue
+			}
+			if instr.column != nil {
+				tbl, ok := objects[idx].(schema.Table)
+				if !ok {
+					continue
 				}
+				found := false
+				for i := range tbl.Columns {
+					if tbl.Columns[i].Name == *instr.column {
+						tbl.Columns[i].Comment = instr.comment
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("COMMENT target column %s.%s.%s was not defined in the schema input", instr.target.schema, instr.target.name, *instr.column)
+				}
+				objects[idx] = tbl
+				matches++
+				continue
 			}
-			if !found {
-				return nil, fmt.Errorf("COMMENT target column %s.%s.%s was not defined in the schema input", instr.schema, instr.table, *instr.column)
-			}
-		}
 
-		objects[idx] = tbl
+			switch obj := objects[idx].(type) {
+			case schema.Table:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			case schema.View:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			case schema.Sequence:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			case schema.Function:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			case schema.EnumDef:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			case schema.DomainDef:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			case schema.CompositeDef:
+				obj.Comment = instr.comment
+				objects[idx] = obj
+			}
+			matches++
+		}
+		if matches != 1 {
+			return nil, metadataAttachmentError("COMMENT", instr.target, matches)
+		}
 	}
 
 	return objects, nil

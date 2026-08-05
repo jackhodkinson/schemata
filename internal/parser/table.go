@@ -8,12 +8,16 @@ import (
 
 	"github.com/jackhodkinson/schemata/pkg/schema"
 	pg_query "github.com/pganalyze/pg_query_go/v5"
+	"google.golang.org/protobuf/proto"
 )
 
 // parseCreateTable parses a CREATE TABLE statement
 func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObject, error) {
 	if stmt.Relation == nil {
 		return nil, fmt.Errorf("CREATE TABLE missing relation")
+	}
+	if stmt.Relation.Relpersistence != "" && stmt.Relation.Relpersistence != "p" {
+		return nil, fmt.Errorf("temporary or unlogged tables are not modeled")
 	}
 
 	schemaName, tableName := p.extractQualifiedName(stmt.Relation)
@@ -35,7 +39,7 @@ func (p *Parser) parseCreateTable(stmt *pg_query.CreateStmt) (schema.DatabaseObj
 
 		switch node := elt.Node.(type) {
 		case *pg_query.Node_ColumnDef:
-			col, isPK, isUnique, colFK, colCheck, err := p.parseColumnDef(node.ColumnDef)
+			col, isPK, isUnique, colFK, colCheck, err := p.parseColumnDef(node.ColumnDef, schemaName)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse column: %w", err)
 			}
@@ -169,7 +173,7 @@ func (p *Parser) generateConstraintNames(table *schema.Table) {
 // a bool indicating if this column has UNIQUE constraint,
 // an optional ForeignKey if the column has an inline REFERENCES clause,
 // and an optional CheckConstraint if the column has an inline CHECK clause
-func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, bool, *schema.ForeignKey, *schema.CheckConstraint, error) {
+func (p *Parser) parseColumnDef(col *pg_query.ColumnDef, tableSchema schema.SchemaName) (schema.Column, bool, bool, *schema.ForeignKey, *schema.CheckConstraint, error) {
 	if col == nil {
 		return schema.Column{}, false, false, nil, nil, fmt.Errorf("nil column definition")
 	}
@@ -206,7 +210,7 @@ func (p *Parser) parseColumnDef(col *pg_query.ColumnDef) (schema.Column, bool, b
 		}
 
 		if c, ok := constraint.Node.(*pg_query.Node_Constraint); ok {
-			isPK, isUQ, fk, ck, err := p.parseColumnConstraint(c.Constraint, &column)
+			isPK, isUQ, fk, ck, err := p.parseColumnConstraint(c.Constraint, &column, tableSchema)
 			if err != nil {
 				return schema.Column{}, false, false, nil, nil, err
 			}
@@ -234,36 +238,33 @@ func (p *Parser) parseTypeName(typeName *pg_query.TypeName) (schema.TypeName, er
 		return "", nil
 	}
 
-	// Build type name from names list
-	var parts []string
-	for _, name := range typeName.Names {
-		if n, ok := name.Node.(*pg_query.Node_String_); ok {
-			parts = append(parts, n.String_.Sval)
-		}
+	// Deparse the authoritative TypeName AST rather than reconstructing it by
+	// joining its name tokens. Joining loses the distinction between names and
+	// multiword built-in types and cannot safely re-quote schema/type names.
+	renderType, ok := proto.Clone(typeName).(*pg_query.TypeName)
+	if !ok {
+		return "", fmt.Errorf("failed to clone type name AST")
 	}
-
-	typeStr := ""
-	if len(parts) > 0 {
-		// Preserve qualification: user-defined types with the same name in
-		// different schemas are not interchangeable.
-		typeStr = strings.Join(parts, ".")
+	renderType.Setof = false
+	cast := &pg_query.Node{Node: &pg_query.Node_TypeCast{TypeCast: &pg_query.TypeCast{
+		Arg: &pg_query.Node{Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{
+			Isnull: true,
+		}}},
+		TypeName: renderType,
+	}}}
+	rendered, err := p.deparseExpr(cast)
+	if err != nil {
+		return "", fmt.Errorf("failed to deparse type name: %w", err)
 	}
-
-	// Handle type modifiers (e.g., varchar(255), numeric(10,2))
-	if len(typeName.Typmods) > 0 {
-		modifiers, err := p.formatTypeModifiers(typeName.Typmods)
-		if err != nil {
-			return "", err
-		}
-		typeStr += "(" + modifiers + ")"
+	const nullCastPrefix = "NULL::"
+	if !strings.HasPrefix(rendered, nullCastPrefix) {
+		return "", fmt.Errorf("type name deparsed to unexpected expression %q", rendered)
 	}
-
-	// Handle array types
-	if len(typeName.ArrayBounds) > 0 {
-		typeStr += "[]"
+	typeSQL := strings.TrimSpace(strings.TrimPrefix(rendered, nullCastPrefix))
+	if typeSQL == "" {
+		return "", fmt.Errorf("type name deparsed to an empty type")
 	}
-
-	return schema.TypeName(typeStr), nil
+	return schema.TypeName(typeSQL), nil
 }
 
 // formatTypeModifiers formats type modifiers for display
@@ -293,7 +294,7 @@ func (p *Parser) formatTypeModifiers(mods []*pg_query.Node) (string, error) {
 // - isUnique: true if this is a UNIQUE constraint (needs table-level handling)
 // - foreignKey: non-nil if this is a REFERENCES constraint (needs to be added to table.ForeignKeys)
 // - checkConstraint: non-nil if this is a CHECK constraint (needs to be added to table.Checks)
-func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column) (bool, bool, *schema.ForeignKey, *schema.CheckConstraint, error) {
+func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *schema.Column, tableSchema schema.SchemaName) (bool, bool, *schema.ForeignKey, *schema.CheckConstraint, error) {
 	if constraint == nil {
 		return false, false, nil, nil, nil
 	}
@@ -341,7 +342,14 @@ func (p *Parser) parseColumnConstraint(constraint *pg_query.Constraint, column *
 
 	case pg_query.ConstrType_CONSTR_IDENTITY:
 		// IDENTITY column
-		column.Identity = p.buildIdentitySpec(constraint, column.Type)
+		identity, err := p.buildIdentitySpec(constraint, column.Type, tableSchema)
+		if err != nil {
+			return false, false, nil, nil, err
+		}
+		column.Identity = identity
+		// PostgreSQL makes every identity column implicitly NOT NULL. Preserve
+		// that effective catalog state so parse -> apply -> extract converges.
+		column.NotNull = true
 
 	case pg_query.ConstrType_CONSTR_GENERATED:
 		// GENERATED column
@@ -531,65 +539,102 @@ func (p *Parser) parseFkMatchTypeString(matchType string) schema.MatchType {
 	}
 }
 
-func (p *Parser) buildIdentitySpec(constraint *pg_query.Constraint, columnType schema.TypeName) *schema.IdentitySpec {
+func (p *Parser) buildIdentitySpec(constraint *pg_query.Constraint, columnType schema.TypeName, tableSchema schema.SchemaName) (*schema.IdentitySpec, error) {
 	spec := &schema.IdentitySpec{
 		Always: strings.EqualFold(constraint.GeneratedWhen, "a") || strings.EqualFold(constraint.GeneratedWhen, "always"),
 	}
 
-	for _, option := range constraint.Options {
+	seen := make(map[string]struct{}, len(constraint.Options))
+	for i, option := range constraint.Options {
 		defElem := option.GetDefElem()
 		if defElem == nil {
+			return nil, fmt.Errorf("identity option %d has unsupported AST node %T", i+1, option.Node)
+		}
+		name := strings.ToLower(defElem.Defname)
+		if name == "" {
+			return nil, fmt.Errorf("identity option %d has no name", i+1)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, fmt.Errorf("identity option %q is specified more than once", defElem.Defname)
+		}
+		seen[name] = struct{}{}
+
+		if name == "sequence_name" {
+			names := extractStringList(defElem.Arg)
+			if len(names) != 1 && len(names) != 2 {
+				return nil, fmt.Errorf("IDENTITY SEQUENCE NAME must contain sequence or schema.sequence")
+			}
+			sequenceSchema := tableSchema
+			if len(names) == 2 {
+				sequenceSchema = schema.SchemaName(names[0])
+			}
+			sequenceName := names[len(names)-1]
+			if sequenceSchema == "" || sequenceName == "" {
+				return nil, fmt.Errorf("IDENTITY SEQUENCE NAME contains an empty identifier")
+			}
+			spec.SequenceName = &schema.QualifiedName{Schema: sequenceSchema, Name: sequenceName}
 			continue
 		}
-		if seqOpt := p.normalizeIdentityOption(defElem); seqOpt != nil {
-			spec.SequenceOptions = append(spec.SequenceOptions, *seqOpt)
+
+		seqOpt, err := p.normalizeIdentityOption(defElem)
+		if err != nil {
+			return nil, err
 		}
+		spec.SequenceOptions = append(spec.SequenceOptions, seqOpt)
 	}
 
 	spec.SequenceOptions = schema.NormalizeIdentityOptions(columnType, spec.SequenceOptions)
 
-	return spec
+	return spec, nil
 }
 
-func (p *Parser) normalizeIdentityOption(defElem *pg_query.DefElem) *schema.SequenceOption {
+func (p *Parser) normalizeIdentityOption(defElem *pg_query.DefElem) (schema.SequenceOption, error) {
 	if defElem == nil {
-		return nil
+		return schema.SequenceOption{}, fmt.Errorf("nil identity sequence option")
 	}
 
 	switch strings.ToLower(defElem.Defname) {
 	case "start":
 		if val := p.extractIntValue(defElem.Arg); val != nil {
-			return &schema.SequenceOption{Type: "START WITH", Value: *val, HasValue: true}
+			return schema.SequenceOption{Type: "START WITH", Value: *val, HasValue: true}, nil
 		}
 	case "increment":
 		if val := p.extractIntValue(defElem.Arg); val != nil {
-			return &schema.SequenceOption{Type: "INCREMENT BY", Value: *val, HasValue: true}
+			return schema.SequenceOption{Type: "INCREMENT BY", Value: *val, HasValue: true}, nil
 		}
 	case "minvalue":
 		if val := p.extractIntValue(defElem.Arg); val != nil {
-			return &schema.SequenceOption{Type: "MINVALUE", Value: *val, HasValue: true}
+			return schema.SequenceOption{Type: "MINVALUE", Value: *val, HasValue: true}, nil
 		}
-		return &schema.SequenceOption{Type: "NO MINVALUE"}
+		if defElem.Arg == nil {
+			return schema.SequenceOption{Type: "NO MINVALUE"}, nil
+		}
 	case "maxvalue":
 		if val := p.extractIntValue(defElem.Arg); val != nil {
-			return &schema.SequenceOption{Type: "MAXVALUE", Value: *val, HasValue: true}
+			return schema.SequenceOption{Type: "MAXVALUE", Value: *val, HasValue: true}, nil
 		}
-		return &schema.SequenceOption{Type: "NO MAXVALUE"}
+		if defElem.Arg == nil {
+			return schema.SequenceOption{Type: "NO MAXVALUE"}, nil
+		}
 	case "cache":
 		if val := p.extractIntValue(defElem.Arg); val != nil {
-			return &schema.SequenceOption{Type: "CACHE", Value: *val, HasValue: true}
+			return schema.SequenceOption{Type: "CACHE", Value: *val, HasValue: true}, nil
 		}
 	case "cycle":
 		if boolVal := p.extractBoolValue(defElem.Arg); boolVal != nil {
 			if *boolVal {
-				return &schema.SequenceOption{Type: "CYCLE"}
+				return schema.SequenceOption{Type: "CYCLE"}, nil
 			}
-			return &schema.SequenceOption{Type: "NO CYCLE"}
+			return schema.SequenceOption{Type: "NO CYCLE"}, nil
 		}
-		return &schema.SequenceOption{Type: "CYCLE"}
+		if defElem.Arg == nil {
+			return schema.SequenceOption{Type: "CYCLE"}, nil
+		}
+	default:
+		return schema.SequenceOption{}, fmt.Errorf("unsupported identity sequence option %q", defElem.Defname)
 	}
 
-	return nil
+	return schema.SequenceOption{}, fmt.Errorf("identity sequence option %q is missing or has an unsupported value", defElem.Defname)
 }
 
 func (p *Parser) parseRelOptions(nodes []*pg_query.Node) ([]string, error) {

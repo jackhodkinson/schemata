@@ -29,30 +29,31 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 		return typeName
 	}
 
-	if strings.HasPrefix(strings.ToLower(typeStr), "pg_catalog.") {
-		typeStr = typeStr[len("pg_catalog."):]
-	} else if strings.HasPrefix(strings.ToLower(typeStr), `"pg_catalog".`) {
-		typeStr = typeStr[len(`"pg_catalog".`):]
+	// Normalize the element type independently so aliases remain canonical for
+	// arrays as well (for example int[] and int4[] must identify integer[]).
+	isArray := false
+	for strings.HasSuffix(typeStr, "[]") {
+		isArray = true
+		typeStr = strings.TrimSpace(strings.TrimSuffix(typeStr, "[]"))
+	}
+	if isArray {
+		// PostgreSQL has one array type OID per element type. Declared ranks such
+		// as integer[][] are not preserved by format_type(), which is the catalog
+		// representation Schemata compares against.
+		return TypeName(string(NormalizeTypeName(TypeName(typeStr))) + "[]")
 	}
 
-	// pg_catalog qualification is redundant for built-in aliases. Qualification
-	// on user-defined types is semantic and must be preserved: a.value_type and
+	// pg_catalog qualification is redundant for built-in aliases. The parser's
+	// default schema is public and catalog rendering uses public in its canonical
+	// search path, so public.value_type and value_type are one canonical identity.
+	// Other user-defined qualifications remain semantic: a.value_type and
 	// b.value_type are different types and can identify different overloads.
-	if strings.Contains(typeStr, ".") && !strings.Contains(typeStr, " ") {
-		arraySuffix := ""
-		for strings.HasSuffix(typeStr, "[]") {
-			arraySuffix += "[]"
-			typeStr = strings.TrimSuffix(typeStr, "[]")
+	if qualifier, name, ok := splitQualifiedTypeName(typeStr); ok {
+		if isCanonicalTypeQualifier(qualifier) {
+			typeStr = name
+		} else {
+			return TypeName(typeStr)
 		}
-		if idx := strings.LastIndex(typeStr, "."); idx != -1 {
-			qualifier := typeStr[:idx]
-			if strings.EqualFold(strings.Trim(qualifier, `"`), "pg_catalog") {
-				typeStr = typeStr[idx+1:]
-			} else {
-				return TypeName(typeStr + arraySuffix)
-			}
-		}
-		typeStr += arraySuffix
 	}
 
 	// Handle common aliases - normalize TO the SQL standard names.
@@ -92,11 +93,15 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 	if strings.Contains(typeStr, "(") {
 		parts := strings.SplitN(typeStr, "(", 2)
 		if len(parts) == 2 {
-			baseType := strings.ToLower(strings.TrimSpace(parts[0]))
+			baseType := strings.TrimSpace(parts[0])
 			params := parts[1]
 
 			// Normalize whitespace inside parameters: "10,2" and "10, 2" → "10, 2"
 			params = normalizeTypeParams(params)
+			if strings.HasPrefix(baseType, `"`) {
+				return TypeName(baseType + "(" + params)
+			}
+			baseType = strings.ToLower(baseType)
 
 			switch baseType {
 			case "character varying":
@@ -110,4 +115,47 @@ func NormalizeTypeName(typeName TypeName) TypeName {
 	}
 
 	return TypeName(typeStr)
+}
+
+// splitQualifiedTypeName finds one schema/type separator while respecting
+// quoted identifiers. More heavily qualified or malformed names are preserved
+// unchanged rather than guessed at.
+func splitQualifiedTypeName(typeName string) (qualifier, name string, ok bool) {
+	inQuotes := false
+	separator := -1
+	for i := 0; i < len(typeName); i++ {
+		switch typeName[i] {
+		case '"':
+			if inQuotes && i+1 < len(typeName) && typeName[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuotes = !inQuotes
+		case '.':
+			if inQuotes {
+				continue
+			}
+			if separator != -1 {
+				return "", "", false
+			}
+			separator = i
+		}
+	}
+	if inQuotes || separator <= 0 || separator == len(typeName)-1 {
+		return "", "", false
+	}
+	qualifier = strings.TrimSpace(typeName[:separator])
+	name = strings.TrimSpace(typeName[separator+1:])
+	return qualifier, name, qualifier != "" && name != ""
+}
+
+func isCanonicalTypeQualifier(qualifier string) bool {
+	qualifier = strings.TrimSpace(qualifier)
+	if qualifier == `"pg_catalog"` || qualifier == `"public"` {
+		return true
+	}
+	if strings.ContainsAny(qualifier, `".`) {
+		return false
+	}
+	return strings.EqualFold(qualifier, "pg_catalog") || strings.EqualFold(qualifier, "public")
 }

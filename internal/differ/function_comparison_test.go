@@ -172,6 +172,31 @@ func TestFunctionNormalizationInDiffer(t *testing.T) {
 		"Normalized function bodies should have consistent whitespace")
 }
 
+func TestCompareFunctionsDetectsSecurityRelevantSearchPathChanges(t *testing.T) {
+	base := schema.Function{
+		Schema:          "public",
+		Name:            "secured",
+		Returns:         schema.ReturnsType{Type: "integer"},
+		Language:        schema.SQL,
+		Volatility:      schema.Volatile,
+		Parallel:        schema.ParallelUnsafe,
+		SecurityDefiner: true,
+		Body:            "SELECT 1",
+	}
+
+	desired := base
+	desired.SearchPath = []schema.SchemaName{"pg_catalog", "public"}
+	actual := base
+	actual.SearchPath = []schema.SchemaName{"attacker", "public"}
+	assert.Contains(t, compareFunctions(desired, actual), "search path changed")
+
+	desired = base
+	desired.SearchPath = make([]schema.SchemaName, 0)
+	actual = base
+	actual.SearchPath = nil
+	assert.Contains(t, compareFunctions(desired, actual), "search path changed", "explicit empty and absent settings have different semantics")
+}
+
 // TestFunctionHashConsistency tests that functions with equivalent bodies produce same hash
 func TestFunctionHashConsistency(t *testing.T) {
 	func1 := schema.Function{

@@ -31,6 +31,31 @@ func TestExprContract(t *testing.T) {
 	})
 }
 
+func TestExprCanonicalizesPublicRegclassQualification(t *testing.T) {
+	t.Parallel()
+
+	assertions := []struct {
+		qualified   schema.Expr
+		unqualified schema.Expr
+	}{
+		{`nextval('public.item_ids'::regclass)`, `nextval('item_ids'::regclass)`},
+		{`nextval('PUBLIC.item_ids'::pg_catalog.regclass)`, `nextval('item_ids'::regclass)`},
+		{`nextval('"public"."Item IDs"'::regclass)`, `nextval('"Item IDs"'::regclass)`},
+	}
+	for _, assertion := range assertions {
+		require.Equal(t, Expr(assertion.unqualified), Expr(assertion.qualified))
+	}
+
+	require.NotEqual(t,
+		Expr(`nextval('tenant.item_ids'::regclass)`),
+		Expr(`nextval('item_ids'::regclass)`),
+	)
+	require.NotEqual(t,
+		Expr(`nextval('"PUBLIC".item_ids'::regclass)`),
+		Expr(`nextval('item_ids'::regclass)`),
+	)
+}
+
 func TestExprForTypeRemovesOnlyMatchingCast(t *testing.T) {
 	require.Equal(t, schema.Expr("'user'"), exprForType("'user'::user_role", "user_role"))
 	require.Equal(t, schema.Expr("'user'::other_role"), exprForType("'user'::other_role", "user_role"))
@@ -56,6 +81,21 @@ func TestObjectPreservesMeaningBearingOrder(t *testing.T) {
 	require.Equal(t, []schema.CompositeAttr{{Name: "z"}, {Name: "a"}}, Object(comp).(schema.CompositeDef).Attributes)
 }
 
+func TestViewNormalizationTreatsPublicAsCanonicalDefaultSchema(t *testing.T) {
+	t.Parallel()
+
+	unqualified := Object(schema.View{Definition: schema.ViewDefinition{Query: `SELECT id FROM items`}}).(schema.View)
+	qualified := Object(schema.View{Definition: schema.ViewDefinition{Query: `SELECT id FROM public.items`}}).(schema.View)
+	require.Equal(t, unqualified.Definition.Query, qualified.Definition.Query)
+	quotedPublic := Object(schema.View{Definition: schema.ViewDefinition{Query: `SELECT id FROM "public".items`}}).(schema.View)
+	require.Equal(t, unqualified.Definition.Query, quotedPublic.Definition.Query)
+
+	otherSchema := Object(schema.View{Definition: schema.ViewDefinition{Query: `SELECT id FROM tenant.items`}}).(schema.View)
+	require.NotEqual(t, unqualified.Definition.Query, otherSchema.Definition.Query)
+	quotedUppercasePublic := Object(schema.View{Definition: schema.ViewDefinition{Query: `SELECT id FROM "PUBLIC".items`}}).(schema.View)
+	require.NotEqual(t, unqualified.Definition.Query, quotedUppercasePublic.Definition.Query)
+}
+
 func columnNames(cols []schema.Column) []schema.ColumnName {
 	names := make([]schema.ColumnName, len(cols))
 	for i := range cols {
@@ -73,6 +113,16 @@ func TestFunctionBodyContract(t *testing.T) {
 	`
 	got := FunctionBody(in)
 	require.Equal(t, "begin new.updated_at = current_timestamp; return new; end;", got)
+}
+
+func TestFunctionBodyPreservesLineCommentTerminator(t *testing.T) {
+	t.Parallel()
+
+	withTerminator := FunctionBody("SELECT 1 -- Keep Case\r\n + 2")
+	withoutTerminator := FunctionBody("SELECT 1 -- Keep Case + 2")
+
+	require.Equal(t, "select 1 -- Keep Case\n + 2", withTerminator)
+	require.NotEqual(t, withTerminator, withoutTerminator)
 }
 
 func TestObjectContract_PolicyExpressionsNormalized(t *testing.T) {

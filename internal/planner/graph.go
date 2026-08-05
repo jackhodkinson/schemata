@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackhodkinson/schemata/internal/sqlrender"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
 
@@ -96,6 +97,9 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 		// If table uses custom types or extension-provided types, it depends on those.
 		for _, col := range v.Columns {
 			addTypeDependencies(graph, key, string(col.Type), objectMap)
+			if col.Default != nil {
+				addSequenceDefaultDependencies(graph, key, string(*col.Default), objectMap)
+			}
 		}
 
 	case schema.View:
@@ -172,12 +176,46 @@ func addDependenciesForObject(graph *DependencyGraph, key schema.ObjectKey, obj 
 		}
 
 	case schema.Sequence:
-		// Sequences typically don't have dependencies on other objects
-		// (they're owned by columns, but that's the reverse dependency)
+		// OWNED BY is deliberately emitted in a deferred post-create phase. The
+		// base sequence must be available before a table can use nextval(...) in
+		// an inline default, so it has no create-time dependency on that table.
 
 	default:
 		// Other object types (extensions, enums, domains, composites, schemas)
 		// typically don't have dependencies on other schema objects
+	}
+}
+
+func addSequenceDefaultDependencies(graph *DependencyGraph, tableKey schema.ObjectKey, expression string, objectMap schema.SchemaObjectMap) {
+	dependencies := make(map[schema.ObjectKey]struct{})
+	for _, reference := range sqlrender.NextvalRegclassReferences(expression) {
+		for candidate := range objectMap {
+			if candidate.Kind != schema.SequenceKind {
+				continue
+			}
+			if reference.Qualified {
+				if reference.Reference == sqlrender.Qualified(string(candidate.Schema), candidate.Name) {
+					dependencies[candidate] = struct{}{}
+					break
+				}
+				continue
+			}
+			if reference.Reference == sqlrender.Qualified(candidate.Name) {
+				// An unqualified regclass literal is search_path-dependent. Add every
+				// matching managed sequence as a conservative ordering dependency;
+				// extra edges are harmless, while guessing one schema can break replay.
+				dependencies[candidate] = struct{}{}
+			}
+		}
+	}
+
+	ordered := make([]schema.ObjectKey, 0, len(dependencies))
+	for dependency := range dependencies {
+		ordered = append(ordered, dependency)
+	}
+	schema.SortObjectKeys(ordered)
+	for _, dependency := range ordered {
+		graph.AddDependency(tableKey, dependency)
 	}
 }
 

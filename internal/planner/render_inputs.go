@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/jackhodkinson/schemata/internal/sqlrender"
 	"github.com/jackhodkinson/schemata/pkg/schema"
@@ -71,30 +72,68 @@ func validateDatabaseObjectRenderInputs(obj schema.DatabaseObject) error {
 				return err
 			}
 		}
-		return validateOptionalLiteral(value.Comment)
+		if err := validateOwner(value.Owner); err != nil {
+			return err
+		}
+		if err := validateOptionalLiteral(value.Comment); err != nil {
+			return err
+		}
+		return validateGrants(value.Grants)
 	case schema.DomainDef:
 		if err := validateQualifiedObject(string(value.Schema), string(value.Name)); err != nil {
-			return err
-		}
-		return validateOptionalLiteral(value.Comment)
-	case schema.CompositeDef:
-		if err := validateQualifiedObject(string(value.Schema), string(value.Name)); err != nil {
-			return err
-		}
-		for _, attr := range value.Attributes {
-			if err := validateIdentifier("composite attribute", attr.Name); err != nil {
-				return err
-			}
-		}
-		return validateOptionalLiteral(value.Comment)
-	case schema.Sequence:
-		if err := validateQualifiedObject(string(value.Schema), value.Name); err != nil {
 			return err
 		}
 		if err := validateOwner(value.Owner); err != nil {
 			return err
 		}
+		if err := validateOptionalLiteral(value.Comment); err != nil {
+			return err
+		}
+		return validateGrants(value.Grants)
+	case schema.CompositeDef:
+		if err := validateQualifiedObject(string(value.Schema), string(value.Name)); err != nil {
+			return err
+		}
+		seenAttributes := make(map[string]struct{}, len(value.Attributes))
+		for _, attr := range value.Attributes {
+			if err := validateIdentifier("composite attribute", attr.Name); err != nil {
+				return err
+			}
+			if _, duplicate := seenAttributes[attr.Name]; duplicate {
+				return fmt.Errorf("cannot render composite %s with duplicate attribute %q", value.Name, attr.Name)
+			}
+			seenAttributes[attr.Name] = struct{}{}
+			if strings.TrimSpace(string(attr.Type)) == "" {
+				return fmt.Errorf("cannot render composite %s attribute %q without a type", value.Name, attr.Name)
+			}
+		}
+		if err := validateOwner(value.Owner); err != nil {
+			return err
+		}
+		if err := validateOptionalLiteral(value.Comment); err != nil {
+			return err
+		}
+		return validateGrants(value.Grants)
+	case schema.Sequence:
+		if err := validateQualifiedObject(string(value.Schema), value.Name); err != nil {
+			return err
+		}
+		if value.Type != "" {
+			normalized := schema.NormalizeTypeName(schema.TypeName(value.Type))
+			if normalized != "smallint" && normalized != "integer" && normalized != "bigint" {
+				return fmt.Errorf("sequence %s.%s has unsupported type %q; PostgreSQL sequences support smallint, integer, or bigint", value.Schema, value.Name, value.Type)
+			}
+		}
+		if err := validateOwner(value.Owner); err != nil {
+			return err
+		}
+		if err := validateOptionalLiteral(value.Comment); err != nil {
+			return err
+		}
 		if value.OwnedBy != nil {
+			if value.Schema != value.OwnedBy.Schema {
+				return fmt.Errorf("sequence %s.%s cannot be OWNED BY a table in schema %s: PostgreSQL requires both objects in the same schema", value.Schema, value.Name, value.OwnedBy.Schema)
+			}
 			if err := validateIdentifier("owned-by schema", string(value.OwnedBy.Schema)); err != nil {
 				return err
 			}
@@ -127,6 +166,19 @@ func validateDatabaseObjectRenderInputs(obj schema.DatabaseObject) error {
 			}
 			if err := validateOptionalLiteral(col.Comment); err != nil {
 				return err
+			}
+			if col.Identity != nil {
+				if col.Identity.SequenceName != nil {
+					if col.Identity.SequenceName.Schema != value.Schema {
+						return fmt.Errorf("column %s identity sequence %s.%s must be in table schema %s", col.Name, col.Identity.SequenceName.Schema, col.Identity.SequenceName.Name, value.Schema)
+					}
+					if err := validateQualifiedObject(string(col.Identity.SequenceName.Schema), col.Identity.SequenceName.Name); err != nil {
+						return fmt.Errorf("column %s identity sequence name: %w", col.Name, err)
+					}
+				}
+				if err := validateIdentitySequenceOptions(col.Identity.SequenceOptions); err != nil {
+					return fmt.Errorf("column %s identity options: %w", col.Name, err)
+				}
 			}
 		}
 		if value.PrimaryKey != nil && value.PrimaryKey.Name != nil && *value.PrimaryKey.Name != "" {
@@ -235,6 +287,9 @@ func validateDatabaseObjectRenderInputs(obj schema.DatabaseObject) error {
 		if value.Type != "" && value.Type != schema.RegularView && value.Type != schema.MaterializedView {
 			return fmt.Errorf("cannot render view %s with unknown type %q", value.Name, value.Type)
 		}
+		if value.SecurityBarrier || value.CheckOption != nil || len(value.Definition.OutputColumns) > 0 {
+			return fmt.Errorf("cannot render view %s with security barrier, CHECK OPTION, or explicit output columns: these view features are not implemented", value.Name)
+		}
 		for _, output := range value.Definition.OutputColumns {
 			if err := validateIdentifier("view output column", output.Name); err != nil {
 				return err
@@ -256,6 +311,12 @@ func validateDatabaseObjectRenderInputs(obj schema.DatabaseObject) error {
 			}
 			if !validArgMode(arg.Mode) {
 				return fmt.Errorf("cannot render function %s with unknown argument mode %q", value.Name, arg.Mode)
+			}
+			if strings.TrimSpace(string(arg.Type)) == "" {
+				return fmt.Errorf("cannot render function %s with an untyped argument", value.Name)
+			}
+			if arg.Mode == schema.TableMode && arg.Default != nil {
+				return fmt.Errorf("cannot render function %s with a default on a TABLE output column", value.Name)
 			}
 		}
 		switch returns := value.Returns.(type) {
@@ -330,6 +391,39 @@ func validateDatabaseObjectRenderInputs(obj schema.DatabaseObject) error {
 	}
 }
 
+func validateIdentitySequenceOptions(options []schema.SequenceOption) error {
+	seen := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		kind := strings.ToUpper(strings.TrimSpace(option.Type))
+		if _, duplicate := seen[kind]; duplicate {
+			return fmt.Errorf("duplicate %s option", kind)
+		}
+		seen[kind] = struct{}{}
+
+		switch kind {
+		case "START WITH", "MINVALUE", "MAXVALUE":
+			if !option.HasValue {
+				return fmt.Errorf("%s requires an integer value", kind)
+			}
+		case "INCREMENT BY":
+			if !option.HasValue || option.Value == 0 {
+				return fmt.Errorf("INCREMENT BY requires a non-zero integer value")
+			}
+		case "CACHE":
+			if !option.HasValue || option.Value <= 0 {
+				return fmt.Errorf("CACHE requires a positive integer value")
+			}
+		case "NO MINVALUE", "NO MAXVALUE", "CYCLE", "NO CYCLE":
+			if option.HasValue {
+				return fmt.Errorf("%s does not accept a value", kind)
+			}
+		default:
+			return fmt.Errorf("unsupported option %q", option.Type)
+		}
+	}
+	return nil
+}
+
 func validateQualifiedObject(schemaName, objectName string) error {
 	if err := validateIdentifier("schema", schemaName); err != nil {
 		return err
@@ -365,20 +459,30 @@ func validPrivilege(value schema.Privilege) bool {
 	switch value {
 	case schema.PrivSelect, schema.PrivInsert, schema.PrivUpdate, schema.PrivDelete,
 		schema.PrivTruncate, schema.PrivReferences, schema.PrivTrigger,
+		schema.PrivMaintain,
 		schema.PrivExecute, schema.PrivUsage, schema.PrivCreate,
-		schema.PrivConnect, schema.PrivTemporary, schema.PrivAll:
+		schema.PrivConnect, schema.PrivTemporary:
 		return true
 	default:
 		return false
 	}
 }
 
-func validateGrantRenderInputs(grantee string, privileges []schema.Privilege) error {
-	if _, err := sqlrender.Role(grantee); err != nil {
-		return err
+func validateGrantRenderInputs(grantee schema.Grantee, privileges []schema.Privilege) error {
+	switch grantee.Kind {
+	case schema.GranteePublic:
+		if grantee.Name != "" {
+			return fmt.Errorf("PUBLIC grantee cannot carry role name %q", grantee.Name)
+		}
+	case schema.GranteeRole:
+		if _, err := sqlrender.Role(grantee.Name); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("cannot render unknown grantee kind %q", grantee.Kind)
 	}
 	if len(privileges) == 0 {
-		return fmt.Errorf("cannot render an empty privilege list for grantee %q", grantee)
+		return fmt.Errorf("cannot render an empty privilege list for grantee %#v", grantee)
 	}
 	for _, privilege := range privileges {
 		if !validPrivilege(privilege) {
@@ -408,7 +512,7 @@ func validMatchType(value schema.MatchType) bool {
 
 func validArgMode(value schema.ArgMode) bool {
 	switch value {
-	case "", schema.InMode, schema.OutMode, schema.InOutMode, schema.VariadicMode:
+	case "", schema.InMode, schema.OutMode, schema.InOutMode, schema.VariadicMode, schema.TableMode:
 		return true
 	default:
 		return false
@@ -480,13 +584,16 @@ func quotedColumnNames(values []schema.ColumnName) string {
 	return sqlrender.IdentifierList(strings)
 }
 
-func quotedStringIdentifiers(values []string) string {
-	return sqlrender.IdentifierList(values)
-}
-
 func quotedRole(value string) string {
 	rendered, _ := sqlrender.Role(value) // validated at the public renderer boundary
 	return rendered
+}
+
+func quotedGrantee(value schema.Grantee) string {
+	if value.Kind == schema.GranteePublic {
+		return "PUBLIC"
+	}
+	return quotedRole(value.Name)
 }
 
 func quotedLiteral(value string) string {

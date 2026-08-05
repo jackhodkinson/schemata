@@ -12,133 +12,81 @@ func TestDetectSerialType(t *testing.T) {
 		name           string
 		colType        schema.TypeName
 		defaultExpr    schema.Expr
-		sequences      []schema.Sequence
+		sequence       schema.Sequence
 		expectedSerial schema.TypeName
 	}{
 		{
-			name:        "INTEGER with nextval and owned sequence should be SERIAL",
-			colType:     "integer",
-			defaultExpr: "nextval('users_id_seq'::regclass)",
-			sequences: []schema.Sequence{
-				{
-					Schema: "public",
-					Name:   "users_id_seq",
-					Type:   "bigint",
-					OwnedBy: &schema.SequenceOwner{
-						Schema: "public",
-						Table:  "users",
-						Column: "id",
-					},
-				},
-			},
+			name:           "INTEGER with nextval and owned sequence should be SERIAL",
+			colType:        "integer",
+			defaultExpr:    "nextval('users_id_seq'::regclass)",
+			sequence:       canonicalSerialSequence("public", "users", "id", "integer", 2147483647),
 			expectedSerial: "serial",
 		},
 		{
-			name:        "BIGINT with nextval and owned sequence should be BIGSERIAL",
-			colType:     "bigint",
-			defaultExpr: "nextval('orders_id_seq'::regclass)",
-			sequences: []schema.Sequence{
-				{
-					Schema: "public",
-					Name:   "orders_id_seq",
-					Type:   "bigint",
-					OwnedBy: &schema.SequenceOwner{
-						Schema: "public",
-						Table:  "orders",
-						Column: "id",
-					},
-				},
-			},
+			name:           "BIGINT with nextval and owned sequence should be BIGSERIAL",
+			colType:        "bigint",
+			defaultExpr:    "nextval('orders_id_seq'::regclass)",
+			sequence:       canonicalSerialSequence("public", "orders", "id", "bigint", 9223372036854775807),
 			expectedSerial: "bigserial",
 		},
 		{
-			name:        "SMALLINT with nextval and owned sequence should be SMALLSERIAL",
-			colType:     "smallint",
-			defaultExpr: "nextval('items_id_seq'::regclass)",
-			sequences: []schema.Sequence{
-				{
-					Schema: "public",
-					Name:   "items_id_seq",
-					Type:   "bigint",
-					OwnedBy: &schema.SequenceOwner{
-						Schema: "public",
-						Table:  "items",
-						Column: "id",
-					},
-				},
-			},
+			name:           "SMALLINT with nextval and owned sequence should be SMALLSERIAL",
+			colType:        "smallint",
+			defaultExpr:    "nextval('items_id_seq'::regclass)",
+			sequence:       canonicalSerialSequence("public", "items", "id", "smallint", 32767),
 			expectedSerial: "smallserial",
 		},
 		{
-			name:        "INTEGER with nextval but NO owned sequence should NOT be SERIAL",
-			colType:     "integer",
-			defaultExpr: "nextval('shared_seq'::regclass)",
-			sequences: []schema.Sequence{
-				{
-					Schema:  "public",
-					Name:    "shared_seq",
-					Type:    "bigint",
-					OwnedBy: nil, // Not owned
-				},
-			},
+			name:           "INTEGER with a BIGINT backing sequence is not SERIAL",
+			colType:        "integer",
+			defaultExpr:    "nextval('users_id_seq'::regclass)",
+			sequence:       canonicalSerialSequence("public", "users", "id", "bigint", 9223372036854775807),
 			expectedSerial: "",
 		},
 		{
 			name:           "INTEGER with non-nextval default should NOT be SERIAL",
 			colType:        "integer",
 			defaultExpr:    "42",
-			sequences:      []schema.Sequence{},
+			sequence:       canonicalSerialSequence("public", "users", "id", "integer", 2147483647),
 			expectedSerial: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Build sequence map
-			seqMap := make(map[string]schema.Sequence)
-			for _, seq := range tt.sequences {
-				if seq.OwnedBy != nil {
-					key := string(seq.OwnedBy.Schema) + "." + string(seq.OwnedBy.Table) + "." + string(seq.OwnedBy.Column)
-					seqMap[key] = seq
-				}
+			owner := "postgres"
+			tableName := tt.sequence.OwnedBy.Table
+			table := schema.Table{
+				Schema: tt.sequence.OwnedBy.Schema,
+				Name:   tableName,
+				Owner:  &owner,
+				Columns: []schema.Column{{
+					Name:    tt.sequence.OwnedBy.Column,
+					Type:    tt.colType,
+					Default: &tt.defaultExpr,
+				}},
 			}
-
-			// Extract table/column info from the first sequence's OwnedBy (if exists)
-			tableSchema := schema.SchemaName("public")
-			tableName := schema.TableName("users")
-			colName := schema.ColumnName("id")
-
-			if len(tt.sequences) > 0 && tt.sequences[0].OwnedBy != nil {
-				tableSchema = tt.sequences[0].OwnedBy.Schema
-				tableName = tt.sequences[0].OwnedBy.Table
-				colName = tt.sequences[0].OwnedBy.Column
+			normalized := NormalizeTable(table, []schema.Sequence{tt.sequence})
+			if tt.expectedSerial == "" {
+				assert.Equal(t, schema.NormalizeTypeName(tt.colType), normalized.Columns[0].Type)
+				assert.NotNil(t, normalized.Columns[0].Default)
+			} else {
+				assert.Equal(t, tt.expectedSerial, normalized.Columns[0].Type)
+				assert.Nil(t, normalized.Columns[0].Default)
 			}
-
-			result := detectSerialType(tt.colType, tt.defaultExpr, tableSchema, tableName, colName, seqMap)
-			assert.Equal(t, tt.expectedSerial, result)
 		})
 	}
 }
 
 func TestNormalizeTable(t *testing.T) {
 	// Test full table normalization
-	sequences := []schema.Sequence{
-		{
-			Schema: "public",
-			Name:   "users_id_seq",
-			Type:   "bigint",
-			OwnedBy: &schema.SequenceOwner{
-				Schema: "public",
-				Table:  "users",
-				Column: "id",
-			},
-		},
-	}
+	sequences := []schema.Sequence{canonicalSerialSequence("public", "users", "id", "integer", 2147483647)}
 
 	defaultExpr := schema.Expr("nextval('users_id_seq'::regclass)")
 	table := schema.Table{
 		Schema: "public",
 		Name:   "users",
+		Owner:  stringPointer("postgres"),
 		Columns: []schema.Column{
 			{
 				Name:    "id",
@@ -164,6 +112,61 @@ func TestNormalizeTable(t *testing.T) {
 	assert.Equal(t, schema.TypeName("varchar(255)"), normalized.Columns[1].Type)
 }
 
+func TestNormalizeCatalogTablePreservesNoncanonicalSerialBackingSequences(t *testing.T) {
+	t.Parallel()
+
+	owner := "postgres"
+	canonical := canonicalSerialSequence("public", "users", "id", "integer", 2147483647)
+	canonicalDefault := schema.Expr("nextval('users_id_seq'::regclass)")
+
+	tests := map[string]struct {
+		mutate      func(*schema.Sequence)
+		defaultExpr schema.Expr
+	}{
+		"custom name": {
+			mutate:      func(seq *schema.Sequence) { seq.Name = "custom_ids" },
+			defaultExpr: "nextval('custom_ids'::regclass)",
+		},
+		"custom cache": {
+			mutate:      func(seq *schema.Sequence) { value := int64(9); seq.Cache = &value },
+			defaultExpr: canonicalDefault,
+		},
+		"comment": {
+			mutate:      func(seq *schema.Sequence) { value := "important"; seq.Comment = &value },
+			defaultExpr: canonicalDefault,
+		},
+		"custom ACL": {
+			mutate: func(seq *schema.Sequence) {
+				seq.Grants = append(seq.Grants, schema.Grant{Grantee: schema.PublicGrantee(), Privileges: []schema.Privilege{schema.PrivSelect}})
+			},
+			defaultExpr: canonicalDefault,
+		},
+		"near-miss default reference": {
+			mutate:      func(*schema.Sequence) {},
+			defaultExpr: "nextval('not_users_id_seq'::regclass)",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			seq := canonical
+			test.mutate(&seq)
+			table := schema.Table{
+				Schema:  "public",
+				Name:    "users",
+				Owner:   &owner,
+				Columns: []schema.Column{{Name: "id", Type: "integer", Default: &test.defaultExpr}},
+			}
+
+			normalized, collapsed := normalizeCatalogTable(table, []catalogSequence{{Sequence: seq, DependencyKind: sequenceSerial}})
+
+			assert.Empty(t, collapsed)
+			assert.Equal(t, schema.TypeName("integer"), normalized.Columns[0].Type)
+			assert.NotNil(t, normalized.Columns[0].Default)
+		})
+	}
+}
+
 func TestNormalizeTypeName(t *testing.T) {
 	tests := []struct {
 		input    schema.TypeName
@@ -181,7 +184,7 @@ func TestNormalizeTypeName(t *testing.T) {
 		{"text", "text"}, // Should stay as-is
 		{"uuid", "uuid"}, // Should stay as-is
 		{"pg_catalog.int4", "integer"},
-		{"public.value_type", "public.value_type"},
+		{"public.value_type", "value_type"},
 		{"tenant.value_type[]", "tenant.value_type[]"},
 		{`"Tenant"."ValueType"`, `"Tenant"."ValueType"`},
 	}
@@ -230,6 +233,27 @@ func TestReferencesSequence(t *testing.T) {
 			seqName:     "users_id_seq",
 			shouldMatch: false,
 		},
+		{
+			name:        "Containing sequence name is not an exact match",
+			expr:        "nextval('not_users_id_seq'::regclass)",
+			seqSchema:   "public",
+			seqName:     "users_id_seq",
+			shouldMatch: false,
+		},
+		{
+			name:        "Compound expression is not the SERIAL expansion",
+			expr:        "nextval('users_id_seq'::regclass) + 1",
+			seqSchema:   "public",
+			seqName:     "users_id_seq",
+			shouldMatch: false,
+		},
+		{
+			name:        "Nested call is not the SERIAL expansion",
+			expr:        "coalesce(nextval('users_id_seq'::regclass), 1)",
+			seqSchema:   "public",
+			seqName:     "users_id_seq",
+			shouldMatch: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -237,5 +261,29 @@ func TestReferencesSequence(t *testing.T) {
 			result := referencesSequence(tt.expr, tt.seqSchema, tt.seqName)
 			assert.Equal(t, tt.shouldMatch, result)
 		})
+	}
+}
+
+func canonicalSerialSequence(schemaName schema.SchemaName, table schema.TableName, column schema.ColumnName, sequenceType string, max int64) schema.Sequence {
+	owner := "postgres"
+	start := int64(1)
+	increment := int64(1)
+	min := int64(1)
+	cache := int64(1)
+	return schema.Sequence{
+		Schema:    schemaName,
+		Name:      string(table) + "_" + string(column) + "_seq",
+		Owner:     &owner,
+		Type:      sequenceType,
+		Start:     &start,
+		Increment: &increment,
+		MinValue:  &min,
+		MaxValue:  &max,
+		Cache:     &cache,
+		OwnedBy:   &schema.SequenceOwner{Schema: schemaName, Table: table, Column: column},
+		Grants: []schema.Grant{{
+			Grantee:    schema.RoleGrantee(owner),
+			Privileges: []schema.Privilege{schema.PrivSelect, schema.PrivUpdate, schema.PrivUsage},
+		}},
 	}
 }

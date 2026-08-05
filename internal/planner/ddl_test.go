@@ -362,7 +362,8 @@ func TestGenerateCreateFunction(t *testing.T) {
 	assert.Contains(t, stmt, `"a" INTEGER, "b" INTEGER`)
 	assert.Contains(t, stmt, "RETURNS INTEGER")
 	assert.Contains(t, stmt, `LANGUAGE "plpgsql"`)
-	assert.Contains(t, stmt, "VOLATILITY IMMUTABLE")
+	assert.Contains(t, stmt, "\nIMMUTABLE")
+	assert.NotContains(t, stmt, "VOLATILITY IMMUTABLE")
 	assert.Contains(t, stmt, "BEGIN RETURN a + b; END;")
 }
 
@@ -858,11 +859,52 @@ func TestGenerateAlterTableIdentitySpecChanged(t *testing.T) {
 		NewObject: newTable,
 	}
 
+	_, err := gen.generateAlterTable(newTable, &oldTable, alter)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires an explicit migration")
+}
+
+func TestGenerateAlterTableIdentityModeChangeIsInPlace(t *testing.T) {
+	gen := NewDDLGenerator()
+	generatedName := schema.QualifiedName{Schema: "public", Name: "accounts_id_seq"}
+	oldTable := schema.Table{
+		Schema: "public", Name: "accounts",
+		Columns: []schema.Column{{Name: "id", Type: "BIGINT", Identity: &schema.IdentitySpec{Always: false, SequenceName: &generatedName}}},
+	}
+	newTable := schema.Table{
+		Schema: "public", Name: "accounts",
+		Columns: []schema.Column{{Name: "id", Type: "BIGINT", Identity: &schema.IdentitySpec{Always: true}}},
+	}
+	alter := differ.AlterOperation{
+		Key:       schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "accounts"},
+		Changes:   []string{"alter column id: identity spec changed"},
+		OldObject: oldTable,
+		NewObject: newTable,
+	}
+
 	statements, err := gen.generateAlterTable(newTable, &oldTable, alter)
 	require.NoError(t, err)
-	require.Len(t, statements, 2)
-	assert.Equal(t, `ALTER TABLE "public"."accounts" ALTER COLUMN "id" DROP IDENTITY IF EXISTS;`, statements[0])
-	assert.Equal(t, `ALTER TABLE "public"."accounts" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10);`, statements[1])
+	require.Equal(t, []string{`ALTER TABLE "public"."accounts" ALTER COLUMN "id" SET GENERATED ALWAYS;`}, statements)
+}
+
+func TestCreateIdentityPreservesExplicitSequenceName(t *testing.T) {
+	t.Parallel()
+
+	ddl, err := NewDDLGenerator().GenerateCreateStatement(schema.Table{
+		Schema: "tenant", Name: "accounts",
+		Columns: []schema.Column{{
+			Name: "id", Type: "integer",
+			Identity: &schema.IdentitySpec{
+				Always:       true,
+				SequenceName: &schema.QualifiedName{Schema: "tenant", Name: "Account IDs"},
+				SequenceOptions: []schema.SequenceOption{{
+					Type: "INCREMENT BY", Value: -2, HasValue: true,
+				}},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, ddl, `GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME "tenant"."Account IDs" INCREMENT BY -2)`)
 }
 
 func TestGenerateAlterTableHandlesCollationAndCommentChanges(t *testing.T) {

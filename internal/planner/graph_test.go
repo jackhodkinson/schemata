@@ -347,6 +347,103 @@ func TestDetectCycle(t *testing.T) {
 	assert.Greater(t, len(cycle), 1, "cycle should contain multiple nodes")
 }
 
+func TestBuildGraphOwnedSequenceBasePrecedesTable(t *testing.T) {
+	tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: "public", Name: "items"}
+	sequenceKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "public", Name: "item_ids"}
+	objectMap := schema.SchemaObjectMap{
+		tableKey: {Payload: schema.Table{Schema: "public", Name: "items", Columns: []schema.Column{{Name: "id", Type: "integer"}}}},
+		sequenceKey: {Payload: schema.Sequence{
+			Schema: "public", Name: "item_ids",
+			OwnedBy: &schema.SequenceOwner{Schema: "public", Table: "items", Column: "id"},
+		}},
+	}
+
+	sorted, err := BuildGraph(objectMap).TopologicalSort()
+	require.NoError(t, err)
+	require.Len(t, sorted, 2)
+	assert.Equal(t, sequenceKey, sorted[0])
+	assert.Equal(t, tableKey, sorted[1])
+}
+
+func TestBuildGraphTableDefaultDependsOnCrossSchemaSequence(t *testing.T) {
+	t.Parallel()
+
+	defaultExpr := schema.Expr(`nextval('z_sequences.item_ids'::regclass)`)
+	tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: "a_tables", Name: "items"}
+	sequenceKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "item_ids"}
+	nearMissKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "not_item_ids"}
+	objectMap := schema.SchemaObjectMap{
+		tableKey: {Payload: schema.Table{
+			Schema: "a_tables", Name: "items",
+			Columns: []schema.Column{{Name: "id", Type: "integer", Default: &defaultExpr}},
+		}},
+		sequenceKey: {Payload: schema.Sequence{Schema: "z_sequences", Name: "item_ids"}},
+		nearMissKey: {Payload: schema.Sequence{Schema: "z_sequences", Name: "not_item_ids"}},
+	}
+
+	dependencies := BuildGraph(objectMap).Dependencies(tableKey)
+	assert.Contains(t, dependencies, sequenceKey)
+	assert.NotContains(t, dependencies, nearMissKey)
+	sorted, err := BuildGraph(objectMap).TopologicalSort()
+	require.NoError(t, err)
+	positions := make(map[schema.ObjectKey]int, len(sorted))
+	for index, key := range sorted {
+		positions[key] = index
+	}
+	assert.Less(t, positions[sequenceKey], positions[tableKey])
+}
+
+func TestBuildGraphTableDefaultFindsCompoundAndNestedSequenceCalls(t *testing.T) {
+	t.Parallel()
+
+	defaultExpr := schema.Expr(`coalesce(
+		nextval('z_sequences.first_ids'::regclass),
+		abs(nextval('z_sequences.second_ids'::pg_catalog.regclass))
+	) + nextval('z_sequences.first_ids'::regclass)`)
+	tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: "a_tables", Name: "items"}
+	firstKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "first_ids"}
+	secondKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "second_ids"}
+	nearMissKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "not_first_ids"}
+	objectMap := schema.SchemaObjectMap{
+		tableKey: {Payload: schema.Table{
+			Schema: "a_tables", Name: "items",
+			Columns: []schema.Column{{Name: "id", Type: "bigint", Default: &defaultExpr}},
+		}},
+		firstKey:    {Payload: schema.Sequence{Schema: "z_sequences", Name: "first_ids"}},
+		secondKey:   {Payload: schema.Sequence{Schema: "z_sequences", Name: "second_ids"}},
+		nearMissKey: {Payload: schema.Sequence{Schema: "z_sequences", Name: "not_first_ids"}},
+	}
+
+	dependencies := BuildGraph(objectMap).Dependencies(tableKey)
+	assert.ElementsMatch(t, []schema.ObjectKey{firstKey, secondKey}, dependencies)
+}
+
+func TestBuildGraphTableDefaultRejectsNestedNextvalNearMisses(t *testing.T) {
+	t.Parallel()
+
+	defaultExpr := schema.Expr(`coalesce(
+		other.nextval('z_sequences.item_ids'::regclass),
+		nextval('z_sequences.item_ids'::text),
+		nextval('z_sequences.item_ids'::evil.regclass),
+		nextval('z_sequences.not_item_ids'::regclass)
+	)`)
+	tableKey := schema.ObjectKey{Kind: schema.TableKind, Schema: "a_tables", Name: "items"}
+	itemKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "item_ids"}
+	nearNameKey := schema.ObjectKey{Kind: schema.SequenceKind, Schema: "z_sequences", Name: "not_item_ids"}
+	objectMap := schema.SchemaObjectMap{
+		tableKey: {Payload: schema.Table{
+			Schema: "a_tables", Name: "items",
+			Columns: []schema.Column{{Name: "id", Type: "bigint", Default: &defaultExpr}},
+		}},
+		itemKey:     {Payload: schema.Sequence{Schema: "z_sequences", Name: "item_ids"}},
+		nearNameKey: {Payload: schema.Sequence{Schema: "z_sequences", Name: "not_item_ids"}},
+	}
+
+	dependencies := BuildGraph(objectMap).Dependencies(tableKey)
+	assert.Equal(t, []schema.ObjectKey{nearNameKey}, dependencies)
+	assert.NotContains(t, dependencies, itemKey)
+}
+
 // Helper function
 func strPtr(s string) *string {
 	return &s

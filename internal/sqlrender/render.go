@@ -9,8 +9,12 @@ package sqlrender
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
+
+	pg_query "github.com/pganalyze/pg_query_go/v5"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // InvalidValueError reports a value that cannot be represented faithfully in
@@ -57,13 +61,11 @@ func IdentifierList(values []string) string {
 	return strings.Join(quoted, ", ")
 }
 
-// Role renders a grantee or owner. PUBLIC is PostgreSQL's pseudo-role only
-// when represented by the canonical, upper-case sentinel. Other spellings,
-// including a real quoted role named "public", remain ordinary identifiers.
+// Role renders an ordinary PostgreSQL role identifier. PostgreSQL's PUBLIC
+// pseudo-role is deliberately not represented by this string API; callers
+// must model and render it explicitly so a real quoted role named "PUBLIC"
+// cannot be confused with the pseudo-role.
 func Role(value string) (string, error) {
-	if value == "PUBLIC" {
-		return "PUBLIC", nil
-	}
 	if err := ValidateIdentifier(value); err != nil {
 		return "", &InvalidValueError{Kind: "role", Value: value, Reason: err.(*InvalidValueError).Reason}
 	}
@@ -97,30 +99,49 @@ func Literal(value string) (string, error) {
 // separately. This parser exists only for legacy string fields such as
 // collation and operator-class names.
 func ParseQualified(value string, minParts, maxParts int) (string, error) {
+	parts, err := parseQualifiedIdentifier(value, minParts, maxParts)
+	if err != nil {
+		return "", err
+	}
+	values := make([]string, len(parts))
+	for i := range parts {
+		values[i] = parts[i].value
+	}
+	return Qualified(values...), nil
+}
+
+type qualifiedIdentifierPart struct {
+	value  string
+	quoted bool
+}
+
+func parseQualifiedIdentifier(value string, minParts, maxParts int) ([]qualifiedIdentifierPart, error) {
 	if minParts < 1 || maxParts < minParts {
-		return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "invalid component bounds"}
+		return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "invalid component bounds"}
 	}
 	if value == "" {
-		return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "must not be empty"}
+		return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "must not be empty"}
 	}
 	if strings.TrimSpace(value) != value {
-		return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "surrounding whitespace is ambiguous"}
+		return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "surrounding whitespace is ambiguous"}
 	}
 	if strings.IndexByte(value, 0) >= 0 {
-		return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains a NUL byte"}
+		return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains a NUL byte"}
 	}
 	if !utf8.ValidString(value) {
-		return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains invalid UTF-8"}
+		return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains invalid UTF-8"}
 	}
 
-	parts := make([]string, 0, maxParts)
+	parts := make([]qualifiedIdentifierPart, 0, maxParts)
 	for pos := 0; pos < len(value); {
 		if len(parts) == maxParts {
-			return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: fmt.Sprintf("has more than %d components", maxParts)}
+			return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: fmt.Sprintf("has more than %d components", maxParts)}
 		}
 
 		var part string
+		quoted := false
 		if value[pos] == '"' {
+			quoted = true
 			pos++
 			var b strings.Builder
 			closed := false
@@ -140,20 +161,20 @@ func ParseQualified(value string, minParts, maxParts int) (string, error) {
 				break
 			}
 			if !closed {
-				return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "has an unterminated quoted component"}
+				return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "has an unterminated quoted component"}
 			}
 			part = b.String()
 			if pos < len(value) && value[pos] != '.' {
-				return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "has characters after a quoted component"}
+				return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "has characters after a quoted component"}
 			}
 		} else {
 			start := pos
 			for pos < len(value) && value[pos] != '.' {
 				if value[pos] == '"' {
-					return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains a quote inside an unquoted component"}
+					return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains a quote inside an unquoted component"}
 				}
 				if value[pos] == ' ' || value[pos] == '\t' || value[pos] == '\r' || value[pos] == '\n' {
-					return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains whitespace in an unquoted component"}
+					return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "contains whitespace in an unquoted component"}
 				}
 				pos++
 			}
@@ -161,23 +182,176 @@ func ParseQualified(value string, minParts, maxParts int) (string, error) {
 		}
 
 		if err := ValidateIdentifier(part); err != nil {
-			return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: err.(*InvalidValueError).Reason}
+			return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: err.(*InvalidValueError).Reason}
 		}
-		parts = append(parts, part)
+		parts = append(parts, qualifiedIdentifierPart{value: part, quoted: quoted})
 
 		if pos == len(value) {
 			break
 		}
 		pos++ // dot
 		if pos == len(value) {
-			return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "has a trailing dot"}
+			return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: "has a trailing dot"}
 		}
 	}
 
 	if len(parts) < minParts {
-		return "", &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: fmt.Sprintf("has fewer than %d components", minParts)}
+		return nil, &InvalidValueError{Kind: "qualified identifier", Value: value, Reason: fmt.Sprintf("has fewer than %d components", minParts)}
 	}
-	return Qualified(parts...), nil
+	return parts, nil
+}
+
+// NextvalReference is one exact nextval('name'::regclass) call found in an SQL
+// expression. Reference is a canonically quoted one- or two-part name.
+type NextvalReference struct {
+	Reference string
+	Qualified bool
+}
+
+// NextvalRegclassReference recognizes only an expression whose root is exactly
+// nextval('name'::regclass), optionally pg_catalog-qualified. SERIAL collapse
+// uses this strict form: a wrapper or compound expression is observably not the
+// PostgreSQL SERIAL expansion even when it contains a nextval call.
+func NextvalRegclassReference(expression string) (reference string, qualified bool, ok bool) {
+	root := parseExpressionRoot(expression)
+	match, ok := nextvalRegclassReferenceFromNode(root)
+	if !ok {
+		return "", false, false
+	}
+	return match.Reference, match.Qualified, true
+}
+
+// NextvalRegclassReferences finds exact nextval('name'::regclass) call nodes
+// anywhere inside an expression. Dependency discovery uses this AST walk so a
+// sequence is created before a table whose compound default references it.
+// Invalid SQL and near-miss calls are ignored, and duplicate references are
+// returned once in deterministic order.
+func NextvalRegclassReferences(expression string) []NextvalReference {
+	root := parseExpressionRoot(expression)
+	if root == nil {
+		return nil
+	}
+
+	found := make(map[NextvalReference]struct{})
+	walkSQLMessages(root.ProtoReflect(), func(node *pg_query.Node) {
+		if match, ok := nextvalRegclassReferenceFromNode(node); ok {
+			found[match] = struct{}{}
+		}
+	})
+
+	references := make([]NextvalReference, 0, len(found))
+	for reference := range found {
+		references = append(references, reference)
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if references[i].Reference != references[j].Reference {
+			return references[i].Reference < references[j].Reference
+		}
+		return !references[i].Qualified && references[j].Qualified
+	})
+	return references
+}
+
+func parseExpressionRoot(expression string) *pg_query.Node {
+	parsed, err := pg_query.Parse("SELECT " + strings.TrimSpace(expression))
+	if err != nil || len(parsed.Stmts) != 1 || parsed.Stmts[0].Stmt == nil {
+		return nil
+	}
+	selectStmt := parsed.Stmts[0].Stmt.GetSelectStmt()
+	if selectStmt == nil || len(selectStmt.TargetList) != 1 {
+		return nil
+	}
+	target := selectStmt.TargetList[0].GetResTarget()
+	if target == nil {
+		return nil
+	}
+	return target.Val
+}
+
+func nextvalRegclassReferenceFromNode(node *pg_query.Node) (NextvalReference, bool) {
+	if node == nil {
+		return NextvalReference{}, false
+	}
+	call := node.GetFuncCall()
+	if call == nil || len(call.Funcname) == 0 || len(call.Funcname) > 2 || len(call.Args) != 1 {
+		return NextvalReference{}, false
+	}
+	functionParts := make([]string, len(call.Funcname))
+	for i, node := range call.Funcname {
+		value := node.GetString_()
+		if value == nil {
+			return NextvalReference{}, false
+		}
+		functionParts[i] = value.Sval
+	}
+	// PostgreSQL folds unquoted identifiers before they reach this AST. Exact
+	// comparison therefore accepts ordinary NEXTVAL while preserving the
+	// distinct semantics of a quoted function such as "NEXTVAL".
+	if functionParts[len(functionParts)-1] != "nextval" {
+		return NextvalReference{}, false
+	}
+	if len(functionParts) == 2 && functionParts[0] != "pg_catalog" {
+		return NextvalReference{}, false
+	}
+
+	cast := call.Args[0].GetTypeCast()
+	if cast == nil || cast.TypeName == nil || cast.Arg == nil {
+		return NextvalReference{}, false
+	}
+	typeNames := cast.TypeName.Names
+	if len(typeNames) == 0 || len(typeNames) > 2 {
+		return NextvalReference{}, false
+	}
+	regclass := typeNames[len(typeNames)-1].GetString_()
+	if regclass == nil || regclass.Sval != "regclass" {
+		return NextvalReference{}, false
+	}
+	if len(typeNames) == 2 {
+		qualifier := typeNames[0].GetString_()
+		if qualifier == nil || qualifier.Sval != "pg_catalog" {
+			return NextvalReference{}, false
+		}
+	}
+	constant := cast.Arg.GetAConst()
+	if constant == nil || constant.GetSval() == nil {
+		return NextvalReference{}, false
+	}
+	rawReference := constant.GetSval().Sval
+	parts, err := parseQualifiedIdentifier(rawReference, 1, 2)
+	if err != nil {
+		return NextvalReference{}, false
+	}
+	values := make([]string, len(parts))
+	for i, part := range parts {
+		values[i] = part.value
+		if !part.quoted {
+			values[i] = strings.ToLower(values[i])
+		}
+	}
+	return NextvalReference{Reference: Qualified(values...), Qualified: len(values) == 2}, true
+}
+
+func walkSQLMessages(message protoreflect.Message, visit func(*pg_query.Node)) {
+	if node, ok := message.Interface().(*pg_query.Node); ok {
+		visit(node)
+	}
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		switch {
+		case field.IsList() && field.Kind() == protoreflect.MessageKind:
+			list := value.List()
+			for i := 0; i < list.Len(); i++ {
+				walkSQLMessages(list.Get(i).Message(), visit)
+			}
+		case field.IsMap() && field.MapValue().Kind() == protoreflect.MessageKind:
+			value.Map().Range(func(_ protoreflect.MapKey, item protoreflect.Value) bool {
+				walkSQLMessages(item.Message(), visit)
+				return true
+			})
+		case !field.IsList() && !field.IsMap() && field.Kind() == protoreflect.MessageKind:
+			walkSQLMessages(value.Message(), visit)
+		}
+		return true
+	})
 }
 
 func validateText(kind, value string, allowEmpty bool) error {

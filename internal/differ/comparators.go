@@ -2,7 +2,6 @@ package differ
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -494,6 +493,10 @@ func compareFunctions(desired, actual schema.Function) []string {
 		changes = append(changes, "parallel safety changed")
 	}
 
+	if !schemaNameSliceEqual(desired.SearchPath, actual.SearchPath) {
+		changes = append(changes, "search path changed")
+	}
+
 	if !stringPtrEqual(desired.Comment, actual.Comment) {
 		changes = append(changes, "comment changed")
 	}
@@ -543,6 +546,10 @@ func compareSequences(desired, actual schema.Sequence) []string {
 		changes = append(changes, "owned by changed")
 	}
 
+	if !stringPtrEqual(desired.Comment, actual.Comment) {
+		changes = append(changes, "comment changed")
+	}
+
 	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
@@ -551,6 +558,9 @@ func compareSequences(desired, actual schema.Sequence) []string {
 // compareEnums compares two enum type objects
 func compareEnums(desired, actual schema.EnumDef) []string {
 	var changes []string
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
+		changes = append(changes, "owner changed")
+	}
 
 	// Enums: order matters, can only safely add values at the end
 	if len(desired.Values) != len(actual.Values) {
@@ -571,18 +581,18 @@ func compareEnums(desired, actual schema.EnumDef) []string {
 		} else {
 			changes = append(changes, "enum values removed (unsafe)")
 		}
-		return changes
-	}
-
-	for i, v := range desired.Values {
-		if v != actual.Values[i] {
-			changes = append(changes, fmt.Sprintf("enum value %d changed", i))
+	} else {
+		for i, v := range desired.Values {
+			if v != actual.Values[i] {
+				changes = append(changes, fmt.Sprintf("enum value %d changed", i))
+			}
 		}
 	}
 
 	if !stringPtrEqual(desired.Comment, actual.Comment) {
 		changes = append(changes, "comment changed")
 	}
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
 }
@@ -590,6 +600,9 @@ func compareEnums(desired, actual schema.EnumDef) []string {
 // compareDomains compares two domain type objects
 func compareDomains(desired, actual schema.DomainDef) []string {
 	var changes []string
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
+		changes = append(changes, "owner changed")
+	}
 
 	if desired.BaseType != actual.BaseType {
 		changes = append(changes, "base type changed")
@@ -610,6 +623,7 @@ func compareDomains(desired, actual schema.DomainDef) []string {
 	if !stringPtrEqual(desired.Comment, actual.Comment) {
 		changes = append(changes, "comment changed")
 	}
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
 }
@@ -617,6 +631,9 @@ func compareDomains(desired, actual schema.DomainDef) []string {
 // compareComposites compares two composite type objects
 func compareComposites(desired, actual schema.CompositeDef) []string {
 	var changes []string
+	if desired.Owner != nil && !stringPtrEqual(desired.Owner, actual.Owner) {
+		changes = append(changes, "owner changed")
+	}
 
 	desiredMap := make(map[string]schema.CompositeAttr)
 	for _, attr := range desired.Attributes {
@@ -626,6 +643,14 @@ func compareComposites(desired, actual schema.CompositeDef) []string {
 	actualMap := make(map[string]schema.CompositeAttr)
 	for _, attr := range actual.Attributes {
 		actualMap[attr.Name] = attr
+	}
+	if len(desired.Attributes) == len(actual.Attributes) {
+		for i := range desired.Attributes {
+			if desired.Attributes[i].Name != actual.Attributes[i].Name {
+				changes = append(changes, "attribute order changed")
+				break
+			}
+		}
 	}
 
 	// Check for added/removed attributes
@@ -654,6 +679,7 @@ func compareComposites(desired, actual schema.CompositeDef) []string {
 	if !stringPtrEqual(desired.Comment, actual.Comment) {
 		changes = append(changes, "comment changed")
 	}
+	changes = append(changes, compareGrants(desired.Grants, actual.Grants)...)
 
 	return changes
 }
@@ -738,21 +764,23 @@ func exprPtrEqual(a, b *schema.Expr) bool {
 	return expressionsEquivalent(*a, *b)
 }
 
-var catalogCastPattern = regexp.MustCompile(`::[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)*(?:\([^)]*\))?(?:\[\])*`)
-
 // expressionsEquivalent is intentionally asymmetric: desired is the
 // declarative expression and actual is catalog-rendered SQL. PostgreSQL adds
-// explicit casts while resolving untyped literals. We may remove those casts
-// from actual to recover the desired spelling, but never remove casts from
-// desired—an explicitly requested cast remains semantic.
+// explicit casts while resolving untyped literals. We may remove literal-only
+// casts from actual to recover the desired spelling, but never remove casts
+// from desired or casts on non-literal expressions—an explicitly requested
+// cast remains semantic.
 func expressionsEquivalent(desired, actual schema.Expr) bool {
 	if desired == actual {
 		return true
 	}
-	withoutCatalogCasts := schema.Expr(catalogCastPattern.ReplaceAllString(string(actual), ""))
 	desiredCanonical := stripLeftAssociativeConcatParens(string(normalizer.Expr(desired)))
-	actualCanonical := stripLeftAssociativeConcatParens(string(normalizer.Expr(withoutCatalogCasts)))
-	return desiredCanonical == actualCanonical
+	actualCanonical := stripLeftAssociativeConcatParens(string(normalizer.Expr(actual)))
+	if desiredCanonical == actualCanonical {
+		return true
+	}
+	actualWithoutCatalogCasts := stripLeftAssociativeConcatParens(string(normalizer.ExprWithoutLiteralCasts(actual)))
+	return desiredCanonical == actualWithoutCatalogCasts
 }
 
 func stripLeftAssociativeConcatParens(expr string) string {
@@ -816,6 +844,20 @@ func stringSliceEqual(a, b []string) bool {
 	return true
 }
 
+func schemaNameSliceEqual(a, b []schema.SchemaName) bool {
+	// nil means the function has no SET search_path clause; a non-nil empty
+	// slice represents an explicit empty search path.
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func columnSliceEqual(a, b []schema.ColumnName) bool {
 	if len(a) != len(b) {
 		return false
@@ -846,6 +888,12 @@ func identitySpecEqual(a, b *schema.IdentitySpec) bool {
 		return false
 	}
 	if a.Always != b.Always {
+		return false
+	}
+	// A nil desired sequence name means PostgreSQL may choose the backing
+	// sequence name. Catalog extraction necessarily knows that generated name,
+	// so compare it only when the declarative schema explicitly manages it.
+	if a.SequenceName != nil && (b.SequenceName == nil || *a.SequenceName != *b.SequenceName) {
 		return false
 	}
 	return sequenceOptionsEqual(a.SequenceOptions, b.SequenceOptions)
@@ -1004,15 +1052,6 @@ func triggerEventSliceEqual(a, b []schema.TriggerEvent) bool {
 
 func qualifiedNameEqual(a, b schema.QualifiedName) bool {
 	return a.Schema == b.Schema && a.Name == b.Name
-}
-
-func sortedColumnNames(m map[schema.ColumnName]schema.Column) []schema.ColumnName {
-	keys := make([]schema.ColumnName, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	return keys
 }
 
 func sortedUniqueConstraintNames(m map[string]schema.UniqueConstraint) []string {

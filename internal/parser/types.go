@@ -139,22 +139,30 @@ func (p *Parser) parseCreateComposite(stmt *pg_query.CompositeTypeStmt) (schema.
 		Attributes: []schema.CompositeAttr{},
 	}
 
-	// Parse attributes
+	seen := make(map[string]struct{}, len(stmt.Coldeflist))
 	for _, col := range stmt.Coldeflist {
 		if col == nil {
-			continue
+			return nil, fmt.Errorf("composite %s contains an empty attribute", typeName)
 		}
-		if colDef, ok := col.Node.(*pg_query.Node_ColumnDef); ok {
-			attrType, err := p.parseTypeName(colDef.ColumnDef.TypeName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse composite %s attribute %s type: %w", typeName, colDef.ColumnDef.Colname, err)
-			}
-			attr := schema.CompositeAttr{
-				Name: colDef.ColumnDef.Colname,
-				Type: attrType,
-			}
-			composite.Attributes = append(composite.Attributes, attr)
+		colDef := col.GetColumnDef()
+		if colDef == nil || colDef.Colname == "" || colDef.TypeName == nil {
+			return nil, fmt.Errorf("composite %s contains an unsupported attribute definition", typeName)
 		}
+		if colDef.CollClause != nil {
+			return nil, fmt.Errorf("composite %s attribute %s uses COLLATE, which the declarative composite model cannot preserve", typeName, colDef.Colname)
+		}
+		if colDef.Compression != "" || colDef.Storage != "" || colDef.StorageName != "" || colDef.RawDefault != nil || colDef.CookedDefault != nil || colDef.Identity != "" || colDef.IdentitySequence != nil || colDef.Generated != "" || colDef.IsNotNull || colDef.IsFromType || len(colDef.Constraints) > 0 || len(colDef.Fdwoptions) > 0 {
+			return nil, fmt.Errorf("composite %s attribute %s contains unsupported column metadata", typeName, colDef.Colname)
+		}
+		if _, duplicate := seen[colDef.Colname]; duplicate {
+			return nil, fmt.Errorf("composite %s declares duplicate attribute %s", typeName, colDef.Colname)
+		}
+		seen[colDef.Colname] = struct{}{}
+		attrType, err := p.parseTypeName(colDef.TypeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse composite %s attribute %s type: %w", typeName, colDef.Colname, err)
+		}
+		composite.Attributes = append(composite.Attributes, schema.CompositeAttr{Name: colDef.Colname, Type: attrType})
 	}
 
 	return composite, nil

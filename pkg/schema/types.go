@@ -85,8 +85,10 @@ type DBType interface {
 type EnumDef struct {
 	Schema  SchemaName
 	Name    TypeName
+	Owner   *string
 	Values  []string // Order matters!
 	Comment *string
+	Grants  []Grant
 }
 
 func (EnumDef) isDatabaseObject()         {}
@@ -97,11 +99,13 @@ func (EnumDef) isDBType()                 {}
 type DomainDef struct {
 	Schema   SchemaName
 	Name     TypeName
+	Owner    *string
 	BaseType TypeName
 	NotNull  bool
 	Default  *Expr
 	Check    *Expr
 	Comment  *string
+	Grants   []Grant
 }
 
 func (DomainDef) isDatabaseObject()         {}
@@ -112,8 +116,10 @@ func (DomainDef) isDBType()                 {}
 type CompositeDef struct {
 	Schema     SchemaName
 	Name       TypeName
+	Owner      *string
 	Attributes []CompositeAttr
 	Comment    *string
+	Grants     []Grant
 }
 
 type CompositeAttr struct {
@@ -130,6 +136,7 @@ type Sequence struct {
 	Schema    SchemaName
 	Name      string
 	Owner     *string
+	Comment   *string
 	Type      string // "bigint", "integer", "smallint"
 	Start     *int64
 	Increment *int64
@@ -188,7 +195,10 @@ type GeneratedSpec struct {
 }
 
 type IdentitySpec struct {
-	Always          bool // True for ALWAYS, False for BY DEFAULT
+	Always bool // True for ALWAYS, False for BY DEFAULT
+	// SequenceName preserves PostgreSQL's optional IDENTITY SEQUENCE NAME.
+	// A nil value asks PostgreSQL to choose its normal table/column-derived name.
+	SequenceName    *QualifiedName
 	SequenceOptions []SequenceOption
 }
 
@@ -518,7 +528,7 @@ type Policy struct {
 	Name       string
 	Permissive bool // True for PERMISSIVE, False for RESTRICTIVE
 	For        PolicyFor
-	To         []string // Role names
+	To         []string // Role names; policy role typing is outside Grant ACL scope.
 	Using      *Expr
 	WithCheck  *Expr
 }
@@ -538,9 +548,32 @@ const (
 
 // Grant represents object permissions
 type Grant struct {
-	Grantee    string
+	Grantee    Grantee
 	Privileges []Privilege
 	Grantable  bool
+}
+
+// Grantee distinguishes PostgreSQL's PUBLIC pseudo-role from an ordinary
+// role. This distinction cannot be represented by a string sentinel because
+// PostgreSQL also permits a real, quoted role whose name is exactly "PUBLIC".
+type Grantee struct {
+	Kind GranteeKind
+	Name string
+}
+
+type GranteeKind string
+
+const (
+	GranteeRole   GranteeKind = "role"
+	GranteePublic GranteeKind = "public"
+)
+
+func RoleGrantee(name string) Grantee {
+	return Grantee{Kind: GranteeRole, Name: name}
+}
+
+func PublicGrantee() Grantee {
+	return Grantee{Kind: GranteePublic}
 }
 
 type Privilege string
@@ -553,6 +586,7 @@ const (
 	PrivTruncate   Privilege = "TRUNCATE"
 	PrivReferences Privilege = "REFERENCES"
 	PrivTrigger    Privilege = "TRIGGER"
+	PrivMaintain   Privilege = "MAINTAIN"
 	PrivExecute    Privilege = "EXECUTE"
 	PrivUsage      Privilege = "USAGE"
 	PrivCreate     Privilege = "CREATE"
