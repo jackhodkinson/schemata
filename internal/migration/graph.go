@@ -24,10 +24,6 @@ func ValidateInventory(migrations []Migration) error {
 		switch migrations[i].ExecutionMode {
 		case ExecutionModeTransactional:
 		case ExecutionModeNonTransactional:
-			return fmt.Errorf(
-				"migration %s requests non-transactional execution, which is not supported yet",
-				migrations[i].Version,
-			)
 		default:
 			return fmt.Errorf(
 				"migration %s has unsupported execution mode %q",

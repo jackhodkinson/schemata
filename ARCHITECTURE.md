@@ -272,7 +272,7 @@ CREATE TABLE IF NOT EXISTS schemata.version (
 •	A migration’s version is the filename prefix: YYYYMMDDHHMMSS-...sql → version_num = YYYYMMDDHHMMSS.
 •	The checksum is SHA-256 over the exact source-file bytes, including comments, directives, and line endings. Moo migrations hash the complete source file rather than only the extracted Apply block.
 •	Before planning pending work, Schemata rejects changed checksums, renamed migrations, missing local versions, changed transaction modes or statement counts, incomplete states, and applied migrations whose dependencies are not applied.
-•	The progress and recovery columns form the durable state model for non-transactional execution. Until that execution path is enabled, non-transactional migrations are rejected; transactional migrations are recorded as applied atomically with their schema changes.
+•	The progress and recovery columns form the durable state model for non-transactional execution. Transactional migrations are recorded as applied atomically with their schema changes. Non-transactional migrations confirm each committed top-level statement separately and require explicit operator recovery after any incomplete attempt.
 
 How apply runs
 1.	Resolve the target, load and validate every migration, calculate exact checksums, split top-level statements, and reject explicit transaction-control commands.
@@ -288,9 +288,16 @@ How apply runs
    - Update the row to `applied` and verify the transition.
    - Commit. On error: roll back the migration and stop.
    - Destroy the execution session so migration-created session state cannot leak into another migration or the pool.
-7.	Release the runner lock and destroy its dedicated session.
+7.	For each pending migration whose leading header declares `-- schemata:transaction off`:
+   - Acquire a session-scoped control fence and cross a separate active-statement fence. This allows statements such as `CREATE INDEX CONCURRENTLY` while preventing recovery from overlapping an orphan executor.
+   - Insert a durable `running` row. Execute each top-level statement on a newly opened physical session, holding the active-statement fence for its full lifetime, then destroy that session and durably advance `last_confirmed_statement`.
+   - On a definite PostgreSQL statement error, persist `failed`, the one-based statement index, a bounded diagnostic, and SQLSTATE when available. A crash or connection loss in the commit-to-confirmation window may intentionally leave `running` because its outcome is ambiguous.
+   - Mark the migration `applied` only after every statement is confirmed. Never resume an incomplete row implicitly.
+8.	Release the runner lock and destroy its dedicated session.
 
 Dry-run does not create the tracking schema on a fresh database.
+
+Incomplete non-transactional migrations are reconciled with the explicit `schemata recover` workflow described in [migration recovery](docs/migration-recovery.md). Retry requires an operator-attested `--confirmed-through N` boundary; `--mark-applied` attests that all statements are already durable.
 
 Migration files are trusted executable code, not sandboxed input. Schemata rejects direct tracking-schema access and verifies the durable ledger around execution, but a deployment role with unrestricted privileges can deliberately bypass in-process safeguards. Production deployments must therefore use the documented least-privilege role boundary once that operational work is complete.
 

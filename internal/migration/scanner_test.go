@@ -174,6 +174,19 @@ func TestMigrationLoadSQLNeverTrustsSuppliedChecksum(t *testing.T) {
 	assert.Equal(t, []string{"SELECT 1"}, migration.Statements)
 }
 
+func TestMigrationLoadSQLDerivesExecutionModeFromChecksummedSource(t *testing.T) {
+	migration := Migration{
+		SQL:           "-- schemata:transaction off\nCREATE INDEX CONCURRENTLY example_idx ON example (id);",
+		ExecutionMode: ExecutionModeTransactional,
+	}
+	require.NoError(t, migration.LoadSQL())
+	assert.Equal(t, ExecutionModeNonTransactional, migration.ExecutionMode)
+
+	migration.ExecutionMode = ExecutionModeTransactional
+	require.NoError(t, migration.LoadSQL())
+	assert.Equal(t, ExecutionModeNonTransactional, migration.ExecutionMode)
+}
+
 func TestMigrationRejectsSQLMutationAfterPreparation(t *testing.T) {
 	migration := Migration{SQL: "SELECT 1;"}
 	require.NoError(t, migration.LoadSQL())

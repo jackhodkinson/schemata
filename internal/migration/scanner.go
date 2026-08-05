@@ -112,14 +112,18 @@ func (m *Migration) LoadSQL() error {
 	// Always derive the public checksum. Never trust a caller-supplied or stale
 	// value when deciding what immutable identity will be recorded.
 	m.Checksum = migrationChecksum(m.sourceBytes)
+	directives, err := parseMigrationDirectives(m.SQL)
+	if err != nil {
+		return err
+	}
 	if m.dependenciesAuthoritative {
 		m.DependsOn = cloneDependencies(m.authoritativeDependencies)
 	} else {
-		m.DependsOn = parseDirectives(m.SQL)
+		m.DependsOn = directives.DependsOn
 	}
-	if m.ExecutionMode == "" {
-		m.ExecutionMode = ExecutionModeTransactional
-	}
+	// Execution policy is part of the checksummed source and is never trusted
+	// from a mutable, caller-supplied struct field.
+	m.ExecutionMode = directives.ExecutionMode
 	return m.prepareStatements()
 }
 

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/jackhodkinson/schemata/internal/app"
@@ -93,8 +92,8 @@ func runApply(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Found %d migrations\n", len(migrations))
 
 	// Connect to database
-	ctx := context.Background()
-	pool, err := db.Connect(ctx, targetConn)
+	ctx := cmd.Context()
+	pool, err := db.Connect(ctx, targetConn, db.WithDatabaseConfig(cfg.Database))
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}

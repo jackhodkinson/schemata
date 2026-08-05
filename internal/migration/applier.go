@@ -13,6 +13,7 @@ import (
 const (
 	migrationLockName       = "schemata:migrations"
 	migrationExecutionLock  = "schemata:migration-transaction"
+	migrationStatementLock  = "schemata:migration-active-statement"
 	migrationLockTimeout    = 30 * time.Second
 	migrationCleanupTimeout = 5 * time.Second
 	migrationHeartbeatEvery = 250 * time.Millisecond
@@ -247,16 +248,44 @@ func (a *Applier) applyMigration(
 	go monitorMigrationLock(migrationCtx, lockConn, stopHeartbeat, cancelMigration, heartbeatDone)
 
 	var updatedHistory []db.MigrationRecord
-	applyErr := db.WithDedicatedConnection(migrationCtx, a.pool, func(conn *pgxpool.Conn) error {
-		var err error
-		updatedHistory, err = a.applyTransactionalMigration(
+	var applyErr error
+	switch migration.ExecutionMode {
+	case ExecutionModeTransactional:
+		applyErr = db.WithDedicatedConnection(migrationCtx, a.pool, func(conn *pgxpool.Conn) error {
+			var err error
+			updatedHistory, err = a.applyTransactionalMigration(
+				migrationCtx,
+				conn,
+				migration,
+				expectedHistory,
+			)
+			return err
+		})
+	case ExecutionModeNonTransactional:
+		// A session-scoped execution fence survives each statement's implicit
+		// transaction and prevents a recovering runner from overlapping an
+		// orphaned executor whose outer runner lock disappeared.
+		applyErr = db.WithSessionAdvisoryLock(
 			migrationCtx,
-			conn,
-			migration,
-			expectedHistory,
+			a.pool,
+			migrationExecutionLock,
+			migrationLockTimeout,
+			func(conn *pgxpool.Conn) error {
+				var err error
+				updatedHistory, err = a.applyNonTransactionalMigration(
+					migrationCtx,
+					conn,
+					migration,
+					expectedHistory,
+					0,
+					true,
+				)
+				return err
+			},
 		)
-		return err
-	})
+	default:
+		applyErr = fmt.Errorf("unsupported execution mode %q", migration.ExecutionMode)
+	}
 	close(stopHeartbeat)
 	heartbeatErr := <-heartbeatDone
 	cancelMigration(context.Canceled)
@@ -291,14 +320,17 @@ func (a *Applier) applyTransactionalMigration(
 	}()
 
 	// The session lock coordinates whole runs. This second transaction-scoped
-	// fence prevents overlapping DDL even if that session disappears while a
-	// migration is executing.
-	if _, err := tx.Exec(
-		ctx,
-		"SELECT pg_advisory_xact_lock($1)",
-		db.AdvisoryLockKey(migrationExecutionLock),
-	); err != nil {
-		return nil, fmt.Errorf("failed to acquire migration transaction fence: %w", err)
+	// fences prevent overlapping DDL even if an earlier runner's control
+	// session disappeared while a non-transactional statement backend was
+	// still finishing. Acquire them in the same order as recovery.
+	for _, lockName := range []string{migrationExecutionLock, migrationStatementLock} {
+		if _, err := tx.Exec(
+			ctx,
+			"SELECT pg_advisory_xact_lock($1)",
+			db.AdvisoryLockKey(lockName),
+		); err != nil {
+			return nil, fmt.Errorf("failed to acquire migration transaction fence %q: %w", lockName, err)
+		}
 	}
 	if err := a.tracker.ValidateSchemaWithExecutor(ctx, tx); err != nil {
 		return nil, fmt.Errorf("migration tracking schema changed before execution: %w", err)
@@ -311,13 +343,7 @@ func (a *Applier) applyTransactionalMigration(
 		return nil, fmt.Errorf("migration history changed after this run planned its pending work")
 	}
 
-	metadata := db.MigrationMetadata{
-		Version:        migration.Version,
-		Name:           migration.Name,
-		Checksum:       migration.Checksum,
-		ExecutionMode:  migration.ExecutionMode,
-		StatementCount: len(migration.Statements),
-	}
+	metadata := metadataForMigration(migration)
 	if err := a.tracker.MarkRunning(ctx, tx, metadata); err != nil {
 		return nil, fmt.Errorf("failed to mark migration as running: %w", err)
 	}
@@ -386,6 +412,16 @@ func (a *Applier) applyTransactionalMigration(
 	}
 
 	return durableHistory, nil
+}
+
+func metadataForMigration(migration Migration) db.MigrationMetadata {
+	return db.MigrationMetadata{
+		Version:        migration.Version,
+		Name:           migration.Name,
+		Checksum:       migration.Checksum,
+		ExecutionMode:  migration.ExecutionMode,
+		StatementCount: len(migration.Statements),
+	}
 }
 
 func verifyMigrationLock(ctx context.Context, lockConn *pgxpool.Conn) error {

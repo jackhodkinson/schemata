@@ -15,6 +15,9 @@ const (
 	MigrationStatusRunning = "running"
 	MigrationStatusApplied = "applied"
 	MigrationStatusFailed  = "failed"
+
+	MigrationRecoveryRetry       = "retry"
+	MigrationRecoveryMarkApplied = "mark_applied"
 )
 
 var expectedVersionColumns = []string{
@@ -46,7 +49,7 @@ var expectedVersionConstraints = []string{
 	"version_recovery_pair:c:true:CHECK ((recovered_at IS NULL) = (recovery_action IS NULL))",
 	"version_statement_count:c:true:CHECK (statement_count >= 0)",
 	"version_status:c:true:CHECK (status = ANY (ARRAY['running'::text, 'applied'::text, 'failed'::text]))",
-	"version_status_state:c:true:CHECK (status = 'running'::text AND finished_at IS NULL AND failed_statement IS NULL AND error_message IS NULL AND error_code IS NULL OR status = 'applied'::text AND finished_at IS NOT NULL AND last_confirmed_statement = statement_count AND failed_statement IS NULL AND error_message IS NULL AND error_code IS NULL OR status = 'failed'::text AND finished_at IS NOT NULL AND failed_statement IS NOT NULL AND last_confirmed_statement < failed_statement AND error_message IS NOT NULL)",
+	"version_status_state:c:true:CHECK (status = 'running'::text AND finished_at IS NULL AND failed_statement IS NULL AND error_message IS NULL AND error_code IS NULL OR status = 'applied'::text AND finished_at IS NOT NULL AND last_confirmed_statement = statement_count AND failed_statement IS NULL AND error_message IS NULL AND error_code IS NULL OR status = 'failed'::text AND finished_at IS NOT NULL AND failed_statement IS NOT NULL AND last_confirmed_statement = (failed_statement - 1) AND error_message IS NOT NULL)",
 }
 
 // MigrationMetadata is the immutable identity recorded for a migration.
@@ -76,7 +79,7 @@ type MigrationRecord struct {
 const (
 	schemaName          = "schemata"
 	tableName           = "version"
-	versionSchemaMarker = "schemata:migration-history:v1"
+	versionSchemaMarker = "schemata:migration-history:v2"
 
 	ensureSchemaLockName    = "schemata:ensure-schema"
 	ensureSchemaLockTimeout = 30 * time.Second
@@ -177,7 +180,7 @@ func (mt *MigrationTracker) ensureSchema(ctx context.Context, executor Executor)
 				OR (status = 'failed'
 					AND finished_at IS NOT NULL
 					AND failed_statement IS NOT NULL
-					AND last_confirmed_statement < failed_statement
+					AND last_confirmed_statement = failed_statement - 1
 					AND error_message IS NOT NULL)
 			)
 		)
@@ -506,7 +509,8 @@ func (mt *MigrationTracker) MarkRunning(
 
 // MarkApplied completes a previously running migration. Immutable metadata is
 // repeated in the predicate so a stale or mismatched caller cannot complete a
-// different history row.
+// different history row. Non-transactional rows must already confirm every
+// statement; transactional rows advance atomically with this update.
 func (mt *MigrationTracker) MarkApplied(
 	ctx context.Context,
 	executor Executor,
@@ -523,6 +527,7 @@ func (mt *MigrationTracker) MarkApplied(
 		  AND execution_mode = $4
 		  AND statement_count = $5
 		  AND status = 'running'
+		  AND (execution_mode = 'transactional' OR last_confirmed_statement = statement_count)
 	`, schemaName, tableName)
 
 	tag, err := executor.Exec(
@@ -539,6 +544,232 @@ func (mt *MigrationTracker) MarkApplied(
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("failed to mark migration as applied: running history row did not match immutable metadata")
+	}
+
+	return nil
+}
+
+// MarkStatementConfirmed durably records one successfully committed statement
+// in a non-transactional migration. The exact previous progress is part of the
+// predicate so confirmations cannot skip or reorder statements.
+func (mt *MigrationTracker) MarkStatementConfirmed(
+	ctx context.Context,
+	executor Executor,
+	metadata MigrationMetadata,
+	statement int,
+) error {
+	if statement < 1 || statement > metadata.StatementCount {
+		return fmt.Errorf("statement confirmation %d is outside migration statement count %d", statement, metadata.StatementCount)
+	}
+
+	query := fmt.Sprintf(`
+		UPDATE %s.%s
+		SET last_confirmed_statement = $6
+		WHERE version_num = $1
+		  AND name = $2
+		  AND checksum = $3
+		  AND execution_mode = $4
+		  AND statement_count = $5
+		  AND status = 'running'
+		  AND last_confirmed_statement = $6 - 1
+	`, schemaName, tableName)
+
+	tag, err := executor.Exec(
+		ctx,
+		query,
+		metadata.Version,
+		metadata.Name,
+		metadata.Checksum,
+		metadata.ExecutionMode,
+		metadata.StatementCount,
+		statement,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to confirm migration statement %d: %w", statement, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("failed to confirm migration statement %d: running history row or previous progress did not match", statement)
+	}
+
+	return nil
+}
+
+// MarkFailed records a statement error after PostgreSQL has reported that the
+// autocommitted statement failed. Errors that leave commit outcome ambiguous
+// intentionally remain running and require explicit operator recovery.
+func (mt *MigrationTracker) MarkFailed(
+	ctx context.Context,
+	executor Executor,
+	metadata MigrationMetadata,
+	failedStatement int,
+	errorMessage string,
+	errorCode *string,
+) error {
+	if failedStatement < 1 || failedStatement > metadata.StatementCount {
+		return fmt.Errorf("failed statement %d is outside migration statement count %d", failedStatement, metadata.StatementCount)
+	}
+	if errorMessage == "" {
+		return fmt.Errorf("migration failure message must not be empty")
+	}
+
+	query := fmt.Sprintf(`
+		UPDATE %s.%s
+		SET status = 'failed',
+		    finished_at = clock_timestamp(),
+		    failed_statement = $6,
+		    error_message = $7,
+		    error_code = $8
+		WHERE version_num = $1
+		  AND name = $2
+		  AND checksum = $3
+		  AND execution_mode = $4
+		  AND statement_count = $5
+		  AND status = 'running'
+		  AND last_confirmed_statement = $6 - 1
+	`, schemaName, tableName)
+
+	tag, err := executor.Exec(
+		ctx,
+		query,
+		metadata.Version,
+		metadata.Name,
+		metadata.Checksum,
+		metadata.ExecutionMode,
+		metadata.StatementCount,
+		failedStatement,
+		errorMessage,
+		errorCode,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record migration statement %d failure: %w", failedStatement, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("failed to record migration statement %d failure: running history row or previous progress did not match", failedStatement)
+	}
+
+	return nil
+}
+
+// MarkRetrying records an explicit operator decision about the durable
+// statement boundary and prepares an incomplete non-transactional migration
+// for another attempt. Progress may only move forward.
+func (mt *MigrationTracker) MarkRetrying(
+	ctx context.Context,
+	executor Executor,
+	previous MigrationRecord,
+	confirmedThrough int,
+) error {
+	if previous.ExecutionMode != "non_transactional" {
+		return fmt.Errorf("only non-transactional migrations can be retried")
+	}
+	if previous.Status != MigrationStatusRunning && previous.Status != MigrationStatusFailed {
+		return fmt.Errorf("only running or failed migrations can be retried")
+	}
+	if confirmedThrough < previous.LastConfirmedStatement || confirmedThrough >= previous.StatementCount {
+		return fmt.Errorf(
+			"confirmed-through value %d must be between durable progress %d and %d",
+			confirmedThrough,
+			previous.LastConfirmedStatement,
+			previous.StatementCount-1,
+		)
+	}
+
+	query := fmt.Sprintf(`
+		UPDATE %s.%s
+		SET status = 'running',
+		    started_at = clock_timestamp(),
+		    finished_at = NULL,
+		    last_confirmed_statement = $9,
+		    failed_statement = NULL,
+		    error_message = NULL,
+		    error_code = NULL,
+		    attempt_count = attempt_count + 1,
+		    recovered_at = clock_timestamp(),
+		    recovery_action = '%s'
+		WHERE version_num = $1
+		  AND name = $2
+		  AND checksum = $3
+		  AND execution_mode = $4
+		  AND statement_count = $5
+		  AND status = $6
+		  AND last_confirmed_statement = $7
+		  AND attempt_count = $8
+	`, schemaName, tableName, MigrationRecoveryRetry)
+
+	tag, err := executor.Exec(
+		ctx,
+		query,
+		previous.Version,
+		previous.Name,
+		previous.Checksum,
+		previous.ExecutionMode,
+		previous.StatementCount,
+		previous.Status,
+		previous.LastConfirmedStatement,
+		previous.AttemptCount,
+		confirmedThrough,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to prepare migration retry: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("failed to prepare migration retry: incomplete history row changed before recovery")
+	}
+
+	return nil
+}
+
+// MarkRecoveredApplied records an operator attestation that every statement
+// in an incomplete non-transactional migration is already durable.
+func (mt *MigrationTracker) MarkRecoveredApplied(
+	ctx context.Context,
+	executor Executor,
+	previous MigrationRecord,
+) error {
+	if previous.ExecutionMode != "non_transactional" {
+		return fmt.Errorf("only non-transactional migrations can be recovered")
+	}
+	if previous.Status != MigrationStatusRunning && previous.Status != MigrationStatusFailed {
+		return fmt.Errorf("only running or failed migrations can be recovered")
+	}
+
+	query := fmt.Sprintf(`
+		UPDATE %s.%s
+		SET status = 'applied',
+		    finished_at = clock_timestamp(),
+		    last_confirmed_statement = statement_count,
+		    failed_statement = NULL,
+		    error_message = NULL,
+		    error_code = NULL,
+		    recovered_at = clock_timestamp(),
+		    recovery_action = '%s'
+		WHERE version_num = $1
+		  AND name = $2
+		  AND checksum = $3
+		  AND execution_mode = $4
+		  AND statement_count = $5
+		  AND status = $6
+		  AND last_confirmed_statement = $7
+		  AND attempt_count = $8
+	`, schemaName, tableName, MigrationRecoveryMarkApplied)
+
+	tag, err := executor.Exec(
+		ctx,
+		query,
+		previous.Version,
+		previous.Name,
+		previous.Checksum,
+		previous.ExecutionMode,
+		previous.StatementCount,
+		previous.Status,
+		previous.LastConfirmedStatement,
+		previous.AttemptCount,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to mark recovered migration as applied: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("failed to mark recovered migration as applied: incomplete history row changed before recovery")
 	}
 
 	return nil

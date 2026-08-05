@@ -33,47 +33,20 @@ func validateMigrationHistory(
 				record.Version,
 			)
 		}
+		if err := validateMigrationRecordIdentity(record, local); err != nil {
+			return nil, err
+		}
 
 		if record.Status != db.MigrationStatusApplied {
 			return nil, fmt.Errorf(
-				"migration %s has incomplete database status %q; reconcile it explicitly before applying more migrations",
+				"migration %s has incomplete database status %q at confirmed statement %d of %d; normal apply never resumes partial work: inspect the database, then use schemata recover %s --retry --confirmed-through N or --mark-applied",
 				record.Version,
 				record.Status,
-			)
-		}
-		if record.Name != local.Name {
-			return nil, fmt.Errorf(
-				"applied migration %s was renamed: database records %q, local inventory has %q",
-				record.Version,
-				record.Name,
-				local.Name,
-			)
-		}
-		if record.Checksum != local.Checksum {
-			return nil, fmt.Errorf(
-				"applied migration %s checksum mismatch: database records %s, local source is %s",
-				record.Version,
-				record.Checksum,
-				local.Checksum,
-			)
-		}
-		if record.ExecutionMode != local.ExecutionMode {
-			return nil, fmt.Errorf(
-				"applied migration %s execution mode mismatch: database records %q, local source declares %q",
-				record.Version,
-				record.ExecutionMode,
-				local.ExecutionMode,
-			)
-		}
-		if record.StatementCount != len(local.Statements) {
-			return nil, fmt.Errorf(
-				"applied migration %s statement count mismatch: database records %d, local source has %d",
-				record.Version,
+				record.LastConfirmedStatement,
 				record.StatementCount,
-				len(local.Statements),
+				record.Version,
 			)
 		}
-
 		applied[record.Version] = true
 	}
 
@@ -102,6 +75,130 @@ func validateMigrationHistory(
 	return pending, nil
 }
 
+func validateMigrationRecordIdentity(record db.MigrationRecord, local Migration) error {
+	if record.Name != local.Name {
+		return fmt.Errorf(
+			"migration %s was renamed: database records %q, local inventory has %q",
+			record.Version,
+			record.Name,
+			local.Name,
+		)
+	}
+	if record.Checksum != local.Checksum {
+		return fmt.Errorf(
+			"migration %s checksum mismatch: database records %s, local source is %s",
+			record.Version,
+			record.Checksum,
+			local.Checksum,
+		)
+	}
+	if record.ExecutionMode != local.ExecutionMode {
+		return fmt.Errorf(
+			"migration %s execution mode mismatch: database records %q, local source declares %q",
+			record.Version,
+			record.ExecutionMode,
+			local.ExecutionMode,
+		)
+	}
+	if record.StatementCount != len(local.Statements) {
+		return fmt.Errorf(
+			"migration %s statement count mismatch: database records %d, local source has %d",
+			record.Version,
+			record.StatementCount,
+			len(local.Statements),
+		)
+	}
+	return nil
+}
+
+// validateRecoveryCandidate verifies the complete history while permitting
+// exactly one selected incomplete non-transactional migration. Normal apply
+// deliberately uses validateMigrationHistory and therefore never resumes one
+// implicitly.
+func validateRecoveryCandidate(
+	migrations []Migration,
+	history []db.MigrationRecord,
+	version string,
+) (Migration, db.MigrationRecord, error) {
+	localByVersion := make(map[string]Migration, len(migrations))
+	for i := range migrations {
+		localByVersion[migrations[i].Version] = migrations[i]
+	}
+
+	local, localExists := localByVersion[version]
+	if !localExists {
+		return Migration{}, db.MigrationRecord{}, fmt.Errorf("recovery migration %s is missing from the local inventory", version)
+	}
+
+	applied := make(map[string]bool, len(history))
+	var candidate db.MigrationRecord
+	candidateExists := false
+	for _, record := range history {
+		if err := validateHistoryRecord(record); err != nil {
+			return Migration{}, db.MigrationRecord{}, fmt.Errorf("invalid database history for migration %s: %w", record.Version, err)
+		}
+		localRecord, exists := localByVersion[record.Version]
+		if !exists {
+			return Migration{}, db.MigrationRecord{}, fmt.Errorf(
+				"database records migration %s, but that version is missing from the local inventory",
+				record.Version,
+			)
+		}
+		if err := validateMigrationRecordIdentity(record, localRecord); err != nil {
+			return Migration{}, db.MigrationRecord{}, err
+		}
+
+		if record.Version == version {
+			if record.Status != db.MigrationStatusRunning && record.Status != db.MigrationStatusFailed {
+				return Migration{}, db.MigrationRecord{}, fmt.Errorf(
+					"migration %s is %q, not an incomplete migration that requires recovery",
+					version,
+					record.Status,
+				)
+			}
+			if record.ExecutionMode != ExecutionModeNonTransactional {
+				return Migration{}, db.MigrationRecord{}, fmt.Errorf(
+					"migration %s is transactional and cannot be recovered as a partially committed migration",
+					version,
+				)
+			}
+			candidate = record
+			candidateExists = true
+			continue
+		}
+
+		if record.Status != db.MigrationStatusApplied {
+			return Migration{}, db.MigrationRecord{}, fmt.Errorf(
+				"migration %s also has incomplete database status %q; recover one migration at a time",
+				record.Version,
+				record.Status,
+			)
+		}
+		applied[record.Version] = true
+	}
+
+	if !candidateExists {
+		return Migration{}, db.MigrationRecord{}, fmt.Errorf("migration %s has no durable incomplete history row", version)
+	}
+
+	for _, migration := range migrations {
+		if migration.Version != version && !applied[migration.Version] {
+			continue
+		}
+		for _, dependency := range migration.DependsOn {
+			if !applied[dependency] {
+				return Migration{}, db.MigrationRecord{}, fmt.Errorf(
+					"migration %s depends on migration %s, which is not recorded as applied",
+					migration.Version,
+					dependency,
+				)
+			}
+		}
+	}
+
+	return local, candidate, nil
+}
+
 func validateHistoryRecord(record db.MigrationRecord) error {
 	if record.Version == "" || record.Name == "" {
 		return fmt.Errorf("version and name must be non-empty")
@@ -127,6 +224,9 @@ func validateHistoryRecord(record db.MigrationRecord) error {
 	if (record.RecoveredAt == nil) != (record.RecoveryAction == nil) {
 		return fmt.Errorf("recovery timestamp and action must either both be set or both be absent")
 	}
+	if record.RecoveryAction != nil && *record.RecoveryAction != db.MigrationRecoveryRetry && *record.RecoveryAction != db.MigrationRecoveryMarkApplied {
+		return fmt.Errorf("unknown recovery action %q", *record.RecoveryAction)
+	}
 
 	switch record.Status {
 	case db.MigrationStatusRunning:
@@ -147,14 +247,137 @@ func validateHistoryRecord(record db.MigrationRecord) error {
 		if *record.FailedStatement < 1 || *record.FailedStatement > record.StatementCount {
 			return fmt.Errorf("failed statement index is outside the migration")
 		}
-		if record.LastConfirmedStatement >= *record.FailedStatement {
-			return fmt.Errorf("failed statement must follow the last confirmed statement")
+		if record.LastConfirmedStatement != *record.FailedStatement-1 {
+			return fmt.Errorf("failed statement must immediately follow the last confirmed statement")
 		}
 	default:
 		return fmt.Errorf("unknown status %q", record.Status)
 	}
 
 	return nil
+}
+
+func validateProgressHistoryTransition(
+	before, after []db.MigrationRecord,
+	metadata db.MigrationMetadata,
+	confirmed int,
+) error {
+	previous, previousExists := findMigrationRecord(before, metadata.Version)
+	current, currentExists := findMigrationRecord(after, metadata.Version)
+	if !previousExists || !currentExists || len(before) != len(after) {
+		return fmt.Errorf("statement progress transition for migration %s is missing or changed row count", metadata.Version)
+	}
+	expected := previous
+	expected.LastConfirmedStatement = confirmed
+	if !migrationRecordsEqual(expected, current) {
+		return fmt.Errorf("statement progress row %s changed fields other than confirmed progress", metadata.Version)
+	}
+	if current.MigrationMetadata != metadata || current.Status != db.MigrationStatusRunning {
+		return fmt.Errorf("statement progress row %s does not match its immutable metadata or running status", metadata.Version)
+	}
+	if err := validateHistoryRecord(current); err != nil {
+		return fmt.Errorf("statement progress row %s is invalid: %w", metadata.Version, err)
+	}
+	if !historiesEqualWithoutVersion(before, after, metadata.Version) {
+		return fmt.Errorf("existing migration history changed while confirming migration %s", metadata.Version)
+	}
+	return nil
+}
+
+func validateFailedHistoryTransition(
+	before, after []db.MigrationRecord,
+	metadata db.MigrationMetadata,
+	failedStatement int,
+) error {
+	previous, previousExists := findMigrationRecord(before, metadata.Version)
+	current, currentExists := findMigrationRecord(after, metadata.Version)
+	if !previousExists || !currentExists || len(before) != len(after) {
+		return fmt.Errorf("failure transition for migration %s is missing or changed row count", metadata.Version)
+	}
+	if current.MigrationMetadata != metadata || current.Status != db.MigrationStatusFailed ||
+		current.FailedStatement == nil || *current.FailedStatement != failedStatement ||
+		current.LastConfirmedStatement != previous.LastConfirmedStatement ||
+		!current.StartedAt.Equal(previous.StartedAt) || current.AttemptCount != previous.AttemptCount ||
+		!optionalTimesEqual(current.RecoveredAt, previous.RecoveredAt) ||
+		!optionalStringsEqual(current.RecoveryAction, previous.RecoveryAction) {
+		return fmt.Errorf("failed history row %s contains an invalid transition", metadata.Version)
+	}
+	if err := validateHistoryRecord(current); err != nil {
+		return fmt.Errorf("failed history row %s is invalid: %w", metadata.Version, err)
+	}
+	if !historiesEqualWithoutVersion(before, after, metadata.Version) {
+		return fmt.Errorf("existing migration history changed while failing migration %s", metadata.Version)
+	}
+	return nil
+}
+
+func validateRetryHistoryTransition(
+	before, after []db.MigrationRecord,
+	metadata db.MigrationMetadata,
+	confirmedThrough int,
+) error {
+	previous, previousExists := findMigrationRecord(before, metadata.Version)
+	current, currentExists := findMigrationRecord(after, metadata.Version)
+	if !previousExists || !currentExists || len(before) != len(after) {
+		return fmt.Errorf("retry transition for migration %s is missing or changed row count", metadata.Version)
+	}
+	if current.MigrationMetadata != metadata || current.Status != db.MigrationStatusRunning ||
+		current.LastConfirmedStatement != confirmedThrough || current.AttemptCount != previous.AttemptCount+1 ||
+		current.FinishedAt != nil || current.FailedStatement != nil || current.ErrorMessage != nil || current.ErrorCode != nil ||
+		current.RecoveredAt == nil || current.RecoveryAction == nil || *current.RecoveryAction != db.MigrationRecoveryRetry {
+		return fmt.Errorf("retry history row %s contains an invalid transition", metadata.Version)
+	}
+	if current.StartedAt.Before(previous.StartedAt) {
+		return fmt.Errorf("retry history row %s moved its start time backwards", metadata.Version)
+	}
+	if err := validateHistoryRecord(current); err != nil {
+		return fmt.Errorf("retry history row %s is invalid: %w", metadata.Version, err)
+	}
+	if !historiesEqualWithoutVersion(before, after, metadata.Version) {
+		return fmt.Errorf("existing migration history changed while retrying migration %s", metadata.Version)
+	}
+	return nil
+}
+
+func validateRecoveredAppliedHistoryTransition(
+	before, after []db.MigrationRecord,
+	metadata db.MigrationMetadata,
+) error {
+	previous, previousExists := findMigrationRecord(before, metadata.Version)
+	current, currentExists := findMigrationRecord(after, metadata.Version)
+	if !previousExists || !currentExists || len(before) != len(after) {
+		return fmt.Errorf("mark-applied transition for migration %s is missing or changed row count", metadata.Version)
+	}
+	if current.MigrationMetadata != metadata || current.Status != db.MigrationStatusApplied ||
+		current.LastConfirmedStatement != current.StatementCount || current.AttemptCount != previous.AttemptCount ||
+		!current.StartedAt.Equal(previous.StartedAt) || current.FinishedAt == nil ||
+		current.FailedStatement != nil || current.ErrorMessage != nil || current.ErrorCode != nil ||
+		current.RecoveredAt == nil || current.RecoveryAction == nil || *current.RecoveryAction != db.MigrationRecoveryMarkApplied {
+		return fmt.Errorf("mark-applied history row %s contains an invalid transition", metadata.Version)
+	}
+	if err := validateHistoryRecord(current); err != nil {
+		return fmt.Errorf("mark-applied history row %s is invalid: %w", metadata.Version, err)
+	}
+	if !historiesEqualWithoutVersion(before, after, metadata.Version) {
+		return fmt.Errorf("existing migration history changed while recovering migration %s", metadata.Version)
+	}
+	return nil
+}
+
+func historiesEqualWithoutVersion(left, right []db.MigrationRecord, version string) bool {
+	leftWithout := make([]db.MigrationRecord, 0, len(left)-1)
+	rightWithout := make([]db.MigrationRecord, 0, len(right)-1)
+	for _, record := range left {
+		if record.Version != version {
+			leftWithout = append(leftWithout, record)
+		}
+	}
+	for _, record := range right {
+		if record.Version != version {
+			rightWithout = append(rightWithout, record)
+		}
+	}
+	return migrationHistoriesEqual(leftWithout, rightWithout)
 }
 
 func migrationHistoriesEqual(left, right []db.MigrationRecord) bool {

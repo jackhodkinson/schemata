@@ -209,6 +209,23 @@ Apply: |
 	assert.Equal(t, []string{"2026-02-26-root"}, migrations[0].DependsOn)
 }
 
+func TestMooScannerSupportsTransactionDirectiveInApplyBlock(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := `Description: Concurrent index
+Created: 2026-02-27 12:00:00.000000000 UTC
+Depends:
+Apply: |
+  -- schemata:transaction off
+  CREATE INDEX CONCURRENTLY example_idx ON example (id);`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "2026-02-27-concurrent-index.txt"), []byte(content), 0644))
+
+	migrations, err := NewMooScanner(tmpDir).Scan()
+	require.NoError(t, err)
+	require.Len(t, migrations, 1)
+	require.NoError(t, ValidateInventory(migrations))
+	assert.Equal(t, ExecutionModeNonTransactional, migrations[0].ExecutionMode)
+}
+
 func TestMooScanner_DependencyOrdering(t *testing.T) {
 	// Create files where date order differs from dependency order
 	// (temporal inversion — like the real circiuthub migrations)

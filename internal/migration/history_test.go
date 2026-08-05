@@ -112,6 +112,23 @@ func TestValidateMigrationHistoryRejectsDriftAndIncompleteState(t *testing.T) {
 			}(),
 			wantErr: "incomplete database status",
 		},
+		{
+			name: "failed progress gap",
+			record: func() db.MigrationRecord {
+				record := appliedHistoryRecord(local)
+				finished := time.Now()
+				failedStatement := 2
+				message := "failed"
+				record.Status = db.MigrationStatusFailed
+				record.FinishedAt = &finished
+				record.LastConfirmedStatement = 0
+				record.FailedStatement = &failedStatement
+				record.ErrorMessage = &message
+				record.StatementCount = 2
+				return record
+			}(),
+			wantErr: "immediately follow",
+		},
 	}
 
 	for _, test := range tests {

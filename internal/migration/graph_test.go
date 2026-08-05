@@ -185,6 +185,6 @@ func TestValidateInventoryRejectsInvalidIdentitiesAndDependencies(t *testing.T) 
 func TestValidateInventoryAcceptsCompleteGraph(t *testing.T) {
 	require.NoError(t, ValidateInventory([]Migration{
 		{Version: "001", SQL: "SELECT 1"},
-		{Version: "002", SQL: "-- schemata:depends-on 001\nSELECT 2"},
+		{Version: "002", SQL: "-- schemata:depends-on 001\n-- schemata:transaction off\nSELECT 2"},
 	}))
 }

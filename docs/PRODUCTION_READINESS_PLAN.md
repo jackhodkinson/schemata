@@ -58,8 +58,9 @@ complete.
 5. **Harden migration history and execution**
    - Record and verify migration checksums and metadata.
    - Reject duplicate versions and missing dependency references.
-   - Add per-migration transaction controls for operations such as
-     `CREATE INDEX CONCURRENTLY`.
+   - Per-migration transaction controls now support operations such as
+     `CREATE INDEX CONCURRENTLY`, with durable statement progress, fail-closed
+     interrupted states, and an explicit recovery workflow.
    - Report the failing file, statement index, and bounded SQL snippet.
 
 6. **Add production safety controls**

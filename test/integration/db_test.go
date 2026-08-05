@@ -456,7 +456,7 @@ func TestMigrationTrackerRejectsLedgerWithMissingConstraints(t *testing.T) {
 			recovered_at timestamptz,
 			recovery_action text
 		);
-		COMMENT ON TABLE schemata.version IS 'schemata:migration-history:v1';
+		COMMENT ON TABLE schemata.version IS 'schemata:migration-history:v2';
 	`)
 	require.NoError(t, err)
 
@@ -498,7 +498,7 @@ func TestMigrationTrackerRejectsLedgerWithForgedConstraintDefinitions(t *testing
 			CONSTRAINT version_recovery_pair CHECK (true),
 			CONSTRAINT version_status_state CHECK (true)
 		);
-		COMMENT ON TABLE schemata.version IS 'schemata:migration-history:v1';
+		COMMENT ON TABLE schemata.version IS 'schemata:migration-history:v2';
 	`)
 	require.NoError(t, err)
 

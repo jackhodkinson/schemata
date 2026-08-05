@@ -63,6 +63,7 @@ func init() {
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(diffCmd)
 	rootCmd.AddCommand(applyCmd)
+	rootCmd.AddCommand(recoverCmd)
 	rootCmd.AddCommand(syncCmd)
 	rootCmd.AddCommand(fixCmd)
 }
