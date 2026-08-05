@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +17,9 @@ import (
 )
 
 const (
+	// DefaultConnectTimeout bounds DNS, TCP, TLS, and PostgreSQL startup for
+	// each physical connection opened by a pool.
+	DefaultConnectTimeout = 15 * time.Second
 	// DefaultStatementTimeout bounds any individual PostgreSQL statement when
 	// the configuration does not provide an override.
 	DefaultStatementTimeout = 15 * time.Minute
@@ -22,13 +28,75 @@ const (
 	DefaultLockTimeout = 10 * time.Second
 )
 
+// postgresEnvironmentVariables is the complete environment surface consumed
+// by the pinned pgx version. Connect rejects non-empty values instead of
+// letting process-global state alter an explicitly validated Schemata target.
+// Values are never included in errors because several of these variables may
+// contain credentials.
+var postgresEnvironmentVariables = []string{
+	"PGAPPNAME",
+	"PGCHANNELBINDING",
+	"PGCONNECT_TIMEOUT",
+	"PGDATABASE",
+	"PGHOST",
+	"PGMAXPROTOCOLVERSION",
+	"PGMINPROTOCOLVERSION",
+	"PGOPTIONS",
+	"PGPASSFILE",
+	"PGPASSWORD",
+	"PGPORT",
+	"PGREQUIREAUTH",
+	"PGSERVICE",
+	"PGSERVICEFILE",
+	"PGSSLCERT",
+	"PGSSLKEY",
+	"PGSSLMODE",
+	"PGSSLNEGOTIATION",
+	"PGSSLPASSWORD",
+	"PGSSLROOTCERT",
+	"PGSSLSNI",
+	"PGTARGETSESSIONATTRS",
+	"PGTZ",
+	"PGUSER",
+}
+
+// deterministicPGXConnectionParameters mirrors config's public conninfo
+// policy, with passfile added solely for Schemata's os.DevNull neutralizer.
+// pgx checks this allow-list before reading any conninfo-selected file.
+var deterministicPGXConnectionParameters = append(
+	config.AllowedConnectionStringParameters(),
+	"passfile",
+)
+
 type connectOptions struct {
+	connectTimeout   time.Duration
 	statementTimeout time.Duration
 	lockTimeout      time.Duration
 }
 
+func defaultConnectOptions() connectOptions {
+	return connectOptions{
+		connectTimeout:   DefaultConnectTimeout,
+		statementTimeout: DefaultStatementTimeout,
+		lockTimeout:      DefaultLockTimeout,
+	}
+}
+
 // ConnectOption customizes PostgreSQL sessions opened by Connect.
 type ConnectOption func(*connectOptions) error
+
+// WithConnectTimeout bounds establishment of each physical PostgreSQL
+// connection, including hostname resolution. It must remain positive so
+// connection creation cannot become unbounded.
+func WithConnectTimeout(connectTimeout time.Duration) ConnectOption {
+	return func(options *connectOptions) error {
+		if connectTimeout <= 0 {
+			return fmt.Errorf("connect timeout must be greater than zero")
+		}
+		options.connectTimeout = connectTimeout
+		return nil
+	}
+}
 
 // WithTimeouts sets PostgreSQL statement_timeout and lock_timeout for every
 // session in the pool. Zero explicitly disables a timeout; negative values are
@@ -52,6 +120,14 @@ func WithTimeouts(statementTimeout, lockTimeout time.Duration) ConnectOption {
 // retaining finite defaults for omitted values.
 func WithDatabaseConfig(databaseConfig config.DatabaseConfig) ConnectOption {
 	return func(options *connectOptions) error {
+		connectTimeout := options.connectTimeout
+		if databaseConfig.ConnectTimeout != nil {
+			connectTimeout = databaseConfig.ConnectTimeout.Duration
+		}
+		if err := WithConnectTimeout(connectTimeout)(options); err != nil {
+			return err
+		}
+
 		statementTimeout := options.statementTimeout
 		if databaseConfig.StatementTimeout != nil {
 			statementTimeout = databaseConfig.StatementTimeout.Duration
@@ -146,10 +222,7 @@ func Connect(ctx context.Context, conn *config.DBConnection, opts ...ConnectOpti
 		return nil, fmt.Errorf("failed to build connection string: %w", err)
 	}
 
-	options := connectOptions{
-		statementTimeout: DefaultStatementTimeout,
-		lockTimeout:      DefaultLockTimeout,
-	}
+	options := defaultConnectOptions()
 	for _, applyOption := range opts {
 		if applyOption == nil {
 			continue
@@ -159,15 +232,11 @@ func Connect(ctx context.Context, conn *config.DBConnection, opts ...ConnectOpti
 		}
 	}
 
-	poolConfig, err := pgxpool.ParseConfig(connStr)
+	poolConfig, err := parseDeterministicPoolConfig(connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse connection string: %w", err)
 	}
-	if poolConfig.ConnConfig.RuntimeParams == nil {
-		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = postgresTimeoutValue(options.statementTimeout)
-	poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = postgresTimeoutValue(options.lockTimeout)
+	applyConnectionSafetyOptions(poolConfig, options)
 	if expectedIdentity != nil {
 		previousAfterConnect := poolConfig.AfterConnect
 		poolConfig.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
@@ -201,6 +270,106 @@ func Connect(ctx context.Context, conn *config.DBConnection, opts ...ConnectOpti
 	}
 
 	return &Pool{Pool: pool}, nil
+}
+
+func applyConnectionSafetyOptions(poolConfig *pgxpool.Config, options connectOptions) {
+	poolConfig.ConnConfig.ConnectTimeout = options.connectTimeout
+	originalLookup := poolConfig.ConnConfig.LookupFunc
+	poolConfig.ConnConfig.LookupFunc = func(ctx context.Context, host string) ([]string, error) {
+		lookupContext, cancel := context.WithTimeout(ctx, options.connectTimeout)
+		defer cancel()
+		return originalLookup(lookupContext, host)
+	}
+	if poolConfig.ConnConfig.RuntimeParams == nil {
+		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = postgresTimeoutValue(options.statementTimeout)
+	poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = postgresTimeoutValue(options.lockTimeout)
+}
+
+func parseDeterministicPoolConfig(connectionString string) (*pgxpool.Config, error) {
+	if err := rejectAmbientPostgresEnvironment(os.LookupEnv); err != nil {
+		return nil, err
+	}
+
+	deterministicConnectionString, err := neutralizeImplicitConnectionFiles(connectionString)
+	if err != nil {
+		return nil, err
+	}
+
+	connConfig, err := pgx.ParseConfigWithOptions(
+		deterministicConnectionString,
+		pgx.ParseConfigOptions{ParseConfigOptions: pgconn.ParseConfigOptions{
+			ConnStringAllowedKeys: deterministicPGXConnectionParameters,
+		}},
+	)
+	if err != nil {
+		// pgx's ParseConfigError embeds the original connection string. Its
+		// password redactor cannot safely handle every libpq escaping form, so
+		// never return or wrap that error across Schemata's logging boundary.
+		return nil, errors.New("PostgreSQL driver rejected the explicit connection configuration; verify endpoint, credentials, and TLS settings")
+	}
+
+	// pgxpool does not expose ParseConfigWithOptions. Parse a fixed, fully
+	// explicit bootstrap solely to obtain pgxpool's private initialization
+	// marker and defaults, then install the allow-listed pgx connection config.
+	poolConfig, err := pgxpool.ParseConfig(
+		"host=localhost port=5432 user=schemata password=unused dbname=schemata " +
+			"sslmode=disable passfile='" + os.DevNull + "' sslcert='' sslkey='' sslrootcert=''",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize deterministic pool defaults: %w", err)
+	}
+	poolConfig.ConnConfig = connConfig
+	return poolConfig, nil
+}
+
+func rejectAmbientPostgresEnvironment(lookupEnv config.LookupEnvFunc) error {
+	if lookupEnv == nil {
+		lookupEnv = func(string) (string, bool) { return "", false }
+	}
+
+	setNames := make([]string, 0, 1)
+	for _, name := range postgresEnvironmentVariables {
+		if value, present := lookupEnv(name); present && value != "" {
+			setNames = append(setNames, name)
+		}
+	}
+	if len(setNames) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"ambient PostgreSQL environment settings are not permitted (%s); move these values into the Schemata connection configuration or a non-PG* placeholder",
+		strings.Join(setNames, ", "),
+	)
+}
+
+// neutralizeImplicitConnectionFiles prevents pgx from consulting ~/.pgpass or
+// automatically discovered ~/.postgresql certificate files. Explicit TLS file
+// paths have already passed config validation and remain authoritative.
+func neutralizeImplicitConnectionFiles(connectionString string) (string, error) {
+	if strings.HasPrefix(connectionString, "postgres://") ||
+		strings.HasPrefix(connectionString, "postgresql://") {
+		parsed, err := url.Parse(connectionString)
+		if err != nil {
+			// net/url errors can contain the complete URL, including credentials.
+			return "", errors.New("failed to add deterministic connection defaults: malformed PostgreSQL URL")
+		}
+		query := parsed.Query()
+		query.Set("passfile", os.DevNull)
+		for _, name := range []string{"sslcert", "sslkey", "sslrootcert"} {
+			if !query.Has(name) {
+				query.Set(name, "")
+			}
+		}
+		parsed.RawQuery = query.Encode()
+		return parsed.String(), nil
+	}
+
+	// Prefix defaults so an explicitly configured TLS path later in the
+	// keyword/value string wins when pgx builds its settings map.
+	return "passfile='" + os.DevNull + "' sslcert='' sslkey='' sslrootcert='' " + connectionString, nil
 }
 
 func verifyTargetIdentity(

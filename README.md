@@ -241,7 +241,9 @@ dev: ${DEV_URL}
 target: ${TARGET_URL}
 ```
 
-Note that environment variables are parsed in as default when you use the syntax `${...}`
+Environment variables are expanded only when you use an explicit `${NAME}` or
+`${NAME:-fallback}` placeholder. An unset or empty variable without a fallback
+is an error.
 
 Optionally you can include multiple target dbs:
 
@@ -260,7 +262,7 @@ You can also break down the URL into host/port/username/password/database/ssl
 dev: ${DEV_URL}
 target:
   host: ${TARGET_HOST}
-  port: ${TARGET_PORT}
+  port: 5432
   username: ${TARGET_USERNAME}
   password: ${TARGET_PASSWORD}
   database: ${TARGET_DATABASE}
@@ -271,26 +273,18 @@ target:
     client-key: /path/to/client-key.key
 ```
 
-All of these fields are optional. If you omit them, `schemata` leaves those connection settings unset and PostgreSQL/libpq fallback behavior applies (for example, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE`):
+`host`, `username`, and `database` are required in the structured form. `port`
+defaults to `5432`; `password` and `ssl` are optional. Schemata does not use
+ambient `PG*` settings, PostgreSQL service files, or `.pgpass`, so omit a
+password only when the server genuinely permits passwordless authentication.
+Unknown or null fields are rejected. Each connection must resolve through one
+explicit server endpoint; multi-host connection strings are not supported.
 
 ```yaml
 target:
-  host: ${TARGET_HOST}
-  # port: ${TARGET_PORT}
-  # username: ${TARGET_USERNAME}
-  # password: ${TARGET_HOST}
-  # database: ${TARGET_DATABASE}
-```
-
-However, if you specify an empty/null value then this will be treated as empty/null and may error
-
-```yaml
-target:
-  host: ${TARGET_HOST}
-  port:
-  # username: ${TARGET_USERNAME}
-  # password: ${TARGET_HOST}
-  # database: ${TARGET_DATABASE}
+  host: localhost
+  username: postgres
+  database: app_development
 ```
 
 This can be done for the dev db and multiple targets as well:
@@ -298,6 +292,9 @@ This can be done for the dev db and multiple targets as well:
 ```yaml
 dev:
   host: ${DEV_HOST}
+  username: ${DEV_USERNAME}
+  password: ${DEV_PASSWORD}
+  database: ${DEV_DATABASE}
 targets:
   prod:
     host: ${PROD_HOST}

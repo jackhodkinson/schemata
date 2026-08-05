@@ -5,6 +5,40 @@ default. These controls apply to catalog reads, drift checks, migration
 pre-flight work, and migration execution, including fresh sessions opened for
 individual migrations.
 
+## Deterministic connection configuration
+
+Schemata accepts only connection parameters that identify the endpoint,
+credentials, database, and TLS configuration: `host`, `port`, `user`,
+`password`, `dbname` (or `database`), `sslmode`, `sslrootcert`, `sslcert`, and
+`sslkey`. Service files, password files, PostgreSQL runtime parameters, pgx pool
+parameters, and unknown connection-string parameters are rejected. Put
+connection, statement, and lock timeouts in Schemata's `database`
+configuration rather than embedding runtime parameters in a connection string.
+Each connection must identify exactly one server; multi-host URLs and host
+lists are rejected. Use a reviewed proxy or load-balanced endpoint when the
+database platform requires endpoint failover.
+
+Every non-empty `PG*` environment variable understood by the pinned pgx
+version is rejected when a connection is opened. This prevents ambient process
+state from changing a connection that already passed Schemata's validation.
+Environment placeholders remain supported, but use application-specific names
+such as `${SCHEMATA_TARGET_URL}` or `${SCHEMATA_DB_PASSWORD}`; a placeholder
+such as `${PGPASSWORD}` will still leave `PGPASSWORD` set and connection
+creation will refuse it. Error messages identify conflicting variable names
+but never include their values.
+
+Schemata also prevents pgx from consulting `~/.pgpass` or automatically
+discovered certificates under `~/.postgresql`. A password must therefore be
+present in the explicit connection configuration when the server requires one,
+and TLS file paths must be configured explicitly. Explicit `sslrootcert`,
+`sslcert`, and `sslkey` values remain authoritative.
+
+Treat the process environment as immutable after Schemata starts. pgx reads
+process-global environment state while parsing a connection, and its public API
+does not provide an environment-free parser. Schemata checks the complete pgx
+environment surface immediately before parsing, but application code that
+mutates `os.Environ` concurrently could race that check and is unsupported.
+
 ## First-time migration history initialization
 
 Schemata never assumes that a missing `schemata.version` table means a fresh
@@ -46,7 +80,7 @@ record. Do not authorize initialization merely to bypass the error. The
 
 ## Required production target identity
 
-Production targets should pin both the database name and PostgreSQL cluster
+Production targets must pin both the database name and PostgreSQL cluster
 system identifier. Obtain them through an independently verified administrative
 connection:
 
@@ -73,12 +107,12 @@ returns a database pool and whenever that pool opens a new physical session. A
 mismatch or an inability to read the identity closes the connection and
 prevents planning or execution against that target.
 
-Scalar connection URLs remain supported for compatibility and local
-development, but they do not provide target attestation. Do not discover and
-accept identity values automatically from the same untrusted runtime connection
-that will execute a migration; that would make the check circular. Treat an
-identity change as an operational event requiring independent verification and
-reviewed configuration updates.
+Scalar connection URLs remain supported for local and non-production
+workflows, but they do not provide target attestation and production migration
+commands reject them. Do not discover and accept identity values automatically
+from the same untrusted runtime connection that will execute a migration; that
+would make the check circular. Treat an identity change as an operational event
+requiring independent verification and reviewed configuration updates.
 
 Reading the system identifier calls `pg_catalog.pg_control_system()`. If a
 provider or hardened cluster restricts it, a database administrator can grant
@@ -98,18 +132,21 @@ errors.
 
 ## PostgreSQL timeouts
 
-Every PostgreSQL session opened by Schemata receives these defaults:
+Every PostgreSQL connection or session opened by Schemata receives these
+defaults:
 
+- connection establishment: 15 seconds
 - `statement_timeout`: 15 minutes
 - `lock_timeout`: 10 seconds
 
-Override either value in `schemata.yaml` with a Go-style duration:
+Override any value in `schemata.yaml` with a Go-style duration:
 
 ```yaml
 dev: ${DEV_URL}
 target: ${TARGET_URL}
 
 database:
+  connect-timeout: 10s
   statement-timeout: 30m
   lock-timeout: 5s
 
@@ -117,16 +154,20 @@ schema: schema.sql
 migrations: ./migrations
 ```
 
-The statement timeout applies independently to each PostgreSQL statement; it is
-not a whole-command deadline. The lock timeout applies only while a statement
-is waiting to acquire a PostgreSQL lock. A migration that legitimately needs a
-longer operation should use an explicit, reviewed value appropriate to that
+The connection timeout is applied independently to DNS resolution and to each
+subsequent address connection attempt (TCP, TLS, and the PostgreSQL startup
+exchange). It prevents either phase from hanging, but is not a whole-command
+deadline. The statement timeout likewise applies independently to each
+PostgreSQL statement. The lock timeout applies only while a statement is
+waiting to acquire a PostgreSQL lock. A deployment that legitimately needs a
+longer timeout should use an explicit, reviewed value appropriate to that
 database.
 
-An explicit `0` disables the corresponding PostgreSQL timeout. This escape
-hatch is not recommended for unattended or production operation because it can
-leave a command or lock wait unbounded. Negative and malformed durations are
-rejected while loading configuration. PostgreSQL timeout resolution is one
+`connect-timeout` must be greater than zero. An explicit `0` may disable
+`statement-timeout` or `lock-timeout`; that escape hatch is not recommended for
+unattended or production operation because it can leave a command or lock wait
+unbounded. Negative and malformed durations are rejected while loading
+configuration. PostgreSQL statement and lock timeout resolution is one
 millisecond; smaller positive values round up to one millisecond.
 
 ## Cancellation and process signals

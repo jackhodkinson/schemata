@@ -20,8 +20,8 @@ func TestConfigParsing(t *testing.T) {
 		{
 			name: "simple URL format",
 			yaml: `
-dev: postgresql://localhost:5432/dev
-target: postgresql://localhost:5432/target
+dev: postgresql://postgres@localhost:5432/dev
+target: postgresql://postgres@localhost:5432/target
 schema: schema.sql
 migrations: ./migrations
 `,
@@ -29,11 +29,11 @@ migrations: ./migrations
 			check: func(t *testing.T, cfg *Config) {
 				require.NotNil(t, cfg.Dev)
 				require.NotNil(t, cfg.Dev.URL)
-				assert.Equal(t, "postgresql://localhost:5432/dev", *cfg.Dev.URL)
+				assert.Equal(t, "postgresql://postgres@localhost:5432/dev", *cfg.Dev.URL)
 
 				require.NotNil(t, cfg.Target)
 				require.NotNil(t, cfg.Target.URL)
-				assert.Equal(t, "postgresql://localhost:5432/target", *cfg.Target.URL)
+				assert.Equal(t, "postgresql://postgres@localhost:5432/target", *cfg.Target.URL)
 
 				assert.Equal(t, "schema.sql", cfg.Schema.GetSchemaPath())
 				assert.Equal(t, "./migrations", cfg.Migrations.GetDir())
@@ -69,9 +69,9 @@ migrations: ./migrations
 		{
 			name: "URL mapping with expected identity",
 			yaml: `
-dev: postgresql://localhost:5432/dev
+dev: postgresql://postgres@localhost:5432/dev
 target:
-  url: postgresql://prod.example.com:5432/app
+  url: postgresql://app@prod.example.com:5432/app
   identity:
     database: app
     system-identifier: "18446744073709551615"
@@ -82,7 +82,7 @@ migrations: ./migrations
 			check: func(t *testing.T, cfg *Config) {
 				require.NotNil(t, cfg.Target)
 				require.NotNil(t, cfg.Target.URL)
-				assert.Equal(t, "postgresql://prod.example.com:5432/app", *cfg.Target.URL)
+				assert.Equal(t, "postgresql://app@prod.example.com:5432/app", *cfg.Target.URL)
 				require.NotNil(t, cfg.Target.Identity)
 				assert.Equal(t, "app", cfg.Target.Identity.Database)
 				assert.Equal(t, "18446744073709551615", cfg.Target.Identity.SystemIdentifier)
@@ -94,10 +94,10 @@ migrations: ./migrations
 		{
 			name: "multi-target format",
 			yaml: `
-dev: postgresql://localhost:5432/dev
+dev: postgresql://postgres@localhost:5432/dev
 targets:
-  prod: postgresql://prod.example.com:5432/prod
-  staging: postgresql://staging.example.com:5432/staging
+  prod: postgresql://app@prod.example.com:5432/prod
+  staging: postgresql://app@staging.example.com:5432/staging
 schema:
   file: schema.sql
   include:
@@ -123,8 +123,8 @@ migrations: ./migrations
 		{
 			name: "structured migrations config with format",
 			yaml: `
-dev: postgresql://localhost:5432/dev
-target: postgresql://localhost:5432/target
+dev: postgresql://postgres@localhost:5432/dev
+target: postgresql://postgres@localhost:5432/target
 schema: schema.sql
 migrations:
   dir: ./sql/migrations
@@ -139,9 +139,10 @@ migrations:
 		{
 			name: "database safety timeouts",
 			yaml: `
-dev: postgresql://localhost:5432/dev
-target: postgresql://localhost:5432/target
+dev: postgresql://postgres@localhost:5432/dev
+target: postgresql://postgres@localhost:5432/target
 database:
+  connect-timeout: 12s
   statement-timeout: 45s
   lock-timeout: 1250ms
 schema: schema.sql
@@ -149,6 +150,8 @@ migrations: ./migrations
 `,
 			wantErr: false,
 			check: func(t *testing.T, cfg *Config) {
+				require.NotNil(t, cfg.Database.ConnectTimeout)
+				assert.Equal(t, 12*time.Second, cfg.Database.ConnectTimeout.Duration)
 				require.NotNil(t, cfg.Database.StatementTimeout)
 				assert.Equal(t, 45*time.Second, cfg.Database.StatementTimeout.Duration)
 				require.NotNil(t, cfg.Database.LockTimeout)
@@ -158,7 +161,7 @@ migrations: ./migrations
 		{
 			name: "explicitly disabled database timeout",
 			yaml: `
-target: postgresql://localhost:5432/target
+target: postgresql://postgres@localhost:5432/target
 database:
   statement-timeout: 0
 schema: schema.sql
@@ -166,15 +169,27 @@ migrations: ./migrations
 `,
 			wantErr: false,
 			check: func(t *testing.T, cfg *Config) {
+				assert.Nil(t, cfg.Database.ConnectTimeout)
 				require.NotNil(t, cfg.Database.StatementTimeout)
 				assert.Zero(t, cfg.Database.StatementTimeout.Duration)
 				assert.Nil(t, cfg.Database.LockTimeout)
 			},
 		},
 		{
+			name: "zero connect timeout",
+			yaml: `
+target: postgresql://postgres@localhost:5432/target
+database:
+  connect-timeout: 0
+schema: schema.sql
+migrations: ./migrations
+`,
+			wantErr: true,
+		},
+		{
 			name: "invalid database timeout",
 			yaml: `
-target: postgresql://localhost:5432/target
+target: postgresql://postgres@localhost:5432/target
 database:
   lock-timeout: eventually
 schema: schema.sql
@@ -185,7 +200,7 @@ migrations: ./migrations
 		{
 			name: "negative database timeout",
 			yaml: `
-target: postgresql://localhost:5432/target
+target: postgresql://postgres@localhost:5432/target
 database:
   statement-timeout: -1s
 schema: schema.sql
@@ -196,7 +211,7 @@ migrations: ./migrations
 		{
 			name: "missing required fields",
 			yaml: `
-dev: postgresql://localhost:5432/dev
+dev: postgresql://postgres@localhost:5432/dev
 migrations: ./migrations
 `,
 			wantErr: true,
@@ -204,10 +219,10 @@ migrations: ./migrations
 		{
 			name: "both target and targets",
 			yaml: `
-dev: postgresql://localhost:5432/dev
-target: postgresql://localhost:5432/target
+dev: postgresql://postgres@localhost:5432/dev
+target: postgresql://postgres@localhost:5432/target
 targets:
-  prod: postgresql://prod:5432/prod
+  prod: postgresql://app@prod:5432/prod
 schema: schema.sql
 migrations: ./migrations
 `,
@@ -217,7 +232,7 @@ migrations: ./migrations
 			name: "identity requires database",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     system-identifier: "123"
 schema: schema.sql
@@ -229,7 +244,7 @@ migrations: ./migrations
 			name: "identity cannot be null",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
 schema: schema.sql
 migrations: ./migrations
@@ -240,7 +255,7 @@ migrations: ./migrations
 			name: "identity requires system identifier",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: app
 schema: schema.sql
@@ -252,7 +267,7 @@ migrations: ./migrations
 			name: "identity rejects non-decimal system identifier",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: app
     system-identifier: "0x123"
@@ -265,7 +280,7 @@ migrations: ./migrations
 			name: "identity requires quoted system identifier",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: app
     system-identifier: 123
@@ -278,7 +293,7 @@ migrations: ./migrations
 			name: "identity database must be a string",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: 123
     system-identifier: "123"
@@ -291,7 +306,7 @@ migrations: ./migrations
 			name: "identity rejects unknown fields",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: app
     system-identifier: "123"
@@ -305,7 +320,7 @@ migrations: ./migrations
 			name: "identity rejects system identifier overflow",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: app
     system-identifier: "18446744073709551616"
@@ -318,7 +333,7 @@ migrations: ./migrations
 			name: "URL mapping rejects structured connection fields",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   host: localhost
 schema: schema.sql
 migrations: ./migrations
@@ -329,7 +344,7 @@ migrations: ./migrations
 			name: "connection mapping rejects unknown identity typo",
 			yaml: `
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identitiy:
     database: app
     system-identifier: "123"
@@ -435,9 +450,10 @@ func TestConnectionStringBuilder(t *testing.T) {
 			expected: "postgresql://user:pass@host:5432/dbname",
 		},
 		{
-			name: "structured format with defaults",
+			name: "structured format with default port",
 			conn: DBConnection{
 				Host:     strPtr("myhost"),
+				Username: strPtr("postgres"),
 				Database: strPtr("mydb"),
 			},
 			expected: "host=myhost port=5432 user=postgres dbname=mydb",
@@ -454,9 +470,20 @@ func TestConnectionStringBuilder(t *testing.T) {
 			expected: "host=prod.example.com port=5433 user=appuser password=secret dbname=proddb",
 		},
 		{
+			name: "structured format preserves an explicitly empty password",
+			conn: DBConnection{
+				Host:     strPtr("prod.example.com"),
+				Username: strPtr("appuser"),
+				Password: strPtr(""),
+				Database: strPtr("proddb"),
+			},
+			expected: "host=prod.example.com port=5432 user=appuser password='' dbname=proddb",
+		},
+		{
 			name: "structured with SSL",
 			conn: DBConnection{
 				Host:     strPtr("secure.example.com"),
+				Username: strPtr("postgres"),
 				Database: strPtr("securedb"),
 				SSL: &SSLConfig{
 					Mode: SSLRequire,
@@ -512,7 +539,7 @@ func TestConfigRejectsImplicitOrInvalidConnections(t *testing.T) {
 	require.ErrorContains(t, cfg.Validate(), "port must be between")
 
 	cfg = base
-	cfg.Target = &DBConnection{URL: strPtr("postgresql://db/app")}
+	cfg.Target = &DBConnection{URL: strPtr("postgresql://app@db/app")}
 	cfg.Migrations.Format = "unknown"
 	require.ErrorContains(t, cfg.Validate(), "unsupported migrations format")
 }
@@ -576,20 +603,25 @@ func TestDatabaseTimeoutsMarshalAsDurationsAndOmitEmptySection(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(withoutTimeouts), "database:")
 
+	connectTimeout := Duration{Duration: 12 * time.Second}
 	statementTimeout := Duration{Duration: 90 * time.Second}
 	withTimeouts, err := yaml.Marshal(Config{
-		Database: DatabaseConfig{StatementTimeout: &statementTimeout},
+		Database: DatabaseConfig{
+			ConnectTimeout:   &connectTimeout,
+			StatementTimeout: &statementTimeout,
+		},
 	})
 	require.NoError(t, err)
+	assert.Contains(t, string(withTimeouts), "connect-timeout: 12s")
 	assert.Contains(t, string(withTimeouts), "statement-timeout: 1m30s")
 }
 
 func TestDBConnectionMarshalPreservesScalarURLAndMapsIdentity(t *testing.T) {
-	url := "postgresql://db.example/app"
+	url := "postgresql://app@db.example/app"
 
 	scalar, err := yaml.Marshal(DBConnection{URL: &url})
 	require.NoError(t, err)
-	assert.Equal(t, "postgresql://db.example/app\n", string(scalar))
+	assert.Equal(t, "postgresql://app@db.example/app\n", string(scalar))
 
 	mapped, err := yaml.Marshal(DBConnection{
 		URL: &url,
@@ -599,9 +631,9 @@ func TestDBConnectionMarshalPreservesScalarURLAndMapsIdentity(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, `url: postgresql://db.example/app
+	assert.Equal(t, `url: postgresql://app@db.example/app
 identity:
-    database: app
+    database: "app"
     system-identifier: "7561860200789946402"
 `, string(mapped))
 }
@@ -613,7 +645,7 @@ func TestIdentityEnvironmentExpansionHappensBeforeValidation(t *testing.T) {
 	configPath := t.TempDir() + "/schemata.yaml"
 	err := os.WriteFile(configPath, []byte(`
 target:
-  url: postgresql://localhost:5432/app
+  url: postgresql://app@localhost:5432/app
   identity:
     database: ${SCHEMATA_EXPECTED_DATABASE}
     system-identifier: ${SCHEMATA_EXPECTED_SYSTEM_IDENTIFIER}
@@ -649,6 +681,16 @@ func TestDetectEnvVar(t *testing.T) {
 			expected: "${MY_VAR}",
 		},
 		{
+			name:     "already wrapped reference is preserved",
+			input:    "${MY_VAR}",
+			expected: "${MY_VAR}",
+		},
+		{
+			name:     "invalid dollar reference is left literal",
+			input:    "$1INVALID",
+			expected: "$1INVALID",
+		},
+		{
 			name:     "literal value",
 			input:    "some-literal",
 			expected: "some-literal",
@@ -661,6 +703,20 @@ func TestDetectEnvVar(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestDetectEnvVarSortsDuplicateMatches(t *testing.T) {
+	environment := []string{
+		"Z_LAST=shared-secret",
+		"INVALID-NAME=shared-secret",
+		"A_FIRST=shared-secret",
+	}
+	assert.Equal(t, "${A_FIRST}", detectEnvVar("shared-secret", environment))
+	assert.Equal(t, "${A_FIRST}", detectEnvVar("shared-secret", []string{
+		"A_FIRST=shared-secret",
+		"Z_LAST=shared-secret",
+	}))
+	assert.Equal(t, "", detectEnvVar("", []string{"EMPTY="}))
 }
 
 // Helper functions
