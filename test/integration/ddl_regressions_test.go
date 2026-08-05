@@ -111,5 +111,5 @@ COMMENT ON TABLE public.storage IS 'Stores document blobs';
 `)
 
 	require.Contains(t, ddl, "WITH (autovacuum_analyze_scale_factor=0.2, fillfactor=70)", "table reloptions should be preserved in CREATE TABLE DDL")
-	require.Contains(t, ddl, "COMMENT ON TABLE public.storage IS 'Stores document blobs';", "table comments should be emitted alongside CREATE TABLE output")
+	require.Contains(t, ddl, `COMMENT ON TABLE "public"."storage" IS 'Stores document blobs';`, "table comments should be emitted alongside CREATE TABLE output")
 }

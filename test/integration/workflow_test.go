@@ -213,7 +213,7 @@ func TestDiffWorkflow(t *testing.T) {
 	ddl, err := ddlGen.GenerateDDL(diff, desiredSchema)
 	require.NoError(t, err)
 	assert.Contains(t, ddl, "ALTER TABLE", "should generate ALTER TABLE statement")
-	assert.Contains(t, ddl, "ADD COLUMN name", "should add name column")
+	assert.Contains(t, ddl, `ADD COLUMN "name"`, "should add name column")
 }
 
 // TestGenerateWorkflow tests the generate command workflow
@@ -453,7 +453,7 @@ func TestALTEROperations(t *testing.T) {
 			`,
 			expectedDDL: []string{
 				"ALTER TABLE",
-				"ADD COLUMN new_column",
+				`ADD COLUMN "new_column"`,
 				"NOT NULL",
 				"DEFAULT",
 			},
@@ -467,7 +467,7 @@ func TestALTEROperations(t *testing.T) {
 			`,
 			expectedDDL: []string{
 				"ALTER TABLE",
-				"DROP COLUMN old_column",
+				`DROP COLUMN "old_column"`,
 			},
 		},
 		{
@@ -480,7 +480,7 @@ func TestALTEROperations(t *testing.T) {
 			`,
 			expectedDDL: []string{
 				"ALTER TABLE",
-				"ALTER COLUMN old_column TYPE",
+				`ALTER COLUMN "old_column" TYPE`,
 			},
 		},
 	}

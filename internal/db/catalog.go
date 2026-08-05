@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/jackhodkinson/schemata/internal/objectmap"
+	"github.com/jackhodkinson/schemata/internal/sqlrender"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
@@ -26,7 +27,10 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 	var objects []schema.DatabaseObject
 
 	// Build schema filter clause
-	schemaFilter := c.buildSchemaFilter(includeSchemas, excludeSchemas)
+	schemaFilter, err := c.buildSchemaFilter(includeSchemas, excludeSchemas)
+	if err != nil {
+		return nil, fmt.Errorf("invalid schema filter: %w", err)
+	}
 
 	// Extract extensions
 	extensions, err := c.extractExtensions(ctx, schemaFilter)
@@ -148,31 +152,43 @@ func (c *Catalog) ExtractAllObjects(ctx context.Context, includeSchemas, exclude
 	return objects, nil
 }
 
-func (c *Catalog) buildSchemaFilter(include, exclude []string) string {
+func (c *Catalog) buildSchemaFilter(include, exclude []string) (string, error) {
 	if len(include) > 0 {
 		quoted := make([]string, len(include))
 		for i, s := range include {
-			quoted[i] = fmt.Sprintf("'%s'", s)
+			literal, err := sqlrender.Literal(s)
+			if err != nil {
+				return "", err
+			}
+			quoted[i] = literal
 		}
-		return fmt.Sprintf("nspname IN (%s)", strings.Join(quoted, ", "))
+		return fmt.Sprintf("nspname IN (%s)", strings.Join(quoted, ", ")), nil
 	}
 
 	if len(exclude) > 0 {
 		quoted := make([]string, len(exclude))
 		for i, s := range exclude {
-			quoted[i] = fmt.Sprintf("'%s'", s)
+			literal, err := sqlrender.Literal(s)
+			if err != nil {
+				return "", err
+			}
+			quoted[i] = literal
 		}
-		return fmt.Sprintf("nspname NOT IN (%s)", strings.Join(quoted, ", "))
+		return fmt.Sprintf("nspname NOT IN (%s)", strings.Join(quoted, ", ")), nil
 	}
 
 	// Default: exclude system schemas
-	return "nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')"
+	return "nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')", nil
 }
 
 // ExtractExtensions queries installed extensions from the database, excluding
 // system schemas (pg_catalog, information_schema, pg_toast) by default.
 func (c *Catalog) ExtractExtensions(ctx context.Context) ([]schema.DatabaseObject, error) {
-	return c.extractExtensions(ctx, c.buildSchemaFilter(nil, nil))
+	schemaFilter, err := c.buildSchemaFilter(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.extractExtensions(ctx, schemaFilter)
 }
 
 func (c *Catalog) extractExtensions(ctx context.Context, schemaFilter string) ([]schema.DatabaseObject, error) {
@@ -1466,13 +1482,13 @@ func (c *Catalog) extractPolicies(ctx context.Context, schemaFilter string) ([]s
 			COALESCE((
 				SELECT array_agg(
 					CASE
-						WHEN role_oid.oid = 0 THEN 'public'
+						WHEN role_oid.oid = 0 THEN 'PUBLIC'
 						ELSE r.rolname
 					END
 					ORDER BY
-					CASE
-						WHEN role_oid.oid = 0 THEN 'public'
-						ELSE r.rolname
+						CASE
+							WHEN role_oid.oid = 0 THEN 'PUBLIC'
+							ELSE r.rolname
 					END
 				)
 				FROM unnest(pol.polroles) AS role_oid(oid)

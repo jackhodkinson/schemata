@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackhodkinson/schemata/internal/capability"
 	"github.com/jackhodkinson/schemata/internal/differ"
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
@@ -32,6 +33,19 @@ func (e *UnsupportedChangeError) Error() string {
 		return fmt.Sprintf("unsupported change (%s): %s; remediation: %s", key, e.Change, e.Remediation)
 	}
 	return fmt.Sprintf("unsupported change (%s): %s", key, e.Change)
+}
+
+// Unwrap exposes the common structured capability error while preserving the
+// more specific legacy error type for callers already matching it.
+func (e *UnsupportedChangeError) Unwrap() error {
+	return &capability.UnsupportedError{
+		Stage:       capability.AlterStage,
+		Family:      capability.Family(e.Key.Kind),
+		Feature:     e.Change,
+		Object:      e.Key,
+		Reason:      "the requested change is not safely renderable",
+		Remediation: e.Remediation,
+	}
 }
 
 type DDLGeneratorOption func(*DDLGenerator)
@@ -232,6 +246,9 @@ func (g *DDLGenerator) GenerateCreateStatement(obj schema.DatabaseObject) (strin
 }
 
 func (g *DDLGenerator) generateCreate(obj schema.DatabaseObject) (string, error) {
+	if err := validateDatabaseObjectRenderInputs(obj); err != nil {
+		return "", fmt.Errorf("invalid CREATE render input: %w", err)
+	}
 	switch v := obj.(type) {
 	case schema.Table:
 		return g.generateCreateTable(v), nil
@@ -253,25 +270,48 @@ func (g *DDLGenerator) generateCreate(obj schema.DatabaseObject) (string, error)
 		return g.generateCreateTrigger(v), nil
 	case schema.Policy:
 		return g.generateCreatePolicy(v), nil
+	case schema.Schema:
+		return "", &capability.UnsupportedError{
+			Stage:       capability.CreateStage,
+			Family:      capability.SchemaFamily,
+			Feature:     "schema definition",
+			Object:      schema.ObjectKey{Kind: schema.SchemaKind, Schema: v.Name, Name: string(v.Name)},
+			Reason:      "CREATE SCHEMA rendering is not implemented",
+			Remediation: "use an explicit migration until schema rendering is supported",
+		}
+	case schema.CompositeDef:
+		return "", &capability.UnsupportedError{
+			Stage:       capability.CreateStage,
+			Family:      capability.CompositeFamily,
+			Feature:     "composite type definition",
+			Object:      schema.ObjectKey{Kind: schema.TypeKind, Schema: v.Schema, Name: string(v.Name)},
+			Reason:      "CREATE TYPE AS composite rendering is not implemented",
+			Remediation: "use an explicit migration until composite rendering is supported",
+		}
 	default:
-		return "", fmt.Errorf("unsupported object type for CREATE: %T", obj)
+		return "", &capability.UnsupportedError{
+			Stage:   capability.CreateStage,
+			Family:  capability.Family(obj.GetObjectKind()),
+			Feature: fmt.Sprintf("object type %T", obj),
+			Reason:  "object type is not registered with the DDL renderer",
+		}
 	}
 }
 
 func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	var parts []string
-	parts = append(parts, fmt.Sprintf("CREATE TABLE %s.%s (", tbl.Schema, tbl.Name))
+	parts = append(parts, fmt.Sprintf("CREATE TABLE %s (", qualifiedName(string(tbl.Schema), string(tbl.Name))))
 
 	// Column order is semantic in PostgreSQL (including SELECT * and physical
 	// tuple layout), so preserve the declaration order.
 	var colDefs []string
 	var columnComments []string
 	for _, col := range tbl.Columns {
-		base := fmt.Sprintf("  %s %s", col.Name, col.Type)
+		base := fmt.Sprintf("  %s %s", quotedIdentifier(string(col.Name)), col.Type)
 		colParts := []string{base}
 
 		if col.Collation != nil {
-			colParts = append(colParts, fmt.Sprintf("COLLATE %s", formatQualifiedIdentifier(*col.Collation)))
+			colParts = append(colParts, fmt.Sprintf("COLLATE %s", qualifiedText(*col.Collation)))
 		}
 
 		if col.Identity != nil {
@@ -295,13 +335,10 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 
 	// Primary key
 	if tbl.PrimaryKey != nil {
-		pkCols := make([]string, len(tbl.PrimaryKey.Cols))
-		for i, col := range tbl.PrimaryKey.Cols {
-			pkCols[i] = string(col)
-		}
-		pkClause := fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkCols, ", "))
+		pkCols := quotedColumnNames(tbl.PrimaryKey.Cols)
+		pkClause := fmt.Sprintf("  PRIMARY KEY (%s)", pkCols)
 		if tbl.PrimaryKey.Name != nil && *tbl.PrimaryKey.Name != "" {
-			pkClause = fmt.Sprintf("  CONSTRAINT %s PRIMARY KEY (%s)", *tbl.PrimaryKey.Name, strings.Join(pkCols, ", "))
+			pkClause = fmt.Sprintf("  CONSTRAINT %s PRIMARY KEY (%s)", quotedIdentifier(*tbl.PrimaryKey.Name), pkCols)
 		}
 		pkClause += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
 		colDefs = append(colDefs, pkClause)
@@ -309,15 +346,12 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 
 	// Unique constraints
 	for _, uq := range sortedUniques(tbl.Uniques) {
-		uqCols := make([]string, len(uq.Cols))
-		for i, col := range uq.Cols {
-			uqCols[i] = string(col)
-		}
+		uqCols := quotedColumnNames(uq.Cols)
 		var uqClause string
 		if uq.Name != "" {
-			uqClause = fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", uq.Name, strings.Join(uqCols, ", "))
+			uqClause = fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", quotedIdentifier(uq.Name), uqCols)
 		} else {
-			uqClause = fmt.Sprintf("  UNIQUE (%s)", strings.Join(uqCols, ", "))
+			uqClause = fmt.Sprintf("  UNIQUE (%s)", uqCols)
 		}
 		if !uq.NullsDistinct {
 			uqClause += " NULLS NOT DISTINCT"
@@ -330,7 +364,7 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 	// Check constraints
 	for _, check := range sortedChecks(tbl.Checks) {
 		if check.Name != "" {
-			checkClause := fmt.Sprintf("  CONSTRAINT %s CHECK (%s)", check.Name, check.Expr)
+			checkClause := fmt.Sprintf("  CONSTRAINT %s CHECK (%s)", quotedIdentifier(check.Name), check.Expr)
 			if check.NoInherit {
 				checkClause += " NO INHERIT"
 			}
@@ -350,16 +384,9 @@ func (g *DDLGenerator) generateCreateTable(tbl schema.Table) string {
 
 	// Foreign keys
 	for _, fk := range sortedForeignKeys(tbl.ForeignKeys) {
-		fkCols := make([]string, len(fk.Cols))
-		for i, col := range fk.Cols {
-			fkCols[i] = string(col)
-		}
-		refCols := make([]string, len(fk.Ref.Cols))
-		for i, col := range fk.Ref.Cols {
-			refCols[i] = string(col)
-		}
-		fkDef := fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
-			fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+		fkDef := fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
+			quotedIdentifier(fk.Name), quotedColumnNames(fk.Cols),
+			qualifiedName(string(fk.Ref.Schema), string(fk.Ref.Table)), quotedColumnNames(fk.Ref.Cols))
 		switch fk.Match {
 		case schema.MatchFull:
 			fkDef += " MATCH FULL"
@@ -416,10 +443,10 @@ func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
 		parts = append(parts, string(key.Expr))
 
 		if key.Collation != nil {
-			parts = append(parts, fmt.Sprintf("COLLATE %s", formatQualifiedIdentifier(*key.Collation)))
+			parts = append(parts, fmt.Sprintf("COLLATE %s", qualifiedText(*key.Collation)))
 		}
 		if key.OpClass != nil {
-			parts = append(parts, *key.OpClass)
+			parts = append(parts, qualifiedText(*key.OpClass))
 		}
 		if key.Ordering != nil && *key.Ordering == schema.Desc {
 			parts = append(parts, "DESC")
@@ -431,15 +458,12 @@ func (g *DDLGenerator) generateCreateIndex(idx schema.Index) string {
 		keyExprs[i] = strings.Join(parts, " ")
 	}
 
-	stmt := fmt.Sprintf("CREATE %sINDEX %s ON %s.%s USING %s (%s)",
-		uniqueStr, idx.Name, idx.Schema, idx.Table, idx.Method, strings.Join(keyExprs, ", "))
+	stmt := fmt.Sprintf("CREATE %sINDEX %s ON %s USING %s (%s)",
+		uniqueStr, quotedIdentifier(idx.Name), qualifiedName(string(idx.Schema), string(idx.Table)),
+		quotedIdentifier(string(idx.Method)), strings.Join(keyExprs, ", "))
 
 	if len(idx.Include) > 0 {
-		includeCols := make([]string, len(idx.Include))
-		for i, col := range idx.Include {
-			includeCols[i] = string(col)
-		}
-		stmt += fmt.Sprintf(" INCLUDE (%s)", strings.Join(includeCols, ", "))
+		stmt += fmt.Sprintf(" INCLUDE (%s)", quotedColumnNames(idx.Include))
 	}
 
 	// PostgreSQL grammar requires INCLUDE before WHERE.
@@ -466,8 +490,8 @@ func (g *DDLGenerator) generateCreateView(view schema.View) string {
 		viewType = "MATERIALIZED "
 	}
 
-	return fmt.Sprintf("CREATE %sVIEW %s.%s AS\n%s;",
-		viewType, view.Schema, view.Name, view.Definition.Query)
+	return fmt.Sprintf("CREATE %sVIEW %s AS\n%s;",
+		viewType, qualifiedName(string(view.Schema), view.Name), view.Definition.Query)
 }
 
 func (g *DDLGenerator) generateCreateFunction(fn schema.Function) string {
@@ -488,7 +512,7 @@ func (g *DDLGenerator) renderFunction(fn schema.Function, replace bool) string {
 			argParts = append(argParts, "VARIADIC")
 		}
 		if arg.Name != nil {
-			argParts = append(argParts, quoteIdentifier(*arg.Name))
+			argParts = append(argParts, quotedIdentifier(*arg.Name))
 		}
 		argParts = append(argParts, string(arg.Type))
 		if arg.Default != nil {
@@ -508,7 +532,7 @@ func (g *DDLGenerator) renderFunction(fn schema.Function, replace bool) string {
 		} else {
 			cols := make([]string, len(ret.Columns))
 			for i, col := range ret.Columns {
-				cols[i] = fmt.Sprintf("%s %s", quoteIdentifier(col.Name), col.Type)
+				cols[i] = fmt.Sprintf("%s %s", quotedIdentifier(col.Name), col.Type)
 			}
 			returnsClause = fmt.Sprintf("RETURNS TABLE (%s)", strings.Join(cols, ", "))
 		}
@@ -521,17 +545,17 @@ func (g *DDLGenerator) renderFunction(fn schema.Function, replace bool) string {
 		createClause = "CREATE OR REPLACE FUNCTION"
 	}
 	dollarTag := functionDollarTag(fn.Body)
-	stmt := fmt.Sprintf(`%s %s.%s(%s)
+	stmt := fmt.Sprintf(`%s %s(%s)
 %s
 LANGUAGE %s
 AS %s
 %s
-%s`, createClause, fn.Schema, fn.Name, strings.Join(args, ", "), returnsClause, fn.Language, dollarTag, fn.Body, dollarTag)
+%s`, createClause, qualifiedName(string(fn.Schema), fn.Name), strings.Join(args, ", "), returnsClause, quotedIdentifier(string(fn.Language)), dollarTag, fn.Body, dollarTag)
 
 	// Add function options after the body (if not defaults)
 	// Default for plpgsql is VOLATILE, so we can omit it in most cases
 	// But for completeness, we'll include it if specified
-	if fn.Volatility != schema.Volatile {
+	if fn.Volatility != "" && fn.Volatility != schema.Volatile {
 		stmt += fmt.Sprintf("\nVOLATILITY %s", fn.Volatility)
 	}
 	if fn.Strict {
@@ -546,7 +570,7 @@ AS %s
 	if len(fn.SearchPath) > 0 {
 		path := make([]string, len(fn.SearchPath))
 		for i := range fn.SearchPath {
-			path[i] = quoteIdentifier(string(fn.SearchPath[i]))
+			path[i] = quotedIdentifier(string(fn.SearchPath[i]))
 		}
 		stmt += fmt.Sprintf("\nSET search_path TO %s", strings.Join(path, ", "))
 	}
@@ -568,7 +592,7 @@ func functionDollarTag(body string) string {
 }
 
 func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
-	stmt := fmt.Sprintf("CREATE SEQUENCE %s.%s", seq.Schema, seq.Name)
+	stmt := fmt.Sprintf("CREATE SEQUENCE %s", qualifiedName(string(seq.Schema), seq.Name))
 
 	if seq.Start != nil {
 		stmt += fmt.Sprintf(" START %d", *seq.Start)
@@ -596,15 +620,15 @@ func (g *DDLGenerator) generateCreateSequence(seq schema.Sequence) string {
 func (g *DDLGenerator) generateCreateEnum(enum schema.EnumDef) string {
 	values := make([]string, len(enum.Values))
 	for i, v := range enum.Values {
-		values[i] = quoteLiteral(v)
+		values[i] = quotedLiteral(v)
 	}
 
-	return fmt.Sprintf("CREATE TYPE %s.%s AS ENUM (%s);",
-		enum.Schema, enum.Name, strings.Join(values, ", "))
+	return fmt.Sprintf("CREATE TYPE %s AS ENUM (%s);",
+		qualifiedName(string(enum.Schema), string(enum.Name)), strings.Join(values, ", "))
 }
 
 func (g *DDLGenerator) generateCreateDomain(domain schema.DomainDef) string {
-	stmt := fmt.Sprintf("CREATE DOMAIN %s.%s AS %s", domain.Schema, domain.Name, domain.BaseType)
+	stmt := fmt.Sprintf("CREATE DOMAIN %s AS %s", qualifiedName(string(domain.Schema), string(domain.Name)), domain.BaseType)
 
 	if domain.Default != nil {
 		stmt += fmt.Sprintf(" DEFAULT %s", *domain.Default)
@@ -621,7 +645,7 @@ func (g *DDLGenerator) generateCreateDomain(domain schema.DomainDef) string {
 }
 
 func (g *DDLGenerator) generateCreateExtension(ext schema.Extension) string {
-	return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s;", ext.Name)
+	return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s;", quotedIdentifier(ext.Name))
 }
 
 func (g *DDLGenerator) generateCreateTrigger(trig schema.Trigger) string {
@@ -637,10 +661,11 @@ func (g *DDLGenerator) generateCreateTrigger(trig schema.Trigger) string {
 	}
 
 	return fmt.Sprintf(`CREATE TRIGGER %s
-%s %s ON %s.%s
-%sEXECUTE FUNCTION %s.%s();`,
-		trig.Name, trig.Timing, strings.Join(events, " OR "), trig.Schema, trig.Table,
-		rowClause, trig.Function.Schema, trig.Function.Name)
+%s %s ON %s
+%sEXECUTE FUNCTION %s();`,
+		quotedIdentifier(trig.Name), trig.Timing, strings.Join(events, " OR "),
+		qualifiedName(string(trig.Schema), string(trig.Table)), rowClause,
+		qualifiedName(string(trig.Function.Schema), trig.Function.Name))
 }
 
 func (g *DDLGenerator) generateCreatePolicy(pol schema.Policy) string {
@@ -649,11 +674,15 @@ func (g *DDLGenerator) generateCreatePolicy(pol schema.Policy) string {
 		permissive = "RESTRICTIVE"
 	}
 
-	stmt := fmt.Sprintf("CREATE POLICY %s ON %s.%s AS %s FOR %s",
-		pol.Name, pol.Schema, pol.Table, permissive, pol.For)
+	stmt := fmt.Sprintf("CREATE POLICY %s ON %s AS %s FOR %s",
+		quotedIdentifier(pol.Name), qualifiedName(string(pol.Schema), string(pol.Table)), permissive, pol.For)
 
 	if len(pol.To) > 0 {
-		stmt += fmt.Sprintf(" TO %s", strings.Join(sortedPolicyRoles(pol.To), ", "))
+		roles := sortedPolicyRoles(pol.To)
+		for i := range roles {
+			roles[i] = quotedRole(roles[i])
+		}
+		stmt += fmt.Sprintf(" TO %s", strings.Join(roles, ", "))
 	}
 
 	if pol.Using != nil {
@@ -669,6 +698,12 @@ func (g *DDLGenerator) generateCreatePolicy(pol schema.Policy) string {
 }
 
 func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, error) {
+	if err := validateObjectKeyRenderInputs(alter.Key); err != nil {
+		return nil, fmt.Errorf("invalid ALTER object identity: %w", err)
+	}
+	if err := validateDatabaseObjectRenderInputs(alter.NewObject); err != nil {
+		return nil, fmt.Errorf("invalid ALTER render input: %w", err)
+	}
 	// For now, implement basic ALTER TABLE operations
 	// More sophisticated ALTERs will be added later
 
@@ -695,7 +730,8 @@ func (g *DDLGenerator) generateAlter(alter differ.AlterOperation) ([]string, err
 		out := []string{dropStmt, createStmt}
 		if obj.Owner != nil {
 			kw := viewAlterKeyword(obj)
-			out = append(out, fmt.Sprintf("ALTER %s %s.%s OWNER TO %s;", kw, obj.Schema, obj.Name, formatRoleIdent(*obj.Owner)))
+			out = append(out, fmt.Sprintf("ALTER %s %s OWNER TO %s;", kw,
+				qualifiedName(string(obj.Schema), obj.Name), quotedRole(*obj.Owner)))
 		}
 		out = append(out, grantStatementsFromView(obj)...)
 		return out, nil
@@ -758,14 +794,15 @@ func (g *DDLGenerator) generateAlterEnum(enum schema.EnumDef, alter differ.Alter
 
 	statements := make([]string, 0, len(enum.Values)-len(oldEnum.Values)+1)
 	for _, value := range enum.Values[len(oldEnum.Values):] {
-		statements = append(statements, fmt.Sprintf("ALTER TYPE %s.%s ADD VALUE %s;",
-			enum.Schema, enum.Name, quoteLiteral(value)))
+		statements = append(statements, fmt.Sprintf("ALTER TYPE %s ADD VALUE %s;",
+			qualifiedName(string(enum.Schema), string(enum.Name)), quotedLiteral(value)))
 	}
 	if !plannerStringPtrEqual(enum.Comment, oldEnum.Comment) {
 		if enum.Comment == nil {
-			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s.%s IS NULL;", enum.Schema, enum.Name))
+			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s IS NULL;", qualifiedName(string(enum.Schema), string(enum.Name))))
 		} else {
-			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s.%s IS %s;", enum.Schema, enum.Name, quoteLiteral(*enum.Comment)))
+			statements = append(statements, fmt.Sprintf("COMMENT ON TYPE %s IS %s;",
+				qualifiedName(string(enum.Schema), string(enum.Name)), quotedLiteral(*enum.Comment)))
 		}
 	}
 	return statements, nil
@@ -779,7 +816,16 @@ func plannerStringPtrEqual(a, b *string) bool {
 }
 
 func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Table, alter differ.AlterOperation) ([]string, error) {
+	if err := validateDatabaseObjectRenderInputs(tbl); err != nil {
+		return nil, fmt.Errorf("invalid ALTER TABLE render input: %w", err)
+	}
+	if oldTable != nil {
+		if err := validateDatabaseObjectRenderInputs(*oldTable); err != nil {
+			return nil, fmt.Errorf("invalid prior TABLE render input: %w", err)
+		}
+	}
 	var statements []string
+	tableSQL := qualifiedName(string(tbl.Schema), string(tbl.Name))
 
 	// Build column and constraint maps for quick lookup (new table)
 	colMap := make(map[schema.ColumnName]schema.Column)
@@ -812,7 +858,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 	for _, change := range alter.Changes {
 		if change == "owner changed" {
 			if tbl.Owner != nil {
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s OWNER TO %s;", tbl.Schema, tbl.Name, formatRoleIdent(*tbl.Owner)))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s OWNER TO %s;", tableSQL, quotedRole(*tbl.Owner)))
 			}
 		} else if strings.HasPrefix(change, "add grant\t") || strings.HasPrefix(change, "revoke grant\t") {
 			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(change)
@@ -826,11 +872,11 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 		} else if strings.HasPrefix(change, "add column ") {
 			colName := schema.ColumnName(strings.TrimPrefix(change, "add column "))
 			if col, exists := colMap[colName]; exists {
-				base := fmt.Sprintf("%s %s", col.Name, col.Type)
+				base := fmt.Sprintf("%s %s", quotedIdentifier(string(col.Name)), col.Type)
 				colParts := []string{base}
 
 				if col.Collation != nil {
-					colParts = append(colParts, fmt.Sprintf("COLLATE %s", formatQualifiedIdentifier(*col.Collation)))
+					colParts = append(colParts, fmt.Sprintf("COLLATE %s", qualifiedText(*col.Collation)))
 				}
 
 				if col.Identity != nil {
@@ -845,7 +891,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 					colParts = append(colParts, "NOT NULL")
 				}
 
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN %s;", tbl.Schema, tbl.Name, strings.Join(colParts, " ")))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;", tableSQL, strings.Join(colParts, " ")))
 
 				if col.Comment != nil {
 					statements = append(statements, formatColumnCommentStatement(tbl.Schema, tbl.Name, col.Name, col.Comment))
@@ -853,7 +899,7 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			}
 		} else if strings.HasPrefix(change, "drop column ") {
 			colName := strings.TrimPrefix(change, "drop column ")
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP COLUMN %s;", tbl.Schema, tbl.Name, colName))
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", tableSQL, quotedIdentifier(colName)))
 		} else if strings.HasPrefix(change, "alter column ") {
 			// Parse "alter column <name>: <details>"
 			parts := strings.SplitN(strings.TrimPrefix(change, "alter column "), ": ", 2)
@@ -868,23 +914,19 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			}
 		} else if strings.HasPrefix(change, "add primary key") {
 			if tbl.PrimaryKey != nil {
-				pkCols := make([]string, len(tbl.PrimaryKey.Cols))
-				for i, col := range tbl.PrimaryKey.Cols {
-					pkCols[i] = string(col)
-				}
 				pkName := "pkey"
 				if tbl.PrimaryKey.Name != nil {
 					pkName = *tbl.PrimaryKey.Name
 				}
-				pkStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s)",
-					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", "))
+				pkStmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY (%s)",
+					tableSQL, quotedIdentifier(pkName), quotedColumnNames(tbl.PrimaryKey.Cols))
 				pkStmt += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
 				statements = append(statements, pkStmt+";")
 			}
 		} else if strings.HasPrefix(change, "drop primary key") {
 			if oldPKName != "" {
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-					tbl.Schema, tbl.Name, oldPKName))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+					tableSQL, quotedIdentifier(oldPKName)))
 			} else {
 				return nil, &UnsupportedChangeError{
 					Key: schema.ObjectKey{
@@ -900,20 +942,16 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 		} else if strings.HasPrefix(change, "primary key columns changed") || strings.Contains(change, "primary key") && strings.Contains(change, "changed") {
 			// Drop old primary key and add new one
 			if oldPKName != "" {
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-					tbl.Schema, tbl.Name, oldPKName))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+					tableSQL, quotedIdentifier(oldPKName)))
 			}
 			if tbl.PrimaryKey != nil {
-				pkCols := make([]string, len(tbl.PrimaryKey.Cols))
-				for i, col := range tbl.PrimaryKey.Cols {
-					pkCols[i] = string(col)
-				}
 				pkName := "pkey"
 				if tbl.PrimaryKey.Name != nil {
 					pkName = *tbl.PrimaryKey.Name
 				}
-				pkStmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s)",
-					tbl.Schema, tbl.Name, pkName, strings.Join(pkCols, ", "))
+				pkStmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY (%s)",
+					tableSQL, quotedIdentifier(pkName), quotedColumnNames(tbl.PrimaryKey.Cols))
 				pkStmt += formatConstraintTiming(tbl.PrimaryKey.Deferrable, tbl.PrimaryKey.InitiallyDeferred)
 				statements = append(statements, pkStmt+";")
 			}
@@ -927,8 +965,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			}
 		} else if strings.HasPrefix(change, "drop unique constraint ") {
 			constraintName := strings.TrimPrefix(change, "drop unique constraint ")
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-				tbl.Schema, tbl.Name, constraintName))
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+				tableSQL, quotedIdentifier(constraintName)))
 		} else if strings.HasPrefix(change, "add check constraint ") {
 			constraintName := strings.TrimPrefix(change, "add check constraint ")
 			for _, ck := range tbl.Checks {
@@ -939,8 +977,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			}
 		} else if strings.HasPrefix(change, "drop check constraint ") {
 			constraintName := strings.TrimPrefix(change, "drop check constraint ")
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-				tbl.Schema, tbl.Name, constraintName))
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+				tableSQL, quotedIdentifier(constraintName)))
 		} else if strings.HasPrefix(change, "add foreign key ") {
 			constraintName := strings.TrimPrefix(change, "add foreign key ")
 			for _, fk := range tbl.ForeignKeys {
@@ -951,8 +989,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			}
 		} else if strings.HasPrefix(change, "drop foreign key ") {
 			constraintName := strings.TrimPrefix(change, "drop foreign key ")
-			statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-				tbl.Schema, tbl.Name, constraintName))
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+				tableSQL, quotedIdentifier(constraintName)))
 		} else if strings.HasPrefix(change, "unique constraint ") && strings.HasSuffix(change, " validation changed") {
 			constraintName := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(change, "unique constraint "), " validation changed"))
 
@@ -960,17 +998,17 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 				if uq, ok := oldUniqueMap[constraintName]; ok && !uq.NotValid {
 					// Old constraint existed; drop only if moving to NOT VALID
 					if newUq := findUniqueConstraint(tbl.Uniques, constraintName); newUq != nil && newUq.NotValid {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 						statements = append(statements, buildAddUniqueConstraintStatement(tbl, *newUq)+";")
 					} else {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 					}
 				} else {
 					if newUq := findUniqueConstraint(tbl.Uniques, constraintName); newUq != nil {
 						if newUq.NotValid {
 							statements = append(statements, buildAddUniqueConstraintStatement(tbl, *newUq)+";")
 						} else {
-							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+							statements = append(statements, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 						}
 					} else {
 						return nil, &UnsupportedChangeError{
@@ -992,8 +1030,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			if len(parts) >= 3 {
 				constraintName := parts[2]
 				// Drop old
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-					tbl.Schema, tbl.Name, constraintName))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+					tableSQL, quotedIdentifier(constraintName)))
 				// Add new
 				for _, uq := range tbl.Uniques {
 					if uq.Name == constraintName {
@@ -1008,17 +1046,17 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			if constraintName != "" {
 				if ck, ok := oldCheckMap[constraintName]; ok && !ck.NotValid {
 					if newCk := findCheckConstraint(tbl.Checks, constraintName); newCk != nil && newCk.NotValid {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 						statements = append(statements, buildAddCheckConstraintStatement(tbl, *newCk)+";")
 					} else {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 					}
 				} else {
 					if newCk := findCheckConstraint(tbl.Checks, constraintName); newCk != nil {
 						if newCk.NotValid {
 							statements = append(statements, buildAddCheckConstraintStatement(tbl, *newCk)+";")
 						} else {
-							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+							statements = append(statements, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 						}
 					} else {
 						return nil, &UnsupportedChangeError{
@@ -1040,8 +1078,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			if len(parts) >= 3 {
 				constraintName := parts[2]
 				// Drop old
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-					tbl.Schema, tbl.Name, constraintName))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+					tableSQL, quotedIdentifier(constraintName)))
 				// Add new
 				for _, ck := range tbl.Checks {
 					if ck.Name == constraintName {
@@ -1056,17 +1094,17 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			if constraintName != "" {
 				if fk, ok := oldFKMap[constraintName]; ok && !fk.NotValid {
 					if newFk := findForeignKey(tbl.ForeignKeys, constraintName); newFk != nil && newFk.NotValid {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 						statements = append(statements, buildAddForeignKeyStatement(tbl, *newFk)+";")
 					} else {
-						statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+						statements = append(statements, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 					}
 				} else {
 					if newFk := findForeignKey(tbl.ForeignKeys, constraintName); newFk != nil {
 						if newFk.NotValid {
 							statements = append(statements, buildAddForeignKeyStatement(tbl, *newFk)+";")
 						} else {
-							statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;", tbl.Schema, tbl.Name, constraintName))
+							statements = append(statements, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", tableSQL, quotedIdentifier(constraintName)))
 						}
 					} else {
 						return nil, &UnsupportedChangeError{
@@ -1088,8 +1126,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 			if len(parts) >= 3 {
 				constraintName := parts[2]
 				// Drop old
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT %s;",
-					tbl.Schema, tbl.Name, constraintName))
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+					tableSQL, quotedIdentifier(constraintName)))
 				// Add new
 				for _, fk := range tbl.ForeignKeys {
 					if fk.Name == constraintName {
@@ -1118,7 +1156,8 @@ func (g *DDLGenerator) generateAlterTable(tbl schema.Table, oldTable *schema.Tab
 
 func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Table, colName, changeDetail string) ([]string, error) {
 	var statements []string
-	tableName := fmt.Sprintf("%s.%s", tbl.Schema, tbl.Name)
+	tableName := qualifiedName(string(tbl.Schema), string(tbl.Name))
+	columnName := quotedIdentifier(colName)
 
 	var newCol *schema.Column
 	for i := range tbl.Columns {
@@ -1139,56 +1178,58 @@ func (g *DDLGenerator) generateColumnAlter(tbl schema.Table, oldTable *schema.Ta
 	}
 
 	if strings.Contains(changeDetail, "type changed") {
-		// Parse "type changed from <old> to <new>"
-		if strings.Contains(changeDetail, " to ") {
-			parts := strings.Split(changeDetail, " to ")
-			if len(parts) == 2 {
-				newType := strings.TrimSpace(parts[1])
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;",
-					tableName, colName, newType))
+		// The human-readable change string is not an authoritative SQL source.
+		// Render the target type from the desired column object instead.
+		if newCol == nil {
+			return nil, &UnsupportedChangeError{
+				Key:         schema.ObjectKey{Kind: schema.ColumnKind, Schema: tbl.Schema, Name: colName, TableName: tbl.Name},
+				Change:      changeDetail,
+				Remediation: "the desired column definition is unavailable; write an explicit migration",
 			}
 		}
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;",
+			tableName, columnName, newCol.Type))
 	} else if changeDetail == "set not null" {
 		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;",
-			tableName, colName))
+			tableName, columnName))
 	} else if changeDetail == "drop not null" {
 		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;",
-			tableName, colName))
+			tableName, columnName))
 	} else if changeDetail == "default changed" {
 		// Find the column to get the new default value
 		if newCol != nil && newCol.Default != nil {
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;",
-				tableName, colName, *newCol.Default))
+				tableName, columnName, *newCol.Default))
 		} else {
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;",
-				tableName, colName))
+				tableName, columnName))
 		}
 	} else if changeDetail == "generated spec changed" {
 		if oldCol != nil && oldCol.Generated != nil {
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP EXPRESSION;",
-				tableName, colName))
+				tableName, columnName))
 		}
 		if newCol != nil && newCol.Generated != nil {
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD %s;",
-				tableName, colName, formatGeneratedClause(*newCol.Generated)))
+				tableName, columnName, formatGeneratedClause(*newCol.Generated)))
 		}
 	} else if changeDetail == "identity spec changed" {
 		if oldCol != nil && oldCol.Identity != nil {
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP IDENTITY IF EXISTS;",
-				tableName, colName))
+				tableName, columnName))
 		}
 		if newCol != nil && newCol.Identity != nil {
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD %s;",
-				tableName, colName, formatIdentityClause(*newCol.Identity)))
+				tableName, columnName, formatIdentityClause(*newCol.Identity)))
 		}
 	} else if changeDetail == "collation changed" {
 		if newCol != nil {
 			if newCol.Collation != nil {
 				statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s COLLATE %s;",
-					tableName, colName, newCol.Type, formatQualifiedIdentifier(*newCol.Collation)))
+					tableName, columnName, newCol.Type, qualifiedText(*newCol.Collation)))
 			} else {
 				statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;",
-					tableName, colName, newCol.Type))
+					tableName, columnName, newCol.Type))
 			}
 		}
 	} else if changeDetail == "comment changed" {
@@ -1241,13 +1282,8 @@ func findForeignKey(constraints []schema.ForeignKey, name string) *schema.Foreig
 }
 
 func buildAddUniqueConstraintStatement(tbl schema.Table, uq schema.UniqueConstraint) string {
-	uqCols := make([]string, len(uq.Cols))
-	for i, col := range uq.Cols {
-		uqCols[i] = string(col)
-	}
-
-	stmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s UNIQUE (%s)",
-		tbl.Schema, tbl.Name, uq.Name, strings.Join(uqCols, ", "))
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s)",
+		qualifiedName(string(tbl.Schema), string(tbl.Name)), quotedIdentifier(uq.Name), quotedColumnNames(uq.Cols))
 	if !uq.NullsDistinct {
 		stmt += " NULLS NOT DISTINCT"
 	}
@@ -1259,11 +1295,11 @@ func buildAddUniqueConstraintStatement(tbl schema.Table, uq schema.UniqueConstra
 func buildAddCheckConstraintStatement(tbl schema.Table, ck schema.CheckConstraint) string {
 	var stmt string
 	if ck.Name != "" {
-		stmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s)",
-			tbl.Schema, tbl.Name, ck.Name, ck.Expr)
+		stmt = fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)",
+			qualifiedName(string(tbl.Schema), string(tbl.Name)), quotedIdentifier(ck.Name), ck.Expr)
 	} else {
-		stmt = fmt.Sprintf("ALTER TABLE %s.%s ADD CHECK (%s)",
-			tbl.Schema, tbl.Name, ck.Expr)
+		stmt = fmt.Sprintf("ALTER TABLE %s ADD CHECK (%s)",
+			qualifiedName(string(tbl.Schema), string(tbl.Name)), ck.Expr)
 	}
 	if ck.NoInherit {
 		stmt += " NO INHERIT"
@@ -1274,17 +1310,9 @@ func buildAddCheckConstraintStatement(tbl schema.Table, ck schema.CheckConstrain
 }
 
 func buildAddForeignKeyStatement(tbl schema.Table, fk schema.ForeignKey) string {
-	fkCols := make([]string, len(fk.Cols))
-	for i, col := range fk.Cols {
-		fkCols[i] = string(col)
-	}
-	refCols := make([]string, len(fk.Ref.Cols))
-	for i, col := range fk.Ref.Cols {
-		refCols[i] = string(col)
-	}
-
-	stmt := fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)",
-		tbl.Schema, tbl.Name, fk.Name, strings.Join(fkCols, ", "), fk.Ref.Schema, fk.Ref.Table, strings.Join(refCols, ", "))
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
+		qualifiedName(string(tbl.Schema), string(tbl.Name)), quotedIdentifier(fk.Name), quotedColumnNames(fk.Cols),
+		qualifiedName(string(fk.Ref.Schema), string(fk.Ref.Table)), quotedColumnNames(fk.Ref.Cols))
 
 	switch fk.Match {
 	case schema.MatchFull:
@@ -1401,62 +1429,41 @@ func formatConstraintValidation(notValid bool) string {
 }
 
 func formatTableCommentStatement(schemaName schema.SchemaName, tableName schema.TableName, comment *string) string {
-	qualified := fmt.Sprintf("%s.%s", schemaName, tableName)
+	qualified := qualifiedName(string(schemaName), string(tableName))
 	if comment == nil {
 		return fmt.Sprintf("COMMENT ON TABLE %s IS NULL;", qualified)
 	}
-	return fmt.Sprintf("COMMENT ON TABLE %s IS %s;", qualified, quoteLiteral(*comment))
+	return fmt.Sprintf("COMMENT ON TABLE %s IS %s;", qualified, quotedLiteral(*comment))
 }
 
 func formatColumnCommentStatement(schemaName schema.SchemaName, tableName schema.TableName, columnName schema.ColumnName, comment *string) string {
-	qualified := fmt.Sprintf("%s.%s.%s", schemaName, tableName, columnName)
+	qualified := qualifiedColumnName(string(schemaName), string(tableName), string(columnName))
 	if comment == nil {
 		return fmt.Sprintf("COMMENT ON COLUMN %s IS NULL;", qualified)
 	}
-	return fmt.Sprintf("COMMENT ON COLUMN %s IS %s;", qualified, quoteLiteral(*comment))
+	return fmt.Sprintf("COMMENT ON COLUMN %s IS %s;", qualified, quotedLiteral(*comment))
 }
 
 func formatIndexCommentStatement(schemaName schema.SchemaName, indexName string, comment *string) string {
-	qualified := fmt.Sprintf("%s.%s", schemaName, indexName)
+	qualified := qualifiedName(string(schemaName), indexName)
 	if comment == nil {
 		return fmt.Sprintf("COMMENT ON INDEX %s IS NULL;", qualified)
 	}
-	return fmt.Sprintf("COMMENT ON INDEX %s IS %s;", qualified, quoteLiteral(*comment))
-}
-
-func quoteLiteral(value string) string {
-	escaped := strings.ReplaceAll(value, "'", "''")
-	return fmt.Sprintf("'%s'", escaped)
-}
-
-func formatQualifiedIdentifier(value string) string {
-	if value == "" {
-		return `""`
-	}
-	parts := strings.Split(value, ".")
-	for i, part := range parts {
-		if part == "" {
-			parts[i] = `""`
-			continue
-		}
-		parts[i] = quoteIdentifier(part)
-	}
-	return strings.Join(parts, ".")
-}
-
-func quoteIdentifier(ident string) string {
-	escaped := strings.ReplaceAll(ident, `"`, `""`)
-	return fmt.Sprintf(`"%s"`, escaped)
+	return fmt.Sprintf("COMMENT ON INDEX %s IS %s;", qualified, quotedLiteral(*comment))
 }
 
 func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
+	if err := validateObjectKeyRenderInputs(key); err != nil {
+		return "", fmt.Errorf("invalid DROP render input: %w", err)
+	}
+	qualified := qualifiedName(string(key.Schema), key.Name)
 	switch key.Kind {
 	case schema.TableKind:
-		return fmt.Sprintf("DROP TABLE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
+		return fmt.Sprintf("DROP TABLE IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.IndexKind:
-		return fmt.Sprintf("DROP INDEX IF EXISTS %s.%s;", key.Schema, key.Name), nil
+		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", qualified), nil
 	case schema.ViewKind:
-		return fmt.Sprintf("DROP VIEW IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
+		return fmt.Sprintf("DROP VIEW IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.FunctionKind:
 		if key.Signature == "" {
 			return "", &UnsupportedChangeError{
@@ -1465,17 +1472,23 @@ func (g *DDLGenerator) generateDrop(key schema.ObjectKey) (string, error) {
 				Remediation: "specify the function argument types explicitly",
 			}
 		}
-		return fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s%s%s;", key.Schema, key.Name, key.Signature, g.cascadeClause()), nil
+		return fmt.Sprintf("DROP FUNCTION IF EXISTS %s%s%s;", qualified, key.Signature, g.cascadeClause()), nil
 	case schema.SequenceKind:
-		return fmt.Sprintf("DROP SEQUENCE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
+		return fmt.Sprintf("DROP SEQUENCE IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.TypeKind:
-		return fmt.Sprintf("DROP TYPE IF EXISTS %s.%s%s;", key.Schema, key.Name, g.cascadeClause()), nil
+		return fmt.Sprintf("DROP TYPE IF EXISTS %s%s;", qualified, g.cascadeClause()), nil
 	case schema.TriggerKind:
-		return fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s.%s;", key.Name, key.Schema, key.TableName), nil
+		return fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", quotedIdentifier(key.Name), qualifiedName(string(key.Schema), string(key.TableName))), nil
 	case schema.PolicyKind:
-		return fmt.Sprintf("DROP POLICY IF EXISTS %s ON %s.%s;", key.Name, key.Schema, key.TableName), nil
+		return fmt.Sprintf("DROP POLICY IF EXISTS %s ON %s;", quotedIdentifier(key.Name), qualifiedName(string(key.Schema), string(key.TableName))), nil
 	default:
-		return "", fmt.Errorf("unsupported object kind for DROP: %s", key.Kind)
+		return "", &capability.UnsupportedError{
+			Stage:   capability.DropStage,
+			Family:  capability.Family(key.Kind),
+			Feature: "drop object",
+			Object:  key,
+			Reason:  "object kind is not registered with the DROP renderer",
+		}
 	}
 }
 

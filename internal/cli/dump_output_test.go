@@ -180,13 +180,13 @@ func TestWriteDumpPerSchemaDirCrossSchemaForeignKey(t *testing.T) {
 	publicSQL := string(publicBytes)
 	salesSQL := string(salesBytes)
 
-	assert.Contains(t, publicSQL, "CREATE TABLE public.users")
-	assert.NotContains(t, publicSQL, "sales.orders")
-	assert.NotContains(t, publicSQL, "orders_user_fk")
+	assert.Contains(t, publicSQL, `CREATE TABLE "public"."users"`)
+	assert.NotContains(t, publicSQL, `"sales"."orders"`)
+	assert.NotContains(t, publicSQL, `"orders_user_fk"`)
 
-	assert.Contains(t, salesSQL, "CREATE TABLE sales.orders")
-	assert.Contains(t, salesSQL, "REFERENCES public.users (id)")
-	assert.Contains(t, salesSQL, "CONSTRAINT orders_user_fk FOREIGN KEY (user_id)")
+	assert.Contains(t, salesSQL, `CREATE TABLE "sales"."orders"`)
+	assert.Contains(t, salesSQL, `REFERENCES "public"."users" ("id")`)
+	assert.Contains(t, salesSQL, `CONSTRAINT "orders_user_fk" FOREIGN KEY ("user_id")`)
 
 	// File emission order is lexicographic by schema name (public.sql then sales.sql), not FK dependency order.
 	names := sortedSchemaNames(groupObjectsBySchema(objs))

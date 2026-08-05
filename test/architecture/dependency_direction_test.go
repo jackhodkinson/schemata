@@ -99,25 +99,29 @@ const (
 	layerExternal        = "external"
 	layerUnknownInternal = "unknown-internal"
 
-	layerCmd       = "cmd"
-	layerCLI       = "cli"
-	layerApp       = "app"
-	layerConfig    = "config"
-	layerDB        = "db"
-	layerDiffer    = "differ"
-	layerMigration = "migration"
-	layerNormalize = "normalize"
-	layerObjectMap = "objectmap"
-	layerParser    = "parser"
-	layerPlanner   = "planner"
-	layerVersion   = "version"
-	layerPkg       = "pkg"
+	layerCmd        = "cmd"
+	layerCapability = "capability"
+	layerCLI        = "cli"
+	layerApp        = "app"
+	layerConfig     = "config"
+	layerDB         = "db"
+	layerDiffer     = "differ"
+	layerMigration  = "migration"
+	layerNormalize  = "normalize"
+	layerObjectMap  = "objectmap"
+	layerParser     = "parser"
+	layerPlanner    = "planner"
+	layerSQLRender  = "sqlrender"
+	layerVersion    = "version"
+	layerPkg        = "pkg"
 )
 
 func classifyLayer(importPath string) string {
 	switch {
 	case importPath == modulePath+"/cmd/schemata":
 		return layerCmd
+	case strings.HasPrefix(importPath, modulePath+"/internal/capability"):
+		return layerCapability
 	case strings.HasPrefix(importPath, modulePath+"/internal/cli"):
 		return layerCLI
 	case strings.HasPrefix(importPath, modulePath+"/internal/app"):
@@ -138,6 +142,8 @@ func classifyLayer(importPath string) string {
 		return layerParser
 	case strings.HasPrefix(importPath, modulePath+"/internal/planner"):
 		return layerPlanner
+	case strings.HasPrefix(importPath, modulePath+"/internal/sqlrender"):
+		return layerSQLRender
 	case strings.HasPrefix(importPath, modulePath+"/internal/version"):
 		return layerVersion
 	case strings.HasPrefix(importPath, modulePath+"/pkg/"):
@@ -153,6 +159,9 @@ func isAllowedLayerDependency(from, to string) bool {
 	allowed := map[string]map[string]bool{
 		layerCmd: {
 			layerCLI: true,
+		},
+		layerCapability: {
+			layerPkg: true,
 		},
 		layerCLI: {
 			layerApp:       true,
@@ -180,6 +189,7 @@ func isAllowedLayerDependency(from, to string) bool {
 		layerDB: {
 			layerConfig:    true,
 			layerObjectMap: true,
+			layerSQLRender: true,
 			layerPkg:       true,
 		},
 		layerDiffer: {
@@ -202,11 +212,14 @@ func isAllowedLayerDependency(from, to string) bool {
 			layerPkg:       true,
 		},
 		layerPlanner: {
-			layerDiffer: true,
-			layerPkg:    true,
+			layerCapability: true,
+			layerDiffer:     true,
+			layerSQLRender:  true,
+			layerPkg:        true,
 		},
-		layerVersion: {},
-		layerPkg: {},
+		layerSQLRender: {},
+		layerVersion:   {},
+		layerPkg:       {},
 	}
 
 	return allowed[from][to]

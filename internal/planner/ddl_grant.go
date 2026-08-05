@@ -8,13 +8,6 @@ import (
 	"github.com/jackhodkinson/schemata/pkg/schema"
 )
 
-func formatRoleIdent(role string) string {
-	if strings.EqualFold(role, "PUBLIC") {
-		return "PUBLIC"
-	}
-	return `"` + strings.ReplaceAll(role, `"`, `""`) + `"`
-}
-
 func joinPrivileges(privs []schema.Privilege) string {
 	parts := make([]string, len(privs))
 	for i := range privs {
@@ -24,8 +17,8 @@ func joinPrivileges(privs []schema.Privilege) string {
 }
 
 func formatTableGrant(tbl schema.Table, grantee string, privs []schema.Privilege, grantable bool) string {
-	stmt := fmt.Sprintf("GRANT %s ON TABLE %s.%s TO %s",
-		joinPrivileges(privs), tbl.Schema, tbl.Name, formatRoleIdent(grantee))
+	stmt := fmt.Sprintf("GRANT %s ON TABLE %s TO %s",
+		joinPrivileges(privs), qualifiedName(string(tbl.Schema), string(tbl.Name)), quotedRole(grantee))
 	if grantable {
 		stmt += " WITH GRANT OPTION"
 	}
@@ -34,16 +27,16 @@ func formatTableGrant(tbl schema.Table, grantee string, privs []schema.Privilege
 
 func formatTableRevoke(tbl schema.Table, grantee string, privs []schema.Privilege, grantable bool) string {
 	if grantable {
-		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON TABLE %s.%s FROM %s;",
-			joinPrivileges(privs), tbl.Schema, tbl.Name, formatRoleIdent(grantee))
+		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON TABLE %s FROM %s;",
+			joinPrivileges(privs), qualifiedName(string(tbl.Schema), string(tbl.Name)), quotedRole(grantee))
 	}
-	return fmt.Sprintf("REVOKE %s ON TABLE %s.%s FROM %s;",
-		joinPrivileges(privs), tbl.Schema, tbl.Name, formatRoleIdent(grantee))
+	return fmt.Sprintf("REVOKE %s ON TABLE %s FROM %s;",
+		joinPrivileges(privs), qualifiedName(string(tbl.Schema), string(tbl.Name)), quotedRole(grantee))
 }
 
 func formatViewGrant(v schema.View, grantee string, privs []schema.Privilege, grantable bool) string {
-	stmt := fmt.Sprintf("GRANT %s ON TABLE %s.%s TO %s",
-		joinPrivileges(privs), v.Schema, v.Name, formatRoleIdent(grantee))
+	stmt := fmt.Sprintf("GRANT %s ON TABLE %s TO %s",
+		joinPrivileges(privs), qualifiedName(string(v.Schema), v.Name), quotedRole(grantee))
 	if grantable {
 		stmt += " WITH GRANT OPTION"
 	}
@@ -52,16 +45,16 @@ func formatViewGrant(v schema.View, grantee string, privs []schema.Privilege, gr
 
 func formatViewRevoke(v schema.View, grantee string, privs []schema.Privilege, grantable bool) string {
 	if grantable {
-		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON TABLE %s.%s FROM %s;",
-			joinPrivileges(privs), v.Schema, v.Name, formatRoleIdent(grantee))
+		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON TABLE %s FROM %s;",
+			joinPrivileges(privs), qualifiedName(string(v.Schema), v.Name), quotedRole(grantee))
 	}
-	return fmt.Sprintf("REVOKE %s ON TABLE %s.%s FROM %s;",
-		joinPrivileges(privs), v.Schema, v.Name, formatRoleIdent(grantee))
+	return fmt.Sprintf("REVOKE %s ON TABLE %s FROM %s;",
+		joinPrivileges(privs), qualifiedName(string(v.Schema), v.Name), quotedRole(grantee))
 }
 
 func formatSequenceGrant(seq schema.Sequence, grantee string, privs []schema.Privilege, grantable bool) string {
-	stmt := fmt.Sprintf("GRANT %s ON SEQUENCE %s.%s TO %s",
-		joinPrivileges(privs), seq.Schema, seq.Name, formatRoleIdent(grantee))
+	stmt := fmt.Sprintf("GRANT %s ON SEQUENCE %s TO %s",
+		joinPrivileges(privs), qualifiedName(string(seq.Schema), seq.Name), quotedRole(grantee))
 	if grantable {
 		stmt += " WITH GRANT OPTION"
 	}
@@ -70,17 +63,17 @@ func formatSequenceGrant(seq schema.Sequence, grantee string, privs []schema.Pri
 
 func formatSequenceRevoke(seq schema.Sequence, grantee string, privs []schema.Privilege, grantable bool) string {
 	if grantable {
-		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON SEQUENCE %s.%s FROM %s;",
-			joinPrivileges(privs), seq.Schema, seq.Name, formatRoleIdent(grantee))
+		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON SEQUENCE %s FROM %s;",
+			joinPrivileges(privs), qualifiedName(string(seq.Schema), seq.Name), quotedRole(grantee))
 	}
-	return fmt.Sprintf("REVOKE %s ON SEQUENCE %s.%s FROM %s;",
-		joinPrivileges(privs), seq.Schema, seq.Name, formatRoleIdent(grantee))
+	return fmt.Sprintf("REVOKE %s ON SEQUENCE %s FROM %s;",
+		joinPrivileges(privs), qualifiedName(string(seq.Schema), seq.Name), quotedRole(grantee))
 }
 
 func formatFunctionGrant(fn schema.Function, grantee string, privs []schema.Privilege, grantable bool) string {
 	sig := functionSignatureForACL(fn)
 	stmt := fmt.Sprintf("GRANT %s ON FUNCTION %s TO %s",
-		joinPrivileges(privs), sig, formatRoleIdent(grantee))
+		joinPrivileges(privs), sig, quotedRole(grantee))
 	if grantable {
 		stmt += " WITH GRANT OPTION"
 	}
@@ -91,10 +84,10 @@ func formatFunctionRevoke(fn schema.Function, grantee string, privs []schema.Pri
 	sig := functionSignatureForACL(fn)
 	if grantable {
 		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON FUNCTION %s FROM %s;",
-			joinPrivileges(privs), sig, formatRoleIdent(grantee))
+			joinPrivileges(privs), sig, quotedRole(grantee))
 	}
 	return fmt.Sprintf("REVOKE %s ON FUNCTION %s FROM %s;",
-		joinPrivileges(privs), sig, formatRoleIdent(grantee))
+		joinPrivileges(privs), sig, quotedRole(grantee))
 }
 
 func functionSignatureForACL(fn schema.Function) string {
@@ -102,7 +95,7 @@ func functionSignatureForACL(fn schema.Function) string {
 	for _, a := range fn.Args {
 		args = append(args, string(a.Type))
 	}
-	return fmt.Sprintf("%s.%s(%s)", fn.Schema, fn.Name, strings.Join(args, ", "))
+	return fmt.Sprintf("%s(%s)", qualifiedName(string(fn.Schema), fn.Name), strings.Join(args, ", "))
 }
 
 func onlyOwnerOrGrantChanges(changes []string) bool {
@@ -135,7 +128,8 @@ func (g *DDLGenerator) generateAlterViewOwnerAndGrants(v schema.View, alter diff
 	kw := viewAlterKeyword(v)
 	for _, ch := range alter.Changes {
 		if ch == "owner changed" && v.Owner != nil {
-			stmts = append(stmts, fmt.Sprintf("ALTER %s %s.%s OWNER TO %s;", kw, v.Schema, v.Name, formatRoleIdent(*v.Owner)))
+			stmts = append(stmts, fmt.Sprintf("ALTER %s %s OWNER TO %s;", kw,
+				qualifiedName(string(v.Schema), v.Name), quotedRole(*v.Owner)))
 		} else if strings.HasPrefix(ch, "add grant\t") || strings.HasPrefix(ch, "revoke grant\t") {
 			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(ch)
 			if ok {
@@ -154,7 +148,8 @@ func (g *DDLGenerator) generateAlterSequenceOwnerAndGrants(seq schema.Sequence, 
 	var stmts []string
 	for _, ch := range alter.Changes {
 		if ch == "owner changed" && seq.Owner != nil {
-			stmts = append(stmts, fmt.Sprintf("ALTER SEQUENCE %s.%s OWNER TO %s;", seq.Schema, seq.Name, formatRoleIdent(*seq.Owner)))
+			stmts = append(stmts, fmt.Sprintf("ALTER SEQUENCE %s OWNER TO %s;",
+				qualifiedName(string(seq.Schema), seq.Name), quotedRole(*seq.Owner)))
 		} else if strings.HasPrefix(ch, "add grant\t") || strings.HasPrefix(ch, "revoke grant\t") {
 			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(ch)
 			if ok {
@@ -193,7 +188,7 @@ func (g *DDLGenerator) generateAlterFunction(fn schema.Function, alter differ.Al
 
 	for _, ch := range alter.Changes {
 		if ch == "owner changed" && fn.Owner != nil {
-			stmts = append(stmts, fmt.Sprintf("ALTER FUNCTION %s OWNER TO %s;", functionSignatureForACL(fn), formatRoleIdent(*fn.Owner)))
+			stmts = append(stmts, fmt.Sprintf("ALTER FUNCTION %s OWNER TO %s;", functionSignatureForACL(fn), quotedRole(*fn.Owner)))
 		} else if strings.HasPrefix(ch, "add grant\t") || strings.HasPrefix(ch, "revoke grant\t") {
 			revoke, grantee, privs, grantable, ok := differ.ParseGrantChange(ch)
 			if ok {
@@ -210,7 +205,7 @@ func (g *DDLGenerator) generateAlterFunction(fn schema.Function, alter differ.Al
 			if fn.Comment == nil {
 				stmts = append(stmts, fmt.Sprintf("COMMENT ON FUNCTION %s IS NULL;", functionSignatureForACL(fn)))
 			} else {
-				stmts = append(stmts, fmt.Sprintf("COMMENT ON FUNCTION %s IS %s;", functionSignatureForACL(fn), quoteLiteral(*fn.Comment)))
+				stmts = append(stmts, fmt.Sprintf("COMMENT ON FUNCTION %s IS %s;", functionSignatureForACL(fn), quotedLiteral(*fn.Comment)))
 			}
 		}
 	}
