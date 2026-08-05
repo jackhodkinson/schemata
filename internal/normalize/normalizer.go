@@ -43,11 +43,21 @@ func Object(obj schema.DatabaseObject) schema.DatabaseObject {
 // Expr normalizes SQL expressions to a canonical form.
 func Expr(expr schema.Expr) schema.Expr {
 	exprStr := strings.TrimSpace(string(expr))
-
-	if canonical, err := canonicalizeExpr(exprStr); err == nil && canonical != "" {
-		exprStr = canonical
+	// pg_query_go crosses a C string boundary. Never pass an embedded NUL to
+	// it: doing so truncates the expression and can make normalization
+	// non-idempotent. The declarative parser rejects NUL-containing SQL.
+	if strings.IndexByte(exprStr, 0) >= 0 {
+		return schema.Expr(exprStr)
 	}
 
+	canonical, err := canonicalizeExpr(exprStr)
+	if err != nil || canonical == "" {
+		// Invalid or context-dependent fragments must remain opaque. Applying
+		// partial textual rewrites after a parse failure can turn one malformed
+		// value into a different, accidentally valid expression.
+		return schema.Expr(exprStr)
+	}
+	exprStr = canonical
 	exprStr = stripOuterParentheses(exprStr)
 
 	if strings.EqualFold(exprStr, "current_timestamp") || strings.EqualFold(exprStr, "current_timestamp()") {
@@ -411,6 +421,36 @@ func canonicalizeExpr(expr string) (string, error) {
 	if expr == "" {
 		return "", nil
 	}
+
+	// PostgreSQL's parser/deparser is not guaranteed to reach its canonical
+	// spelling in one pass. For example, malformed operator expressions can
+	// acquire grouping on a second pass. Iterate to a fixed point so callers
+	// never observe a value that changes when it is normalized again. Treat a
+	// cycle or a failure to converge as a parse failure; Expr will then preserve
+	// the original fragment opaquely.
+	const maxCanonicalizationPasses = 16
+	current := expr
+	seen := make(map[string]struct{}, maxCanonicalizationPasses)
+	for range maxCanonicalizationPasses {
+		if _, exists := seen[current]; exists {
+			return "", fmt.Errorf("expression canonicalization entered a cycle")
+		}
+		seen[current] = struct{}{}
+
+		next, err := canonicalizeExprOnce(current)
+		if err != nil {
+			return "", err
+		}
+		if next == current {
+			return next, nil
+		}
+		current = next
+	}
+
+	return "", fmt.Errorf("expression canonicalization did not converge after %d passes", maxCanonicalizationPasses)
+}
+
+func canonicalizeExprOnce(expr string) (string, error) {
 	query := fmt.Sprintf("SELECT %s", expr)
 	parsed, err := pg_query.Parse(query)
 	if err != nil {

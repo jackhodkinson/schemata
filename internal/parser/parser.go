@@ -125,6 +125,10 @@ func (p *Parser) parseSQLWithSource(sql string, sourcePath string) (schema.Schem
 }
 
 func (p *Parser) parseSQLObjects(sql string) ([]schema.DatabaseObject, error) {
+	if strings.IndexByte(sql, 0) >= 0 {
+		return nil, fmt.Errorf("schema SQL contains a NUL byte")
+	}
+
 	// Parse using pg_query_go
 	result, err := pg_query.Parse(sql)
 	if err != nil {
