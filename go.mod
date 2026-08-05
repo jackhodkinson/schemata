@@ -24,5 +24,5 @@ require (
 	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
-	google.golang.org/protobuf v1.31.0 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )
