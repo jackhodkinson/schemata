@@ -91,7 +91,7 @@ jobs:
           tar -C dist -czf "dist/schemata_${VERSION}_${GOOS}_${GOARCH}.tar.gz" "schemata_${VERSION}_${GOOS}_${GOARCH}"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: schemata_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
           path: dist/schemata_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
