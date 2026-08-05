@@ -338,7 +338,8 @@ func TestMigrationApplication(t *testing.T) {
 
 	// Apply migrations
 	opts := migration.ApplyOptions{
-		DryRun: false,
+		DryRun:            false,
+		InitializeHistory: true,
 	}
 	err = applier.Apply(ctx, migrations, opts)
 	require.NoError(t, err, "should apply migrations")
@@ -399,7 +400,7 @@ func TestMigrationHistoryRejectsChangedAppliedSource(t *testing.T) {
 		SQL:     "CREATE TABLE checksum_original (id integer);",
 	}
 	require.NoError(t, original.LoadSQL())
-	require.NoError(t, applier.Apply(ctx, []migration.Migration{original}, migration.ApplyOptions{}))
+	require.NoError(t, applier.Apply(ctx, []migration.Migration{original}, migration.ApplyOptions{InitializeHistory: true}))
 
 	changed := migration.Migration{
 		Version:       original.Version,
@@ -575,7 +576,7 @@ ALTER TABLE statement_diagnostics ADD COLUMN value text;`,
 		FilePath: "/migrations/20231015120530-statement-diagnostics.sql",
 	}}
 
-	err = migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{})
+	err = migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "statement 2 of 3")
 	assert.Contains(t, err.Error(), "INSERT INTO missing_statement_diagnostics_table")
@@ -628,7 +629,7 @@ CREATE TABLE public.dynamic_history_should_rollback (id integer);`,
 				Name:    "history-baseline",
 				SQL:     "SELECT 1;",
 			}
-			require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{}))
+			require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{InitializeHistory: true}))
 
 			second := migration.Migration{
 				Version: "20231015130000",
@@ -669,7 +670,7 @@ func TestDeferredConstraintTriggerCannotMutateHistoryAtCommit(t *testing.T) {
 		Name:    "history-baseline",
 		SQL:     "SELECT 1;",
 	}
-	require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{}))
+	require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{InitializeHistory: true}))
 
 	second := migration.Migration{
 		Version: "20231015130000",
@@ -720,7 +721,7 @@ func TestCommitTimeHistoryMutationIsNeverReportedAsSuccess(t *testing.T) {
 		Name:    "history-baseline",
 		SQL:     "SELECT 1;",
 	}
-	require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{}))
+	require.NoError(t, applier.Apply(ctx, []migration.Migration{first}, migration.ApplyOptions{InitializeHistory: true}))
 
 	second := migration.Migration{
 		Version: "20231015130000",
@@ -779,7 +780,7 @@ BEGIN ATOMIC
   SELECT value + 1;
 END;`,
 	}}
-	require.NoError(t, migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{}))
+	require.NoError(t, migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true}))
 
 	var result int
 	require.NoError(t, pool.QueryRow(ctx, "SELECT public.atomic_add_one(41)").Scan(&result))
@@ -882,7 +883,7 @@ func TestDryRunMode(t *testing.T) {
 	// Apply in dry run mode
 	// Constructor-level dry-run must remain authoritative even when callers
 	// pass zero-value options.
-	opts := migration.ApplyOptions{}
+	opts := migration.ApplyOptions{InitializeHistory: true}
 	err = applier.Apply(ctx, migrations, opts)
 	require.NoError(t, err)
 

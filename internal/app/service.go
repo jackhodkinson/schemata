@@ -96,7 +96,11 @@ func (s *Service) GenerateDDL(diff *differ.Diff, desired, actual schema.SchemaOb
 	return ddl, nil
 }
 
-func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config) error {
+func (s *Service) CheckMigrationsInSync(
+	ctx context.Context,
+	cfg *config.Config,
+	applyOpts migration.ApplyOptions,
+) error {
 	if cfg.Dev == nil {
 		return fmt.Errorf("no dev database configured")
 	}
@@ -113,7 +117,10 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 			return err
 		}
 		if len(migrations) > 0 {
-			if err := s.ApplyMigrations(ctx, devPool, migrations, migration.ApplyOptions{}); err != nil {
+			if err := s.ApplyMigrations(ctx, devPool, migrations, migration.ApplyOptions{
+				DryRun:            applyOpts.DryRun,
+				InitializeHistory: applyOpts.InitializeHistory,
+			}); err != nil {
 				return fmt.Errorf("failed to apply migrations to dev: %w", err)
 			}
 		}
@@ -144,62 +151,7 @@ func (s *Service) CheckMigrationsInSync(ctx context.Context, cfg *config.Config)
 }
 
 func (s *Service) DropAllObjects(ctx context.Context, pool *db.Pool) error {
-	query := `
-		SELECT nspname
-		FROM pg_namespace
-		WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'schemata')
-		  AND nspname NOT LIKE 'pg_temp_%'
-		  AND nspname NOT LIKE 'pg_toast_temp_%'
-		ORDER BY nspname
-	`
-
-	rows, err := pool.Query(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to query schemas: %w", err)
-	}
-	defer rows.Close()
-
-	var schemas []string
-	for rows.Next() {
-		var schemaName string
-		if err := rows.Scan(&schemaName); err != nil {
-			return fmt.Errorf("failed to scan schema name: %w", err)
-		}
-		schemas = append(schemas, schemaName)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error reading schema rows: %w", err)
-	}
-
-	dropMode := "RESTRICT"
-	if s.allowCascade {
-		dropMode = "CASCADE"
-	}
-
-	for _, schemaName := range schemas {
-		dropSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS %s %s", schemaName, dropMode)
-		if _, err := pool.Exec(ctx, dropSQL); err != nil {
-			if !s.allowCascade {
-				return fmt.Errorf("failed to drop schema %s: %w\n\nHint: Schema has dependent objects. Use --allow-cascade to drop with CASCADE (this will drop all dependent objects)", schemaName, err)
-			}
-			return fmt.Errorf("failed to drop schema %s: %w", schemaName, err)
-		}
-
-		createSQL := fmt.Sprintf("CREATE SCHEMA %s", schemaName)
-		if _, err := pool.Exec(ctx, createSQL); err != nil {
-			return fmt.Errorf("failed to create schema %s: %w", schemaName, err)
-		}
-	}
-
-	dropTrackingSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS schemata %s", dropMode)
-	if _, err := pool.Exec(ctx, dropTrackingSQL); err != nil {
-		if !s.allowCascade {
-			return fmt.Errorf("failed to drop schemata tracking schema: %w\n\nHint: Schema has dependent objects. Use --allow-cascade to drop with CASCADE (this will drop all dependent objects)", err)
-		}
-		return fmt.Errorf("failed to drop schemata tracking schema: %w", err)
-	}
-
-	return nil
+	return db.ResetSchemas(ctx, pool, s.allowCascade)
 }
 
 func (s *Service) BuildObjectMapFromObjects(objects []schema.DatabaseObject) (schema.SchemaObjectMap, error) {

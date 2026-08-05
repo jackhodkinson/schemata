@@ -107,7 +107,7 @@ CREATE INDEX CONCURRENTLY schemata_nt_success_value_idx ON public.schemata_nt_su
 	}}
 
 	applier := migration.NewApplier(pool, false)
-	require.NoError(t, applier.Apply(ctx, migrations, migration.ApplyOptions{}))
+	require.NoError(t, applier.Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true}))
 
 	var indexValid bool
 	require.NoError(t, pool.QueryRow(ctx, `
@@ -148,7 +148,7 @@ CREATE INDEX CONCURRENTLY schemata_nt_retry_value_idx ON public.schemata_nt_retr
 	}}
 
 	applier := migration.NewApplier(pool, false)
-	err := applier.Apply(ctx, migrations, migration.ApplyOptions{})
+	err := applier.Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "statement 3 of 4")
 	assert.ErrorContains(t, err, "durably marked failed")
@@ -289,7 +289,7 @@ INSERT INTO public.schemata_nt_fatal (id) VALUES (1);`,
 
 	result := make(chan error, 1)
 	go func() {
-		result <- migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{})
+		result <- migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true})
 	}()
 
 	tracker := db.NewMigrationTracker(pool)
@@ -338,7 +338,7 @@ INSERT INTO public.schemata_nt_cancel (id) VALUES (1);`,
 	applyCtx, cancel := context.WithCancel(ctx)
 	result := make(chan error, 1)
 	go func() {
-		result <- migration.NewApplier(pool, false).Apply(applyCtx, migrations, migration.ApplyOptions{})
+		result <- migration.NewApplier(pool, false).Apply(applyCtx, migrations, migration.ApplyOptions{InitializeHistory: true})
 	}()
 
 	tracker := db.NewMigrationTracker(pool)
@@ -482,7 +482,7 @@ func TestTransactionalMigrationWaitsForOrphanActiveStatement(t *testing.T) {
 		SQL:     "CREATE TABLE public.schemata_transactional_fenced (id integer PRIMARY KEY);",
 	}}
 	applyCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	err = migration.NewApplier(pool, false).Apply(applyCtx, migrations, migration.ApplyOptions{})
+	err = migration.NewApplier(pool, false).Apply(applyCtx, migrations, migration.ApplyOptions{InitializeHistory: true})
 	cancel()
 	require.Error(t, err)
 
@@ -517,7 +517,7 @@ CREATE UNIQUE INDEX CONCURRENTLY schemata_nt_partial_value_idx ON public.schemat
 	}}
 
 	applier := migration.NewApplier(pool, false)
-	err := applier.Apply(ctx, migrations, migration.ApplyOptions{})
+	err := applier.Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "statement 3 of 3")
 
@@ -580,7 +580,7 @@ CREATE TABLE public.schemata_nt_session_isolation AS
 SELECT COALESCE(current_setting('schemata.session_probe', true), '<unset>') AS value;`,
 	}}
 
-	require.NoError(t, migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{}))
+	require.NoError(t, migration.NewApplier(pool, false).Apply(ctx, migrations, migration.ApplyOptions{InitializeHistory: true}))
 
 	var value string
 	require.NoError(t, pool.QueryRow(ctx, "SELECT value FROM public.schemata_nt_session_isolation").Scan(&value))

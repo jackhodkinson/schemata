@@ -121,7 +121,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	applier := migration.NewApplier(targetPool, false)
 	opts := migration.ApplyOptions{
-		DryRun: false,
+		DryRun:            false,
+		InitializeHistory: true,
 	}
 	err = applier.Apply(ctx, migrations, opts)
 	require.NoError(t, err, "should apply migrations to target")
@@ -250,7 +251,8 @@ func TestGenerateWorkflow(t *testing.T) {
 
 	applier := migration.NewApplier(devPool, false)
 	opts := migration.ApplyOptions{
-		DryRun: false,
+		DryRun:            false,
+		InitializeHistory: true,
 	}
 	err = applier.Apply(ctx, migrations, opts)
 	require.NoError(t, err)
@@ -353,7 +355,8 @@ func TestMigrateWithPreflightCheck(t *testing.T) {
 
 	devApplier := migration.NewApplier(devPool, false)
 	opts := migration.ApplyOptions{
-		DryRun: false,
+		DryRun:            false,
+		InitializeHistory: true,
 	}
 	err = devApplier.Apply(ctx, migrations, opts)
 	require.NoError(t, err)

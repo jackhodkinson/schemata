@@ -5,6 +5,45 @@ default. These controls apply to catalog reads, drift checks, migration
 pre-flight work, and migration execution, including fresh sessions opened for
 individual migrations.
 
+## First-time migration history initialization
+
+Schemata never assumes that a missing `schemata.version` table means a fresh
+database. It may instead mean that a previously managed database lost its
+ledger, in which case replaying every migration could corrupt or destroy the
+existing schema. Normal `apply` and `migrate` commands therefore refuse a
+missing ledger before creating the reserved schema or executing migration SQL.
+The same rule applies to dry-run.
+
+For the first deployment to a verified empty target, explicitly authorize
+ledger creation:
+
+```shell
+schemata migrate --target prod --initialize-history
+# or, for the low-level command:
+schemata apply --target prod --initialize-history
+```
+
+The decision is made while holding the ordinary migration-runner lock, so
+concurrent initializers are serialized. `--dry-run --initialize-history`
+reports that initialization would occur but creates neither the ledger nor any
+other database object. Development workflows that apply migrations (`generate`,
+and `diff --from migrations`) expose the same explicit flag rather than
+silently opting in. `sync` always requires the flag because its documented
+reset operation deliberately removes and recreates the dev ledger; validation,
+reset, ledger recreation, and replay remain behind one runner lock. Schema
+names read from the catalog are validated and quoted, and the complete schema
+reset is one PostgreSQL transaction so any drop/recreate failure rolls it all
+back. Applied-history source divergence is allowed because replacing edited or
+deleted dev migrations is the purpose of this explicitly destructive command;
+an incomplete `running` or `failed` history row must still be recovered or
+resolved before reset.
+
+Treat `--initialize-history` as a one-time bootstrap authorization, not a lost
+history recovery switch. If a managed database is missing its ledger, stop the
+deployment and restore the ledger from a trusted backup or incident-recovery
+record. Do not authorize initialization merely to bypass the error. The
+`recover` command intentionally never creates missing history.
+
 ## Required production target identity
 
 Production targets should pin both the database name and PostgreSQL cluster

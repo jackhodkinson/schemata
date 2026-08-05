@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	diffFrom   string
-	diffTarget string
+	diffFrom              string
+	diffTarget            string
+	diffInitializeHistory bool
 )
 
 var diffCmd = &cobra.Command{
@@ -36,9 +37,13 @@ Examples:
 func init() {
 	diffCmd.Flags().StringVar(&diffFrom, "from", "", "Compare from 'migrations' (apply to dev) instead of target")
 	diffCmd.Flags().StringVar(&diffTarget, "target", "", "Target database to use (for multi-target configs)")
+	diffCmd.Flags().BoolVar(&diffInitializeHistory, "initialize-history", false, "Authorize first-time creation of migration history when using --from migrations")
 }
 
 func runDiff(cmd *cobra.Command, args []string) error {
+	if diffInitializeHistory && diffFrom != "migrations" {
+		return fmt.Errorf("--initialize-history is only valid with --from migrations")
+	}
 	ctx := cmd.Context()
 	service := app.NewService(allowCascade)
 
@@ -91,7 +96,9 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{}); err != nil {
+		if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{
+			InitializeHistory: diffInitializeHistory,
+		}); err != nil {
 			return fmt.Errorf("failed to apply migrations to dev: %w", err)
 		}
 	}

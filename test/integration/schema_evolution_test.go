@@ -433,7 +433,7 @@ func TestMigrationRollback_OnFailure(t *testing.T) {
 			SQL:      "CREATE TABLE rollback_test (id INTEGER PRIMARY KEY, val TEXT);",
 			FilePath: "/tmp/test",
 		},
-	}, migration.ApplyOptions{})
+	}, migration.ApplyOptions{InitializeHistory: true})
 	require.NoError(t, err)
 
 	// Verify table exists and insert a row
@@ -542,7 +542,7 @@ func TestConcurrentMigrationRunners(t *testing.T) {
 			defer pool.Close()
 
 			applier := migration.NewApplier(pool, false)
-			errs[idx] = applier.Apply(context.Background(), migrations, migration.ApplyOptions{})
+			errs[idx] = applier.Apply(context.Background(), migrations, migration.ApplyOptions{InitializeHistory: true})
 		}(i)
 	}
 
@@ -862,7 +862,7 @@ func TestFileBasedMigrationWorkflow(t *testing.T) {
 	require.Len(t, migrations, 1)
 
 	devApplier := migration.NewApplier(devDB.pool, false)
-	err = devApplier.Apply(context.Background(), migrations, migration.ApplyOptions{})
+	err = devApplier.Apply(context.Background(), migrations, migration.ApplyOptions{InitializeHistory: true})
 	require.NoError(t, err)
 
 	// Preflight check: dev DB after migrations should match desired schema
@@ -872,7 +872,7 @@ func TestFileBasedMigrationWorkflow(t *testing.T) {
 
 	// --- Step 3: Apply same migrations to target ---
 	targetApplier := migration.NewApplier(targetDB.pool, false)
-	err = targetApplier.Apply(context.Background(), migrations, migration.ApplyOptions{})
+	err = targetApplier.Apply(context.Background(), migrations, migration.ApplyOptions{InitializeHistory: true})
 	require.NoError(t, err)
 
 	assert.True(t, targetDB.tableExists(t, "accounts"))

@@ -58,6 +58,9 @@ complete.
 5. **Harden migration history and execution**
    - Record and verify migration checksums and metadata.
    - Reject duplicate versions and missing dependency references.
+   - Missing-ledger bootstrap is fail-closed: normal execution and dry-run
+     require explicit first-time initialization authorization under the runner
+     lock, while recovery never creates history.
    - Per-migration transaction controls now support operations such as
      `CREATE INDEX CONCURRENTLY`, with durable statement progress, fail-closed
      interrupted states, and an explicit recovery workflow.

@@ -52,6 +52,15 @@ Normal `apply` and `migrate` runs refuse both `running` and `failed` history.
 They never guess whether a statement committed and never resume partial work
 automatically.
 
+They also refuse when the complete `schemata.version` ledger is missing. A
+missing ledger cannot be distinguished from a first-time database safely, so
+normal execution and dry-run both require `--initialize-history` before they
+will treat it as empty. Use that flag only for the first deployment to a
+verified fresh database. If an existing deployment lost its ledger, restore
+the ledger through the incident-recovery process instead; replaying migrations
+from an invented empty history is unsafe. Recovery never initializes a missing
+ledger.
+
 The per-statement session boundary prevents settings, prepared statements,
 temporary objects, roles, or advisory locks created indirectly by a routine or
 trigger from leaking into later statements. Top-level `DO` and `CALL` are

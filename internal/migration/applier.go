@@ -20,6 +20,22 @@ const (
 	migrationHeartbeatWait  = 2 * time.Second
 )
 
+// ErrHistoryInitializationRequired is returned when a target has no durable
+// migration ledger and the caller has not explicitly authorized creating one.
+// A missing ledger is ambiguous: it can mean either a first-time database or a
+// previously managed database whose history was lost. Normal application must
+// never guess which case it is.
+var ErrHistoryInitializationRequired = errors.New(
+	"migration history table schemata.version does not exist; refusing to initialize history or execute migrations without explicit authorization: use --initialize-history only for a first-time database, or restore the lost migration history before retrying",
+)
+
+// ErrHistoryResetAuthorizationRequired is returned when a caller asks to run
+// a destructive reset workflow without explicitly authorizing recreation of
+// the ledger that reset necessarily removes.
+var ErrHistoryResetAuthorizationRequired = errors.New(
+	"migration history reset requires explicit authorization: use --initialize-history to acknowledge that the ledger will be removed and recreated",
+)
+
 // Applier applies migrations to a database
 type Applier struct {
 	pool    *db.Pool
@@ -38,9 +54,10 @@ func NewApplier(pool *db.Pool, dryRun bool) *Applier {
 
 // ApplyOptions configures migration application
 type ApplyOptions struct {
-	DryRun    bool
-	Step      int    // Apply at most N pending migrations. 0 means unlimited.
-	ToVersion string // Apply up to and including this version. Empty means unlimited.
+	DryRun            bool
+	InitializeHistory bool   // Authorize first-time creation of schemata.version.
+	Step              int    // Apply at most N pending migrations. 0 means unlimited.
+	ToVersion         string // Apply up to and including this version. Empty means unlimited.
 }
 
 // FilterPendingMigrations applies Step and ToVersion filters to a pending
@@ -81,40 +98,137 @@ func (a *Applier) Apply(ctx context.Context, migrations []Migration, opts ApplyO
 		return fmt.Errorf("invalid migration inventory: %w", err)
 	}
 
-	if opts.DryRun {
-		// Dry-run does not create schema state, but it still takes the same
-		// transient lock so history cannot change between its existence check,
-		// validation, and plan output.
-		return db.WithSessionAdvisoryLock(
-			ctx,
-			a.pool,
-			migrationLockName,
-			migrationLockTimeout,
-			func(conn *pgxpool.Conn) error {
-				return a.applyPending(ctx, migrations, opts, conn)
-			},
-		)
-	}
-
 	// One dedicated PostgreSQL session owns this lock for the complete run,
-	// including first-run schema creation, history reads, and all migrations.
-	// Keeping schema creation inside this boundary also gives dry-run a stable,
-	// side-effect-free view while a real runner is waiting.
+	// including the missing-history decision, optional first-run schema
+	// creation, history reads, and all migrations. Keeping authorization and
+	// schema creation inside this boundary prevents concurrent runners from
+	// disagreeing about whether the target is fresh. Dry-run takes the same lock
+	// and follows the same authorization path without creating anything.
 	return db.WithSessionAdvisoryLock(
 		ctx,
 		a.pool,
 		migrationLockName,
 		migrationLockTimeout,
 		func(conn *pgxpool.Conn) error {
-			if err := a.tracker.EnsureSchema(ctx); err != nil {
-				return fmt.Errorf("failed to ensure migration tracking schema: %w", err)
+			return a.applyLocked(ctx, migrations, opts, conn)
+		},
+	)
+}
+
+// ResetAndApply validates the current ledger, runs reset, recreates the ledger,
+// and applies migrations while holding the ordinary runner lock throughout.
+// It is intended only for explicitly destructive development workflows whose
+// reset removes schemata.version. The reset callback may use the pool, but must
+// not try to acquire the migration runner lock itself.
+func (a *Applier) ResetAndApply(
+	ctx context.Context,
+	migrations []Migration,
+	opts ApplyOptions,
+	reset func(context.Context) error,
+) error {
+	opts.DryRun = opts.DryRun || a.dryRun
+	if opts.DryRun {
+		return fmt.Errorf("migration reset cannot run in dry-run mode")
+	}
+	if !opts.InitializeHistory {
+		return ErrHistoryResetAuthorizationRequired
+	}
+	if reset == nil {
+		return fmt.Errorf("migration reset callback must not be nil")
+	}
+	if err := ValidateInventory(migrations); err != nil {
+		return fmt.Errorf("invalid migration inventory: %w", err)
+	}
+
+	return db.WithSessionAdvisoryLock(
+		ctx,
+		a.pool,
+		migrationLockName,
+		migrationLockTimeout,
+		func(conn *pgxpool.Conn) error {
+			// Validate any existing ledger's shape and internal state before
+			// allowing the destructive callback to run.
+			historyExists, err := a.tracker.HistoryExistsWithExecutor(ctx, conn)
+			if err != nil {
+				return err
+			}
+			if historyExists {
+				if err := a.tracker.ValidateSchemaWithExecutor(ctx, conn); err != nil {
+					return err
+				}
+				history, err := a.tracker.GetHistoryWithExecutor(ctx, conn)
+				if err != nil {
+					return fmt.Errorf("failed to get migration history before reset: %w", err)
+				}
+				if err := validateHistoryForReset(history); err != nil {
+					return fmt.Errorf("migration history validation failed before reset: %w", err)
+				}
 			}
 			if err := verifyMigrationLock(ctx, conn); err != nil {
 				return err
 			}
-			return a.applyPending(ctx, migrations, opts, conn)
+
+			resetCtx, cancelReset := context.WithCancelCause(ctx)
+			stopHeartbeat := make(chan struct{})
+			heartbeatDone := make(chan error, 1)
+			go monitorMigrationLock(resetCtx, conn, stopHeartbeat, cancelReset, heartbeatDone)
+			resetErr := reset(resetCtx)
+			close(stopHeartbeat)
+			heartbeatErr := <-heartbeatDone
+			cancelReset(context.Canceled)
+			if heartbeatErr != nil {
+				return errors.Join(resetErr, heartbeatErr)
+			}
+			if resetErr != nil {
+				return fmt.Errorf("migration reset failed: %w", resetErr)
+			}
+			if err := verifyMigrationLock(ctx, conn); err != nil {
+				return fmt.Errorf("migration reset completed but runner lock state is ambiguous: %w", err)
+			}
+			return a.applyLocked(ctx, migrations, opts, conn)
 		},
 	)
+}
+
+func (a *Applier) applyLocked(
+	ctx context.Context,
+	migrations []Migration,
+	opts ApplyOptions,
+	conn *pgxpool.Conn,
+) error {
+	historyExists, err := a.tracker.HistoryExistsWithExecutor(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if !historyExists {
+		if !opts.InitializeHistory {
+			return ErrHistoryInitializationRequired
+		}
+		if opts.DryRun {
+			fmt.Println("[DRY RUN] Would initialize migration history table schemata.version")
+			return a.applyPending(ctx, migrations, opts, conn, false)
+		}
+		if err := a.tracker.EnsureSchema(ctx); err != nil {
+			return fmt.Errorf("failed to initialize migration tracking schema: %w", err)
+		}
+		if err := verifyMigrationLock(ctx, conn); err != nil {
+			return err
+		}
+		historyExists, err = a.tracker.HistoryExistsWithExecutor(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if !historyExists {
+			return fmt.Errorf("migration history initialization completed without creating schemata.version")
+		}
+	}
+	if err := a.tracker.ValidateSchemaWithExecutor(ctx, conn); err != nil {
+		return err
+	}
+	if err := verifyMigrationLock(ctx, conn); err != nil {
+		return err
+	}
+	return a.applyPending(ctx, migrations, opts, conn, true)
 }
 
 func (a *Applier) applyPending(
@@ -122,21 +236,8 @@ func (a *Applier) applyPending(
 	migrations []Migration,
 	opts ApplyOptions,
 	lockConn *pgxpool.Conn,
+	historyExists bool,
 ) error {
-	historyExists := true
-	if opts.DryRun {
-		var err error
-		historyExists, err = a.tracker.HistoryExistsWithExecutor(ctx, lockConn)
-		if err != nil {
-			return err
-		}
-		if historyExists {
-			if err := a.tracker.ValidateSchemaWithExecutor(ctx, lockConn); err != nil {
-				return err
-			}
-		}
-	}
-
 	var history []db.MigrationRecord
 	if historyExists {
 		var err error

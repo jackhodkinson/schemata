@@ -152,3 +152,23 @@ func TestValidateMigrationHistoryRejectsMissingAppliedDependency(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not recorded as applied")
 }
+
+func TestValidateHistoryForResetAllowsAppliedInventoryDivergence(t *testing.T) {
+	applied := preparedHistoryMigration(t, "001", "old-source", "SELECT 1;")
+
+	require.NoError(t, validateHistoryForReset([]db.MigrationRecord{
+		appliedHistoryRecord(applied),
+	}))
+}
+
+func TestValidateHistoryForResetRejectsIncompleteState(t *testing.T) {
+	migration := preparedHistoryMigration(t, "001", "incomplete", "SELECT 1;")
+	record := appliedHistoryRecord(migration)
+	record.Status = db.MigrationStatusRunning
+	record.FinishedAt = nil
+	record.LastConfirmedStatement = 0
+
+	err := validateHistoryForReset([]db.MigrationRecord{record})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete database status")
+}

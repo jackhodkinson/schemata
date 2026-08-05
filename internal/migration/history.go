@@ -75,6 +75,26 @@ func validateMigrationHistory(
 	return pending, nil
 }
 
+// validateHistoryForReset verifies that the durable ledger is internally
+// coherent and has no ambiguous partial work. Unlike normal apply, an
+// explicitly authorized destructive reset deliberately permits applied rows
+// to differ from or be absent from the replacement local inventory.
+func validateHistoryForReset(history []db.MigrationRecord) error {
+	for _, record := range history {
+		if err := validateHistoryRecord(record); err != nil {
+			return fmt.Errorf("invalid database history for migration %s: %w", record.Version, err)
+		}
+		if record.Status != db.MigrationStatusApplied {
+			return fmt.Errorf(
+				"migration %s has incomplete database status %q; recover or otherwise resolve partial work before resetting migration history",
+				record.Version,
+				record.Status,
+			)
+		}
+	}
+	return nil
+}
+
 func validateMigrationRecordIdentity(record db.MigrationRecord, local Migration) error {
 	if record.Name != local.Name {
 		return fmt.Errorf(

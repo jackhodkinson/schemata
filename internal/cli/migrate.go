@@ -11,10 +11,11 @@ import (
 )
 
 var (
-	migrateTarget string
-	migrateDryRun bool
-	migrateStep   int
-	migrateTo     string
+	migrateTarget            string
+	migrateDryRun            bool
+	migrateInitializeHistory bool
+	migrateStep              int
+	migrateTo                string
 )
 
 var migrateCmd = &cobra.Command{
@@ -43,6 +44,7 @@ Examples:
 func init() {
 	migrateCmd.Flags().StringVar(&migrateTarget, "target", "", "Target database (required if multiple targets configured)")
 	migrateCmd.Flags().BoolVar(&migrateDryRun, "dry-run", false, "Show what would be applied without actually applying")
+	migrateCmd.Flags().BoolVar(&migrateInitializeHistory, "initialize-history", false, "Authorize first-time creation of migration history on the dev and selected target databases")
 	migrateCmd.Flags().IntVar(&migrateStep, "step", 0, "Apply at most N pending migrations")
 	migrateCmd.Flags().StringVar(&migrateTo, "to", "", "Apply pending migrations up to and including VERSION")
 }
@@ -66,7 +68,11 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	// Pre-flight check: ensure migrations are in sync with configured schema path
 	fmt.Println("Running pre-flight check (diff --from migrations)...")
-	if err := service.CheckMigrationsInSync(ctx, cfg); err != nil {
+	if err := service.CheckMigrationsInSync(
+		ctx,
+		cfg,
+		migratePreflightApplyOptions(migrateDryRun, migrateInitializeHistory),
+	); err != nil {
 		return fmt.Errorf("pre-flight check failed: %w\n\nHint: Run 'schemata generate <name>' to create a migration for the differences", err)
 	}
 	fmt.Println("✓ Migrations are in sync with configured schema path")
@@ -105,20 +111,16 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if len(migrations) == 0 {
-		fmt.Println("No migrations found")
-		return nil
-	}
-
 	// Apply migrations
 	if migrateDryRun {
 		fmt.Println("\n=== DRY RUN MODE ===")
 	}
 
 	opts := migration.ApplyOptions{
-		DryRun:    migrateDryRun,
-		Step:      migrateStep,
-		ToVersion: migrateTo,
+		DryRun:            migrateDryRun,
+		InitializeHistory: migrateInitializeHistory,
+		Step:              migrateStep,
+		ToVersion:         migrateTo,
 	}
 	if err := service.ApplyMigrations(ctx, targetPool, migrations, opts); err != nil {
 		return err
@@ -131,4 +133,11 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func migratePreflightApplyOptions(dryRun, initializeHistory bool) migration.ApplyOptions {
+	return migration.ApplyOptions{
+		DryRun:            dryRun,
+		InitializeHistory: initializeHistory,
+	}
 }

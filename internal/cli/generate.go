@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var generateInitializeHistory bool
+
 var generateCmd = &cobra.Command{
 	Use:   "generate <migration-name>",
 	Short: "Generate a migration from schema changes",
@@ -28,6 +30,10 @@ Examples:
 `,
 	Args: cobra.ExactArgs(1),
 	RunE: runGenerate,
+}
+
+func init() {
+	generateCmd.Flags().BoolVar(&generateInitializeHistory, "initialize-history", false, "Authorize first-time creation of migration history on the dev database")
 }
 
 func runGenerate(cmd *cobra.Command, args []string) error {
@@ -67,7 +73,9 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(migrations) > 0 {
-		if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{}); err != nil {
+		if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{
+			InitializeHistory: generateInitializeHistory,
+		}); err != nil {
 			return fmt.Errorf("failed to apply migrations to dev: %w", err)
 		}
 	} else {

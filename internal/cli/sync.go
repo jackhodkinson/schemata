@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/jackhodkinson/schemata/internal/app"
@@ -9,6 +10,8 @@ import (
 	"github.com/jackhodkinson/schemata/internal/migration"
 	"github.com/spf13/cobra"
 )
+
+var syncInitializeHistory bool
 
 var syncCmd = &cobra.Command{
 	Use:   "sync",
@@ -19,17 +22,29 @@ This command will:
 1. Drop all objects from the dev database
 2. Apply all migrations from the migrations directory
 
+Because reset deliberately removes and recreates migration history, it always
+requires --initialize-history. Validation, reset, ledger recreation, and replay
+remain fenced by the migration runner lock.
+
 This is useful when you've deleted/modified migrations and need to
 reset your dev database to match.
 
 Examples:
   # Sync dev database
-  schemata sync
+  schemata sync --initialize-history
 `,
 	RunE: runSync,
 }
 
+func init() {
+	syncCmd.Flags().BoolVar(&syncInitializeHistory, "initialize-history", false, "Authorize removal and recreation of migration history on the dev database")
+}
+
 func runSync(cmd *cobra.Command, args []string) error {
+	if !syncInitializeHistory {
+		return migration.ErrHistoryResetAuthorizationRequired
+	}
+
 	service := app.NewService(allowCascade)
 
 	// Load configuration
@@ -52,12 +67,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	// Drop all objects from dev database
-	fmt.Println("Dropping all objects from dev database...")
-	if err := service.DropAllObjects(ctx, pool); err != nil {
-		return fmt.Errorf("failed to drop objects: %w", err)
-	}
-
 	// Scan migrations
 	fmt.Printf("Scanning migrations directory: %s\n", cfg.Migrations.GetDir())
 	migrations, err := service.ScanMigrations(cfg.Migrations.GetDir(), cfg.Migrations.GetFormat())
@@ -65,17 +74,23 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if len(migrations) == 0 {
-		fmt.Println("No migrations found")
-		return nil
-	}
-
 	fmt.Printf("Found %d migration(s)\n", len(migrations))
 
-	// Apply all migrations
-	fmt.Println("Applying migrations...")
-	if err := service.ApplyMigrations(ctx, pool, migrations, migration.ApplyOptions{}); err != nil {
-		return err
+	// Keep validation, the destructive reset, ledger recreation, and replay
+	// behind one migration-runner lock. No other Schemata runner can observe the
+	// deliberately missing ledger between reset and initialization.
+	applier := migration.NewApplier(pool, false)
+	if err := applier.ResetAndApply(ctx, migrations, migration.ApplyOptions{
+		InitializeHistory: syncInitializeHistory,
+	}, func(resetCtx context.Context) error {
+		fmt.Println("Dropping all objects from dev database...")
+		if err := service.DropAllObjects(resetCtx, pool); err != nil {
+			return fmt.Errorf("failed to drop objects: %w", err)
+		}
+		fmt.Println("Applying migrations...")
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to reset and apply migrations: %w", err)
 	}
 
 	fmt.Println("\n✓ Dev database synced successfully")
